@@ -1,7 +1,7 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
-import { join } from 'path'
+import { join, resolve } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { writeFile, readFile } from 'fs/promises'
 import { encode, decode } from 'cbor-x'
@@ -376,7 +376,8 @@ function initProxyServer(): ProxyServer {
             account.clientSecret || '',
             account.region || 'us-east-1',
             account.authMethod,
-            account.proxyUrl  // 账号绑定的代理（如有）
+            account.proxyUrl,  // 账号绑定的代理（如有）
+            { tokenEndpoint: account.tokenEndpoint, scopes: account.scopes }
           )
 
           if (refreshResult.success && refreshResult.accessToken) {
@@ -486,6 +487,10 @@ function initProxyServer(): ProxyServer {
             region: acc.credentials?.region || 'us-east-1',
             authMethod: acc.credentials?.authMethod,
             provider: acc.credentials?.provider || acc.idp,
+            // external_idp (Azure AD) 专用:反代自动刷新需微软 tokenEndpoint,不传会报"缺 tokenEndpoint"
+            tokenEndpoint: acc.credentials?.tokenEndpoint,
+            issuerUrl: acc.credentials?.issuerUrl,
+            scopes: acc.credentials?.scopes,
             proxyUrl: buildProxyUrl(acc.id)
           }))
         if (proxyAccounts.length > 0 && proxyServer) {
@@ -748,6 +753,94 @@ async function refreshSocialToken(
   }
 }
 
+// external_idp (微软 Azure AD 等外部 IdP) Token 刷新
+// 走账户自带的微软 tokenEndpoint（form-urlencoded），不走 AWS OIDC。
+// 参考 9router kiroExternalIdp.js + kiro-switch oidc.py。
+const MICROSOFT_TOKEN_ENDPOINT_HOSTS = new Set([
+  'login.microsoftonline.com',
+  'login.microsoft.com',
+  'login.windows.net'
+])
+
+// 校验 tokenEndpoint 必须是微软登录端点（https + 域名白名单），防 SSRF / 误配
+function validateMicrosoftTokenEndpoint(rawEndpoint?: string): string {
+  const tokenEndpoint = (rawEndpoint || '').trim()
+  if (!tokenEndpoint) throw new Error('缺少 tokenEndpoint')
+  let parsed: URL
+  try {
+    parsed = new URL(tokenEndpoint)
+  } catch {
+    throw new Error('tokenEndpoint 不是合法 URL')
+  }
+  if (parsed.protocol !== 'https:') throw new Error('tokenEndpoint 必须使用 https')
+  if (!MICROSOFT_TOKEN_ENDPOINT_HOSTS.has(parsed.hostname.toLowerCase())) {
+    throw new Error('tokenEndpoint 必须是微软登录端点 (login.microsoftonline.com 等)')
+  }
+  return parsed.toString()
+}
+
+// external_idp 的 Token 刷新：POST 微软 tokenEndpoint，form-urlencoded
+async function refreshExternalIdpToken(
+  refreshToken: string,
+  clientId: string,
+  tokenEndpoint?: string,
+  scopes?: string,
+  proxyUrl?: string
+): Promise<OidcRefreshResult> {
+  console.log(`[ExternalIdp] Refreshing token via Microsoft endpoint...${proxyUrl ? ' [via bound proxy]' : ''}`)
+
+  let endpoint: string
+  try {
+    endpoint = validateMicrosoftTokenEndpoint(tokenEndpoint)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    console.error(`[ExternalIdp] Invalid tokenEndpoint: ${msg}`)
+    return { success: false, error: msg }
+  }
+  if (!clientId) return { success: false, error: 'external_idp 刷新缺少 clientId' }
+  if (!refreshToken) return { success: false, error: 'external_idp 刷新缺少 refreshToken' }
+
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    client_id: clientId,
+    refresh_token: refreshToken
+  })
+  if (scopes) body.set('scope', scopes)
+
+  try {
+    const response = await fetchWithAppProxy(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json'
+      },
+      body: body.toString()
+    }, proxyUrl)
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      console.error(`[ExternalIdp] Refresh failed: ${response.status} - ${errorText}`)
+      return { success: false, error: `HTTP ${response.status}: ${errorText}` }
+    }
+
+    // 微软端点返回 snake_case: access_token / refresh_token / expires_in
+    const data = await response.json()
+    if (!data.access_token) {
+      return { success: false, error: `刷新响应缺少 access_token: ${JSON.stringify(data).slice(0, 200)}` }
+    }
+    console.log(`[ExternalIdp] Token refreshed successfully, expires in ${data.expires_in}s`)
+    return {
+      success: true,
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token || refreshToken,
+      expiresIn: data.expires_in
+    }
+  } catch (error) {
+    console.error(`[ExternalIdp] Refresh error:`, error)
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
 // 通用 Token 刷新 - 根据 authMethod 选择刷新方式
 async function refreshTokenByMethod(
   token: string,
@@ -755,8 +848,14 @@ async function refreshTokenByMethod(
   clientSecret: string,
   region: string = 'us-east-1',
   authMethod?: string,
-  proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
+  proxyUrl?: string,  // 账号绑定的代理 URL（可选，优先级最高）
+  externalIdp?: { tokenEndpoint?: string; scopes?: string }  // external_idp 刷新专用
 ): Promise<OidcRefreshResult> {
+  // external_idp (Azure AD 等外部 IdP)：走微软 tokenEndpoint 刷新。
+  // 必须优先于 social 判定——external_idp 与 social 都无 clientSecret，否则会被误判为 social 走错端点。
+  if (authMethod === 'external_idp') {
+    return refreshExternalIdpToken(token, clientId, externalIdp?.tokenEndpoint, externalIdp?.scopes, proxyUrl)
+  }
   // 如果是社交登录，使用 Kiro Auth Service 刷新
   if (authMethod === 'social') {
     return refreshSocialToken(token, proxyUrl)
@@ -1136,7 +1235,8 @@ async function fetchRestApi(
   baseUrl: string,
   path: string,
   accessToken: string,
-  machineId?: string
+  machineId?: string,
+  authMethod?: string  // external_idp 需 TokenType: EXTERNAL_IDP header，否则 CW REST 403
 ): Promise<Response> {
   const agent = getKProxyAgent()
   const headers: Record<string, string> = {
@@ -1144,6 +1244,11 @@ async function fetchRestApi(
     'Authorization': `Bearer ${accessToken}`,
     'User-Agent': getKiroUserAgent(machineId),
     'x-amz-user-agent': getKiroAmzUserAgent(machineId)
+  }
+  // Enterprise External IdP (Azure AD) token: CodeWhisperer REST 需要 TokenType 标识才会使用
+  // 外部 IdP token 验证路径（否则默认按 AWS SSO token 校验→"bearer token invalid" 403）
+  if (authMethod === 'external_idp') {
+    headers['TokenType'] = 'EXTERNAL_IDP'
   }
   const url = `${baseUrl}${path}`
   if (agent) {
@@ -1161,7 +1266,8 @@ async function getUsageLimitsRest(
   profileArn?: string,
   accountMachineId?: string,  // 账户绑定的设备 ID
   ssoRegion?: string,         // SSO 区域，用于选择正确的 REST API 端点
-  email?: string              // 用于日志标识
+  email?: string,             // 用于日志标识
+  authMethod?: string         // external_idp (Azure AD) 需传入以加 TokenType header
 ): Promise<UsageLimitsResponse> {
   // 优先使用账户绑定的设备 ID，其次使用 K-Proxy 全局设备 ID
   const machineId = accountMachineId || getCurrentMachineId()
@@ -1182,12 +1288,12 @@ async function getUsageLimitsRest(
   const primaryBase = getRestApiBase(ssoRegion)
   const fallbackBase = getFallbackRestApiBase(ssoRegion)
   
-  let response = await fetchRestApi(primaryBase, path, accessToken, machineId)
+  let response = await fetchRestApi(primaryBase, path, accessToken, machineId, authMethod)
   
   // 如果主端点返回 403，尝试备用端点
   if (response.status === 403) {
     console.log(`[Kiro REST API] Primary 403, fallback → ${fallbackBase}`)
-    response = await fetchRestApi(fallbackBase, path, accessToken, machineId)
+    response = await fetchRestApi(fallbackBase, path, accessToken, machineId, authMethod)
   }
   
   if (!response.ok) {
@@ -1262,11 +1368,12 @@ async function getUsageAndLimits(
   profileArn?: string,
   accountMachineId?: string,  // 账户绑定的设备 ID
   ssoRegion?: string,         // SSO 区域，用于选择正确的 REST API 端点
-  email?: string              // 用于日志标识
+  email?: string,             // 用于日志标识
+  authMethod?: string         // external_idp (Azure AD) 需传入以加 TokenType header
 ): Promise<UnifiedUsageResponse> {
   if (currentUsageApiType === 'rest') {
     // 使用 REST API (GetUsageLimits)
-    const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email)
+    const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email, authMethod)
     // REST API 返回的字段名和 CBOR API 相同，直接返回
     return {
       usageBreakdownList: result.usageBreakdownList?.map(b => ({
@@ -1333,7 +1440,7 @@ async function getUsageAndLimits(
       // CBOR 401/403 时自动 fallback 到 REST API
       if (errorMsg.includes('401') || errorMsg.includes('403')) {
         console.log(`[API] CBOR API failed (${errorMsg}), falling back to REST API...`)
-        const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email)
+        const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email, authMethod)
         return {
           usageBreakdownList: result.usageBreakdownList?.map(b => ({
             resourceType: b.resourceType || b.type,
@@ -1650,7 +1757,7 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
     }
   }
   const accountData = store?.get('accountData') as
-    | { accounts?: Record<string, { id?: string; email?: string; profileArn?: string; proxyUrl?: string; credentials?: { refreshToken?: string; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; startUrl?: string; provider?: string; accessToken?: string; expiresAt?: number } }> }
+    | { accounts?: Record<string, { id?: string; email?: string; profileArn?: string; proxyUrl?: string; credentials?: { refreshToken?: string; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; startUrl?: string; provider?: string; accessToken?: string; expiresAt?: number; tokenEndpoint?: string; scopes?: string } }> }
     | null
     | undefined
   const account = accountData?.accounts?.[accountId]
@@ -1674,7 +1781,8 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
       creds.clientSecret || '',
       creds.region || 'us-east-1',
       creds.authMethod,
-      account.proxyUrl
+      account.proxyUrl,
+      { tokenEndpoint: creds.tokenEndpoint, scopes: creds.scopes }
     )
   } catch (e) {
     console.warn('[ProactiveRenewal] refreshTokenByMethod threw, stop scheduling:', e)
@@ -1705,7 +1813,7 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
       accessToken: newAccess,
       refreshToken: newRefresh,
       expiresAtIso: new Date(newExpiresAt).toISOString(),
-      authMethod: (creds.authMethod === 'social' ? 'social' : 'IdC'),
+      authMethod: (creds.authMethod === 'social' ? 'social' : creds.authMethod === 'external_idp' ? 'external_idp' : 'IdC'),
       provider: creds.provider || 'BuilderId',
       region: creds.region,
       startUrl: creds.startUrl,
@@ -1888,6 +1996,11 @@ type BackgroundRefreshAccount = {
     accessToken?: string
     provider?: string
     profileArn?: string
+    // external_idp (Azure AD) 刷新走微软 tokenEndpoint，缺字段会导致后台自动刷新失败
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
+    audience?: string
   }
 }
 /** background-batch-refresh 的核心实现（由 IPC 与主进程调度器共用）。在 whenReady 中赋值。 */
@@ -2246,6 +2359,10 @@ function createWindow(): void {
                 region: acc.credentials?.region || 'us-east-1',
                 authMethod,
                 provider,
+                // external_idp (Azure AD) 专用:反代自动刷新需微软 tokenEndpoint
+                tokenEndpoint: acc.credentials?.tokenEndpoint,
+                issuerUrl: acc.credentials?.issuerUrl,
+                scopes: acc.credentials?.scopes,
                 proxyUrl: buildProxyUrl(acc.id)
               }
             })
@@ -2382,8 +2499,10 @@ function registerProtocol(): void {
   
   if (process.defaultApp) {
     if (process.argv.length >= 2) {
+      // dev 模式：process.argv[1] 是相对路径，协议处理器由系统从 system32 启动，
+      // 必须传绝对路径，否则 electron 找不到 app 入口报 "Unable to find Electron app"
       app.setAsDefaultProtocolClient(PROTOCOL_PREFIX, process.execPath, [
-        join(process.argv[1])
+        resolve(process.argv[1])
       ])
     }
   } else {
@@ -2397,7 +2516,7 @@ function unregisterProtocol(): void {
   if (process.defaultApp) {
     if (process.argv.length >= 2) {
       app.removeAsDefaultProtocolClient(PROTOCOL_PREFIX, process.execPath, [
-        join(process.argv[1])
+        resolve(process.argv[1])
       ])
     }
   } else {
@@ -2853,6 +2972,8 @@ app.whenReady().then(async () => {
       machineId?: string
       expiresAt?: number
       proxyUrl?: string
+      tokenEndpoint?: string
+      scopes?: string
     }
     model?: string
     message?: string
@@ -2882,7 +3003,8 @@ app.whenReady().then(async () => {
             acc.clientSecret || '',
             acc.region || 'us-east-1',
             acc.authMethod,
-            acc.proxyUrl
+            acc.proxyUrl,
+            { tokenEndpoint: acc.tokenEndpoint, scopes: acc.scopes }
           )
           if (r.success && r.accessToken) accessToken = r.accessToken
         } catch { /* 刷新失败则用原 token 尝试，让真实错误暴露出来 */ }
@@ -2973,14 +3095,14 @@ app.whenReady().then(async () => {
   // IPC: 刷新账号 Token（支持 IdC 和社交登录）
   ipcMain.handle('refresh-account-token', async (_event, account) => {
     try {
-      const { refreshToken, clientId, clientSecret, region, authMethod, startUrl, provider } = account.credentials || {}
+      const { refreshToken, clientId, clientSecret, region, authMethod, startUrl, provider, tokenEndpoint, scopes } = account.credentials || {}
 
       if (!refreshToken) {
         return { success: false, error: { message: '缺少 Refresh Token' } }
       }
 
-      // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
-      if (authMethod !== 'social' && (!clientId || !clientSecret)) {
+      // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret；external_idp 只需 tokenEndpoint+clientId
+      if (authMethod !== 'social' && authMethod !== 'external_idp' && (!clientId || !clientSecret)) {
         return { success: false, error: { message: '缺少 OIDC 刷新凭证 (clientId/clientSecret)' } }
       }
 
@@ -2998,7 +3120,8 @@ app.whenReady().then(async () => {
         clientSecret || '',
         region || 'us-east-1',
         authMethod,
-        boundProxyUrl
+        boundProxyUrl,
+        { tokenEndpoint, scopes }
       )
 
       if (!refreshResult.success || !refreshResult.accessToken) {
@@ -3031,7 +3154,7 @@ app.whenReady().then(async () => {
             accessToken: newAccess,
             refreshToken: newRefresh,
             expiresAtIso: new Date(Date.now() + expiresIn * 1000).toISOString(),
-            authMethod: (authMethod === 'social' ? 'social' : 'IdC'),
+            authMethod: (authMethod === 'social' ? 'social' : authMethod === 'external_idp' ? 'external_idp' : 'IdC'),
             provider: provider || (diskToken?.provider as string | undefined) || 'BuilderId',
             region: region || diskToken?.region,
             startUrl,
@@ -3505,7 +3628,7 @@ app.whenReady().then(async () => {
     }
 
     try {
-      const { accessToken, refreshToken, clientId, clientSecret, region, authMethod, provider } = account.credentials || {}
+      const { accessToken, refreshToken, clientId, clientSecret, region, authMethod, provider, tokenEndpoint, scopes } = account.credentials || {}
 
       // 查询账号绑定的代理（账号池）
       const boundProxyUrl = proxyServer
@@ -3540,7 +3663,7 @@ app.whenReady().then(async () => {
             }
             return undefined
           }),
-          getUsageAndLimits(accessToken, idp, undefined, accountMachineId, region, account?.email)
+          getUsageAndLimits(accessToken, idp, undefined, accountMachineId, region, account?.email, authMethod)
         ])
         return parseUsageResponse(usageResult, undefined, userInfoResult)
       } catch (apiError) {
@@ -3555,10 +3678,13 @@ app.whenReady().then(async () => {
           }
         }
         
-        // 检查是否是 401 错误（token 过期）
-        // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
-        const canRefresh = refreshToken && (authMethod === 'social' || (clientId && clientSecret))
-        if (errorMsg.includes('401') && canRefresh) {
+        // 检查是否是 auth 错误 (token 过期 / 失效)
+        // - 401 ：OIDC/CBOR API 无效 token 的典型返回
+        // - 403 ：CodeWhisperer REST API 对 external_idp 过期 token 返回 "User is not authorized to make this call." / "The bearer token included in the request is invalid."
+        //   已在上方排除了 AccountSuspended/423 封禁类 403，这里剥 401||403 都当作 token 问题转 refresh；刷新成功则继续，失败则报 error 无伤
+        // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret，external_idp 需 tokenEndpoint
+        const canRefresh = refreshToken && (authMethod === 'social' || authMethod === 'external_idp' || (clientId && clientSecret))
+        if ((errorMsg.includes('401') || errorMsg.includes('403')) && canRefresh) {
           console.log(`[IPC] Token expired, attempting to refresh (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`)
 
           // 尝试刷新 token - 根据 authMethod 选择刷新方式（透传账号代理）
@@ -3568,7 +3694,8 @@ app.whenReady().then(async () => {
             clientSecret || '',
             region || 'us-east-1',
             authMethod,
-            boundProxyUrl
+            boundProxyUrl,
+            { tokenEndpoint, scopes }
           )
           
           if (refreshResult.success && refreshResult.accessToken) {
@@ -3582,7 +3709,7 @@ app.whenReady().then(async () => {
                 }
                 return undefined
               }),
-              getUsageAndLimits(refreshResult.accessToken, idp, undefined, accountMachineId, region)
+              getUsageAndLimits(refreshResult.accessToken, idp, undefined, accountMachineId, region, undefined, authMethod)
             ])
             
             // 返回结果并包含新凭证
@@ -3634,7 +3761,7 @@ app.whenReady().then(async () => {
           }
           if (account.id) poolRefreshInFlightIds.add(account.id)
           try {
-            const { refreshToken, clientId, clientSecret, region, authMethod, accessToken, provider } = account.credentials
+            const { refreshToken, clientId, clientSecret, region, authMethod, accessToken, provider, tokenEndpoint, scopes } = account.credentials
             const needsTokenRefresh = account.needsTokenRefresh !== false // 默认为 true（兼容旧版本）
 
             // 查询账号绑定的代理（从主进程账号池）
@@ -3669,7 +3796,8 @@ app.whenReady().then(async () => {
                 clientSecret || '',
                 region || 'us-east-1',
                 authMethod,
-                boundProxyUrl
+                boundProxyUrl,
+                { tokenEndpoint, scopes }
               )
 
               if (!refreshResult.success) {
@@ -3707,7 +3835,7 @@ app.whenReady().then(async () => {
                       accessToken: newAccessToken,
                       refreshToken: newRefreshToken,
                       expiresAtIso: new Date(Date.now() + newExpiresIn * 1000).toISOString(),
-                      authMethod: (authMethod === 'social' ? 'social' : 'IdC'),
+                      authMethod: (authMethod === 'social' ? 'social' : authMethod === 'external_idp' ? 'external_idp' : 'IdC'),
                       provider: provider || (diskToken?.provider as string | undefined) || 'BuilderId',
                       region: region || diskToken?.region,
                       // background-batch-refresh 没传 startUrl，但 disk 的 clientIdHash 不再变；
@@ -3831,7 +3959,7 @@ app.whenReady().then(async () => {
                   }
                 }
                 console.log(`[BackgroundRefresh] Account ${account.id} machineId: ${account.machineId || 'undefined'}`)
-                const rawUsage = await getUsageAndLimits(newAccessToken, idp, undefined, account.machineId, region) as UsageResponse
+                const rawUsage = await getUsageAndLimits(newAccessToken, idp, undefined, account.machineId, region, undefined, authMethod) as UsageResponse
                 
                 // 解析使用量数据
                 const creditUsage = rawUsage.usageBreakdownList?.find(b => b.resourceType === 'CREDIT')
@@ -4043,7 +4171,7 @@ app.whenReady().then(async () => {
 
             // 调用 API 获取用量和用户信息（根据配置选择 REST 或 CBOR 格式）
             const [usageRes, userInfoRes] = await Promise.allSettled([
-              getUsageAndLimits(accessToken, idp, undefined, undefined, account.credentials?.region, account.email) as Promise<{
+              getUsageAndLimits(accessToken, idp, undefined, undefined, account.credentials?.region, account.email, account.credentials?.authMethod) as Promise<{
                 usageBreakdownList?: Array<{
                   resourceType?: string
                   displayName?: string
@@ -4245,7 +4373,8 @@ app.whenReady().then(async () => {
               if (errorMsg.includes('AccountSuspendedException') || errorMsg.includes('423')) {
                 status = 'error'
                 errorMessage = errorMsg
-              } else if (errorMsg.includes('401')) {
+              } else if (errorMsg.includes('401') || errorMsg.includes('403')) {
+                // external_idp 过期 token 返回 403，已排除上方封禁类（423/AccountSuspended），剩下的 403 当 token 问题
                 status = 'expired'
                 errorMessage = 'Token 已过期，请刷新'
               } else {
@@ -4376,12 +4505,20 @@ app.whenReady().then(async () => {
     region?: string
     authMethod?: string
     provider?: string  // 'BuilderId', 'Github', 'Google' 等
+    accessToken?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
+    profileArn?: string
   }) => {
     console.log('[IPC] verify-account-credentials called')
     
     try {
-      const { refreshToken, clientId, clientSecret, region = 'us-east-1', authMethod, provider } = credentials
+      const { refreshToken, clientId, clientSecret, region = 'us-east-1', authMethod, provider, tokenEndpoint, scopes } = credentials
       // 确定 idp：社交登录使用 provider，IdC 也需要根据 provider 区分 BuilderId 和 Enterprise
+      // 注：external_idp (AzureAD/ExternalIdp) 刻意 fallback 到 'BuilderId'，避免把非标准 idp 值拼进
+      // kiroApiRequest 的 cookie (`Idp=${idp}`) 触发服务端非 401/403 错误绕过 REST fallback。
+      // external_idp 靠 CBOR 401 → REST fallback (accessToken+profileArn) 查用量，与 idp 值无关。
       const idp = provider && (provider === 'Enterprise' || provider === 'Github' || provider === 'Google') 
         ? provider 
         : 'BuilderId'
@@ -4390,20 +4527,20 @@ app.whenReady().then(async () => {
       if (!refreshToken) {
         return { success: false, error: '请填写 Refresh Token' }
       }
-      if (authMethod !== 'social' && (!clientId || !clientSecret)) {
+      if (authMethod !== 'social' && authMethod !== 'external_idp' && (!clientId || !clientSecret)) {
         return { success: false, error: '请填写 Client ID 和 Client Secret' }
       }
       
       // Step 1: 使用合适的方式刷新获取 accessToken
       console.log(`[Verify] Step 1: Refreshing token (authMethod: ${authMethod || 'IdC'})...`)
-      const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod)
+      const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod, undefined, { tokenEndpoint, scopes })
       
       if (!refreshResult.success || !refreshResult.accessToken) {
         return { success: false, error: `Token 刷新失败: ${refreshResult.error}` }
       }
-      
+
       console.log('[Verify] Step 2: Getting user info...')
-      
+
       // Step 2: 调用 GetUserUsageAndLimits 获取用户信息
       interface Bonus {
         bonusCode?: string
@@ -4455,7 +4592,7 @@ app.whenReady().then(async () => {
         userInfo?: { email?: string; userId?: string }
       }
       
-      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, undefined, undefined, region) as UsageResponse
+      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, undefined, undefined, region, undefined, authMethod) as UsageResponse
       
       // 解析用户信息
       const email = usageResult.userInfo?.email || ''
@@ -4643,6 +4780,10 @@ app.whenReady().then(async () => {
         region?: string
         authMethod?: string
         provider?: string
+        profileArn?: string
+        tokenEndpoint?: string
+        issuerUrl?: string
+        scopes?: string
       }
       
       try {
@@ -4706,8 +4847,9 @@ app.whenReady().then(async () => {
       
       // 社交登录不需要 clientId/clientSecret
       const isSocialAuth = tokenData.authMethod === 'social'
+      const isExternalIdp = tokenData.authMethod === 'external_idp' || tokenData.provider === 'ExternalIdp'
       
-      if (!isSocialAuth && (!clientData || !clientData.clientId || !clientData.clientSecret)) {
+      if (!isSocialAuth && !isExternalIdp && (!clientData || !clientData.clientId || !clientData.clientSecret)) {
         return { success: false, error: '找不到客户端注册文件，请确保已在 Kiro IDE 中完成登录' }
       }
       
@@ -4722,7 +4864,11 @@ app.whenReady().then(async () => {
           clientSecret: clientData?.clientSecret || '',
           region: tokenData.region || 'us-east-1',
           authMethod: tokenData.authMethod || 'IdC',
-          provider: tokenData.provider || 'BuilderId'
+          provider: tokenData.provider || 'BuilderId',
+          tokenEndpoint: tokenData.tokenEndpoint,
+          issuerUrl: tokenData.issuerUrl,
+          scopes: tokenData.scopes,
+          profileArn: tokenData.profileArn
         }
       }
     } catch (error) {
@@ -4748,9 +4894,13 @@ app.whenReady().then(async () => {
     clientSecret: string
     region?: string
     startUrl?: string
-    authMethod?: 'IdC' | 'social'
-    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise'
+    authMethod?: 'IdC' | 'social' | 'external_idp'
+    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise' | 'AzureAD' | 'ExternalIdp'
     profileArn?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
+    audience?: string
     accountId?: string
   }) => {
     try {
@@ -4763,6 +4913,10 @@ app.whenReady().then(async () => {
         authMethod = 'IdC',
         provider = 'BuilderId',
         profileArn,
+        tokenEndpoint,
+        issuerUrl,
+        scopes,
+        audience,
         accountId
       } = credentials
       let finalAccessToken = credentials.accessToken
@@ -4772,7 +4926,7 @@ app.whenReady().then(async () => {
       // 切号前先 refresh，确保磁盘里写的是最新 access + 最新 refresh（rotating）
       if (refreshToken) {
         console.log(`[Switch Account] Refreshing token before switch (authMethod: ${authMethod})...`)
-        const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod)
+        const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod, undefined, { tokenEndpoint, scopes })
         if (refreshResult.success && refreshResult.accessToken) {
           finalAccessToken = refreshResult.accessToken
           // bug A 修复：OIDC 返回新 refreshToken 时必须替换；否则下次 IDE/反代 refresh 会撞已作废的 v1
@@ -4811,7 +4965,11 @@ app.whenReady().then(async () => {
         startUrl,
         clientId,
         clientSecret,
-        profileArn: resolvedProfileArn
+        profileArn: resolvedProfileArn,
+        tokenEndpoint,
+        issuerUrl,
+        scopes,
+        audience
       })
       console.log('[Switch Account] Token written to:', tokenPath)
       if (clientRegPath) {
@@ -4855,6 +5013,9 @@ app.whenReady().then(async () => {
     profileArn?: string
     provider?: string
     scopes?: string[]
+    tokenEndpoint?: string
+    issuerUrl?: string
+    audience?: string
   }) => {
     const os = await import('os')
     const path = await import('path')
@@ -4868,15 +5029,22 @@ app.whenReady().then(async () => {
         region = 'us-east-1',
         profileArn,
         provider,
-        scopes
+        scopes,
+        tokenEndpoint,
+        issuerUrl,
+        audience
       } = credentials
       let { accessToken } = credentials
 
+      // external_idp (Azure AD) 判定：切 CLI 全程复用
+      const isExternalIdp = provider === 'AzureAD' || provider === 'ExternalIdp'
+
       // 切号前先刷新 token（和 IDE 切号一致）
       if (refreshToken) {
-        const authMethod = (provider === 'Google' || provider === 'Github') ? 'social' : undefined
+        const authMethod = (provider === 'Google' || provider === 'Github') ? 'social'
+          : isExternalIdp ? 'external_idp' : undefined
         console.log(`[Switch CLI] Refreshing token before switch (provider: ${provider})...`)
-        const refreshResult = await refreshTokenByMethod(refreshToken, clientId || '', clientSecret || '', region, authMethod)
+        const refreshResult = await refreshTokenByMethod(refreshToken, clientId || '', clientSecret || '', region, authMethod, undefined, { tokenEndpoint, scopes: scopes?.join(' ') })
         if (refreshResult.success && refreshResult.accessToken) {
           accessToken = refreshResult.accessToken
           console.log('[Switch CLI] Token refreshed successfully')
@@ -4894,16 +5062,17 @@ app.whenReady().then(async () => {
       await mkdir(dataDir, { recursive: true })
       const dbPath = path.join(dataDir, 'data.sqlite3')
 
-      // 判断 token key：social 登录用 social:token，IdC 登录用 odic:token
+      // 判断 token key：external_idp→external-idp:token，social→social:token，IdC→odic:token
       const isSocial = provider === 'Google' || provider === 'Github'
-      const preferredTokenKey = isSocial ? 'kirocli:social:token' : 'kirocli:odic:token'
+      const preferredTokenKey = isExternalIdp ? 'kirocli:external-idp:token'
+        : isSocial ? 'kirocli:social:token' : 'kirocli:odic:token'
       const preferredRegKey = 'kirocli:odic:device-registration'
 
       // profileArn 决策统一由 helper：BuilderId 不带 profileArn
       // kiro-cli 同样不应该在 SQLite 里塞占位符 ARN（实测会触发 REST 端点 403）
       const resolvedProfileArn = resolveProfileArnForWrite({
         profileArn,
-        authMethod: isSocial ? 'social' : 'IdC',
+        authMethod: isExternalIdp ? 'external_idp' : isSocial ? 'social' : 'IdC',
         provider,
         region
       })
@@ -4921,6 +5090,18 @@ app.whenReady().then(async () => {
         tokenData.profile_arn = resolvedProfileArn
       }
       if (scopes) tokenData.scopes = scopes
+      // external_idp: 补齐 kiro-cli 二进制声明的微软元数据字段（参考 kiro-switch cli_writer.py inject_external_idp）
+      if (isExternalIdp) {
+        tokenData.auth_method = 'external_idp'
+        tokenData.provider = 'ExternalIdp'
+        if (tokenEndpoint) tokenData.token_endpoint = tokenEndpoint
+        if (issuerUrl) {
+          tokenData.issuer = issuerUrl
+          tokenData.issuer_url = issuerUrl
+        }
+        if (clientId) tokenData.client_id = clientId
+        if (audience) tokenData.audience = audience
+      }
 
       // 使用 sqlite3 命令行操作（跨平台兼容，无需原生模块编译）
       const { execFileSync } = await import('child_process')
@@ -4932,8 +5113,8 @@ app.whenReady().then(async () => {
         `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredTokenKey}', '${JSON.stringify(tokenData).replace(/'/g, "''")}');`
       ]
 
-      // 写入 device-registration（仅 IdC 登录）
-      if (clientId && clientSecret && !isSocial) {
+      // 写入 device-registration（仅 IdC 登录；social/external_idp 不需要）
+      if (clientId && clientSecret && !isSocial && !isExternalIdp) {
         const regData = { client_id: clientId, client_secret: clientSecret, region }
         sqlStatements.push(
           `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredRegKey}', '${JSON.stringify(regData).replace(/'/g, "''")}');`
@@ -4941,7 +5122,7 @@ app.whenReady().then(async () => {
       }
 
       // 清除其他优先级的旧 key
-      const cliTokenKeys = ['kirocli:social:token', 'kirocli:odic:token', 'codewhisperer:odic:token']
+      const cliTokenKeys = ['kirocli:social:token', 'kirocli:odic:token', 'kirocli:external-idp:token', 'codewhisperer:odic:token']
       for (const key of cliTokenKeys) {
         if (key !== preferredTokenKey) {
           sqlStatements.push(`DELETE FROM auth_kv WHERE key = '${key}';`)
@@ -5471,6 +5652,274 @@ app.whenReady().then(async () => {
     }
     iamSsoResult = null
     currentLoginState = null
+    return { success: true }
+  })
+
+  // ============ external_idp (Microsoft Entra) 浏览器登录 ============
+  // 协议来自真机抓包（.agent-workspace/.archive/2026-07-07/external-idp-login/）：
+  // email 域名 → GetLoginMetadata(拿 clientId/issuerUrl/scopes) → OIDC discovery →
+  // 浏览器 authorize(直连微软, redirect_uri=kiro://kiro.oauth/callback deep-link) →
+  // 用户粘回 kiro://...?code=... → PKCE 换 token → ListAvailableProfiles 拿 profileArn。
+  // deep-link 被真 Kiro IDE 抢注，故用"半自动粘贴回调链接"绕开，不抢协议。
+  let externalIdpLoginState: {
+    codeVerifier: string
+    state: string
+    clientId: string
+    tokenEndpoint: string
+    issuerUrl: string
+    scopes: string[]
+    email: string
+    expiresAt: number
+  } | null = null
+
+  const EXTERNAL_IDP_REDIRECT_URI = 'kiro://kiro.oauth/callback'
+
+  // 按 email 域名向 Kiro 后端查该组织的 Azure App 配置（smithy rpc-v2-cbor）
+  async function getLoginMetadata(
+    domainName: string
+  ): Promise<{ clientId: string; issuerUrl: string; scopes: string[] }> {
+    const { decode } = await import('cbor-x')
+    // 请求体手写 canonical CBOR（结构固定 {domainName: str}）：与抓包字节 (a1...) 逐字节一致。
+    // cbor-x encode 默认写成 b90001(uint16 长度头)，虽合法但非 canonical，避免后端严格解析拒收。
+    const cborText = (s: string): Uint8Array => {
+      const bytes = Buffer.from(s, 'utf8')
+      const len = bytes.length
+      let header: number[]
+      if (len < 24) header = [0x60 | len]
+      else if (len < 256) header = [0x78, len]
+      else header = [0x79, (len >> 8) & 0xff, len & 0xff]
+      return new Uint8Array([...header, ...bytes])
+    }
+    const reqBody = new Uint8Array([
+      0xa1, // map, 1 对
+      ...cborText('domainName'),
+      ...cborText(domainName)
+    ])
+    const res = await fetchWithAppProxy(
+      'https://app.kiro.dev/service/KiroWebPortalService/operation/GetLoginMetadata',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/cbor',
+          Accept: 'application/cbor',
+          'smithy-protocol': 'rpc-v2-cbor'
+        },
+        body: reqBody
+      }
+    )
+    if (!res.ok) {
+      const errText = await res.text()
+      throw new Error(`GetLoginMetadata 失败: HTTP ${res.status} ${errText.slice(0, 200)}`)
+    }
+    const buf = Buffer.from(await res.arrayBuffer())
+    const data = decode(buf) as {
+      clientId?: string
+      found?: boolean
+      issuerUrl?: string
+      scopes?: string[]
+    }
+    if (!data || data.found === false || !data.clientId || !data.issuerUrl) {
+      throw new Error(`该邮箱域名 (${domainName}) 未配置 Kiro 外部 IdP 登录，或不是组织账号`)
+    }
+    // 安全校验：issuerUrl 必须是微软登录端点
+    let issuerHost = ''
+    try {
+      issuerHost = new URL(data.issuerUrl).hostname.toLowerCase()
+    } catch {
+      throw new Error('GetLoginMetadata 返回的 issuerUrl 非法')
+    }
+    if (!MICROSOFT_TOKEN_ENDPOINT_HOSTS.has(issuerHost)) {
+      throw new Error(`暂仅支持 Microsoft Entra 外部 IdP（issuer=${issuerHost}）`)
+    }
+    return {
+      clientId: data.clientId,
+      issuerUrl: data.issuerUrl,
+      scopes: Array.isArray(data.scopes) ? data.scopes : []
+    }
+  }
+
+  // IPC: 启动 external_idp 登录 —— 返回浏览器授权 URL
+  ipcMain.handle('start-external-idp-login', async (_event, email: string) => {
+    console.log('[ExternalIdpLogin] Starting login for:', email)
+    const trimmed = (email || '').trim()
+    const domainName = trimmed.split('@')[1]
+    if (!trimmed || !domainName) {
+      return { success: false, error: '请输入完整的组织邮箱（如 user@company.com）' }
+    }
+
+    try {
+      const crypto = await import('crypto')
+
+      // Step 1: email 域名 → clientId / issuerUrl / scopes
+      const meta = await getLoginMetadata(domainName)
+
+      // Step 2: OIDC discovery 拿 authorization_endpoint / token_endpoint
+      const discoveryUrl = `${meta.issuerUrl.replace(/\/$/, '')}/.well-known/openid-configuration`
+      const discRes = await fetchWithAppProxy(discoveryUrl, {
+        method: 'GET',
+        headers: { Accept: 'application/json' }
+      })
+      if (!discRes.ok) {
+        return { success: false, error: `OIDC discovery 失败: HTTP ${discRes.status}` }
+      }
+      const disc = (await discRes.json()) as {
+        authorization_endpoint?: string
+        token_endpoint?: string
+      }
+      if (!disc.authorization_endpoint || !disc.token_endpoint) {
+        return { success: false, error: 'OIDC discovery 缺少 authorization/token endpoint' }
+      }
+
+      // Step 3: PKCE + state（照抄 IAM SSO 做法）
+      const codeVerifier = crypto.randomBytes(32).toString('base64url')
+      const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url')
+      const state = crypto.randomUUID()
+
+      // Step 4: 拼 authorize URL
+      const authorizeUrl = new URL(disc.authorization_endpoint)
+      authorizeUrl.searchParams.set('redirect_uri', EXTERNAL_IDP_REDIRECT_URI)
+      authorizeUrl.searchParams.set('scope', meta.scopes.join(' '))
+      authorizeUrl.searchParams.set('code_challenge', codeChallenge)
+      authorizeUrl.searchParams.set('code_challenge_method', 'S256')
+      authorizeUrl.searchParams.set('response_mode', 'query')
+      authorizeUrl.searchParams.set('state', state)
+      authorizeUrl.searchParams.set('login_hint', trimmed)
+      authorizeUrl.searchParams.set('client_id', meta.clientId)
+      authorizeUrl.searchParams.set('response_type', 'code')
+
+      externalIdpLoginState = {
+        codeVerifier,
+        state,
+        clientId: meta.clientId,
+        tokenEndpoint: disc.token_endpoint,
+        issuerUrl: meta.issuerUrl,
+        scopes: meta.scopes,
+        email: trimmed,
+        expiresAt: Date.now() + 600000
+      }
+
+      return { success: true, authorizeUrl: authorizeUrl.toString() }
+    } catch (error) {
+      console.error('[ExternalIdpLogin] start error:', error)
+      return { success: false, error: error instanceof Error ? error.message : '启动登录失败' }
+    }
+  })
+
+  // IPC: 完成 external_idp 登录 —— 用户粘贴 kiro://...?code=... 回调链接
+  ipcMain.handle('complete-external-idp-login', async (_event, callbackUrl: string) => {
+    if (!externalIdpLoginState) {
+      return { success: false, error: '没有进行中的登录，请重新开始' }
+    }
+    if (Date.now() > externalIdpLoginState.expiresAt) {
+      externalIdpLoginState = null
+      return { success: false, error: '登录已超时，请重新开始' }
+    }
+
+    const saved = externalIdpLoginState
+
+    // 解析 code + state。kiro:// 是非标准 scheme，new URL 可解析但 host/path 归属不定，
+    // 统一取 search 部分兜底。
+    let code: string | null = null
+    let returnedState: string | null = null
+    try {
+      const raw = (callbackUrl || '').trim()
+      const qIndex = raw.indexOf('?')
+      const search = qIndex >= 0 ? raw.slice(qIndex + 1) : raw
+      const params = new URLSearchParams(search)
+      code = params.get('code')
+      returnedState = params.get('state')
+      const errParam = params.get('error')
+      if (errParam) {
+        return {
+          success: false,
+          error: `授权失败: ${errParam} ${params.get('error_description') || ''}`.trim()
+        }
+      }
+    } catch {
+      return { success: false, error: '回调链接解析失败，请粘贴完整的 kiro:// 链接' }
+    }
+
+    if (!code) {
+      return { success: false, error: '回调链接里没有 code，请确认粘贴的是登录成功后的完整链接' }
+    }
+    if (returnedState && returnedState !== saved.state) {
+      return { success: false, error: 'state 不匹配，可能是旧链接或跨会话，请重新登录' }
+    }
+
+    try {
+      // 用 code + code_verifier 换 token（PKCE，无 client_secret）
+      const body = new URLSearchParams({
+        redirect_uri: EXTERNAL_IDP_REDIRECT_URI,
+        code,
+        code_verifier: saved.codeVerifier,
+        grant_type: 'authorization_code',
+        client_id: saved.clientId
+      })
+      const tokenRes = await fetchWithAppProxy(saved.tokenEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json'
+        },
+        body: body.toString()
+      })
+      if (!tokenRes.ok) {
+        const errText = await tokenRes.text()
+        externalIdpLoginState = null
+        // invalid_grant 常见于 code 过期/已用
+        const hint = errText.includes('invalid_grant')
+          ? '（code 可能已过期或已被使用，请重新登录）'
+          : ''
+        return { success: false, error: `换取 Token 失败: HTTP ${tokenRes.status} ${hint}` }
+      }
+      const tok = (await tokenRes.json()) as {
+        access_token?: string
+        refresh_token?: string
+        expires_in?: number
+      }
+      if (!tok.access_token) {
+        externalIdpLoginState = null
+        return { success: false, error: '换取 Token 响应缺少 access_token' }
+      }
+
+      // 用微软 access_token 调 ListAvailableProfiles 拿 profileArn（复用现有函数）
+      let profileArn: string | undefined
+      try {
+        profileArn = await fetchEnterpriseProfileArn({
+          id: '',
+          accessToken: tok.access_token,
+          region: 'us-east-1',
+          provider: 'ExternalIdp',
+          authMethod: 'external_idp'
+        })
+      } catch (e) {
+        console.warn('[ExternalIdpLogin] fetchEnterpriseProfileArn failed:', e)
+      }
+
+      const result = {
+        success: true,
+        accessToken: tok.access_token,
+        refreshToken: tok.refresh_token || '',
+        expiresIn: tok.expires_in ?? 3600,
+        tokenEndpoint: saved.tokenEndpoint,
+        issuerUrl: saved.issuerUrl,
+        clientId: saved.clientId,
+        scopes: saved.scopes.join(' '),
+        profileArn,
+        email: saved.email
+      }
+      externalIdpLoginState = null
+      return result
+    } catch (error) {
+      console.error('[ExternalIdpLogin] complete error:', error)
+      return { success: false, error: error instanceof Error ? error.message : '完成登录失败' }
+    }
+  })
+
+  // IPC: 取消 external_idp 登录
+  ipcMain.handle('cancel-external-idp-login', async () => {
+    console.log('[ExternalIdpLogin] Cancelling login...')
+    externalIdpLoginState = null
     return { success: true }
   })
 
@@ -7194,7 +7643,18 @@ app.whenReady().then(async () => {
 
     try {
       const urlObj = new URL(url)
-      
+
+      // 处理 external_idp (Microsoft Entra) 回调 (kiro://kiro.oauth/callback?code=...)
+      // 必须在下面 social 分支之前：'kiro.oauth' 含 'auth' 会被 social 分支误吃。
+      if (url.includes('kiro.oauth/callback') || urlObj.host === 'kiro.oauth') {
+        console.log('[ExternalIdpLogin] Deep-link callback received')
+        if (mainWindow) {
+          mainWindow.webContents.send('external-idp-callback', { url })
+          mainWindow.focus()
+        }
+        return
+      }
+
       // 处理 Social Auth 回调 (kiro://kiro.kiroAgent/authenticate-success)
       if (url.includes('authenticate-success') || url.includes('auth')) {
         const code = urlObj.searchParams.get('code')

@@ -30,6 +30,34 @@ import type {
 import { buildKiroPayload, mapModelId } from './kiroApi'
 import { ToolNameRegistry } from './toolNameRegistry'
 
+// ================== 历史消息 tool-call XML 泄漏清理 ==================
+// 背景:
+//   Opus 4.8 decoder 有已知 bug (anthropics/claude-code#64418 #66888 #69421),
+//   会把 tool_use 序列化成 <tool_use>...</tool_use> / <invoke>...</invoke> XML 当纯文本发出。
+//   Kiro CLI 也遇到类似问题 (kirodotdev/Kiro#8021),泄漏为 <function_calls>...</function_calls>。
+//   一旦泄漏进入会话 history,模型看到自己前面的“错误示范”会持续模仿放大,会话不可恢复。
+// 兼底策略:
+//   请求发到 Kiro 前,把 history 中 assistant text 里的**已知**泄漏 XML 替换成 [tool call redacted]。
+//   保守:只匹配已知 pattern,不启发式;只清 assistant text,不动 user 或 tool_result。
+const LEAKED_TOOL_XML_PATTERNS: RegExp[] = [
+  /<tool_use\b[^>]*>[\s\S]*?<\/tool_use>/g,             // 标准 Anthropic 格式泄漏
+  /<invoke\b[^>]*>[\s\S]*?<\/invoke>/g,                 // Opus 4.8 变体 (#66888/#69421)
+  /<function_calls\b[^>]*>[\s\S]*?<\/function_calls>/g, // Kiro CLI 变体 (#8021)
+  /<tool_use\b[^>]*>[\s\S]*?<\/invoke>/g                // 混合变体(实测截图证据)
+]
+export function sanitizeLeakedToolXml(text: string): { cleaned: string; count: number } {
+  if (!text || typeof text !== 'string') return { cleaned: text, count: 0 }
+  let cleaned = text
+  let count = 0
+  for (const pattern of LEAKED_TOOL_XML_PATTERNS) {
+    cleaned = cleaned.replace(pattern, () => {
+      count++
+      return '[tool call redacted]'
+    })
+  }
+  return { cleaned, count }
+}
+
 const KIRO_CACHE_POINT: KiroCachePoint = { type: 'default' }
 
 /** 模型 thinking 能力元数据（由 proxyServer 从模型缓存中查询后传入） */
@@ -395,6 +423,14 @@ export function openaiToKiro(
       // Kiro 后端 schema 仅在响应输出中支持 assistantResponseMessage.reasoningContent，
       // 在请求 history 中传入此字段会触发 400 "Improperly formed request"
       let assistantContent = typeof msg.content === 'string' ? msg.content : ''
+      // 历史 tool-call XML 泄漏兼底(OpenAI 兼容路径):避免模型看到自己前面的错误 XML 继续模仿
+      {
+        const { cleaned, count } = sanitizeLeakedToolXml(assistantContent)
+        if (count > 0) {
+          console.log(`[HistorySanitize] OpenAI-path cleaned ${count} leaked tool XML from assistant message`)
+          assistantContent = cleaned
+        }
+      }
       if (!assistantContent.trim() && msg.tool_calls && msg.tool_calls.length > 0) {
         assistantContent = ' '
       } else if (!assistantContent.trim()) {
@@ -913,7 +949,16 @@ export function claudeToKiro(
       // Kiro 后端 schema 仅在响应输出中支持 assistantResponseMessage.reasoningContent，
       // 在请求 history 中传入此字段会触发 400 "Improperly formed request"
       // 当前消息的 thinking 开关由 additionalModelRequestFields.thinking 控制
-      const { content: assistantContent, toolUses } = extractClaudeAssistantContent(msg, toolNameRegistry)
+      const { content: assistantContentRaw, toolUses } = extractClaudeAssistantContent(msg, toolNameRegistry)
+      // 历史 tool-call XML 泄漏兼底(Claude 兼容路径):避免模型看到自己前面的错误 XML 继续模仿
+      let assistantContent = assistantContentRaw
+      {
+        const { cleaned, count } = sanitizeLeakedToolXml(assistantContent)
+        if (count > 0) {
+          console.log(`[HistorySanitize] Claude-path cleaned ${count} leaked tool XML from assistant message`)
+          assistantContent = cleaned
+        }
+      }
 
       // 如果有 pending 的 user 内容但还没添加到 history，先添加
       if (pendingUserContent.trim() || pendingUserImages.length > 0 || pendingUserDocuments.length > 0 || pendingToolResults.length > 0) {

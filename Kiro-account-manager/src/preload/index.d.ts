@@ -161,6 +161,10 @@ interface KiroApi {
       authMethod?: string
       accessToken?: string
       provider?: string
+      tokenEndpoint?: string
+      issuerUrl?: string
+      scopes?: string
+      profileArn?: string
     }
   }>, concurrency?: number, syncInfo?: boolean) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
   onBackgroundRefreshProgress: (callback: (data: { completed: number; total: number; success: number; failed: number }) => void) => () => void
@@ -178,6 +182,9 @@ interface KiroApi {
       region?: string
       authMethod?: string
       provider?: string
+      tokenEndpoint?: string
+      issuerUrl?: string
+      scopes?: string
     }
     idp?: string
   }>, concurrency?: number) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
@@ -192,9 +199,12 @@ interface KiroApi {
     clientSecret: string
     region?: string
     startUrl?: string
-    authMethod?: 'IdC' | 'social'
-    provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO'
+    authMethod?: 'IdC' | 'social' | 'external_idp'
+    provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO' | 'AzureAD' | 'ExternalIdp'
     profileArn?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
     /** 反代 store 里的 account.id，用于 main 进程记忆 lastSwitchedAccountId 供 watcher 反向同步 */
     accountId?: string
   }) => Promise<{
@@ -244,6 +254,9 @@ interface KiroApi {
     profileArn?: string
     provider?: string
     scopes?: string[]
+    tokenEndpoint?: string
+    issuerUrl?: string
+    audience?: string
   }) => Promise<{ success: boolean; error?: string; dbPath?: string }>
 
   // 退出登录 - 清除本地 SSO 缓存
@@ -259,8 +272,13 @@ interface KiroApi {
     clientId: string
     clientSecret: string
     region?: string
-    authMethod?: string  // 'IdC' 或 'social'
-    provider?: string    // 'BuilderId', 'Github', 'Google'
+    authMethod?: string  // 'IdC' / 'social' / 'external_idp'
+    provider?: string    // 'BuilderId', 'Github', 'Google', 'AzureAD'
+    accessToken?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
+    profileArn?: string
   }) => Promise<{
     success: boolean
     data?: {
@@ -326,8 +344,12 @@ interface KiroApi {
       clientId: string
       clientSecret: string
       region: string
-      authMethod: string  // 'IdC' 或 'social'
-      provider: string    // 'BuilderId', 'Github', 'Google'
+      authMethod: string  // 'IdC' / 'social' / 'external_idp'
+      provider: string    // 'BuilderId', 'Github', 'Google', 'AzureAD'
+      tokenEndpoint?: string
+      issuerUrl?: string
+      scopes?: string
+      profileArn?: string
     }
     error?: string
   }>
@@ -432,6 +454,28 @@ interface KiroApi {
 
   // 取消 IAM SSO 登录
   cancelIamSsoLogin: () => Promise<{ success: boolean }>
+
+  // external_idp (Microsoft Entra) 浏览器登录
+  startExternalIdpLogin: (email: string) => Promise<{
+    success: boolean
+    authorizeUrl?: string
+    error?: string
+  }>
+  completeExternalIdpLogin: (callbackUrl: string) => Promise<{
+    success: boolean
+    accessToken?: string
+    refreshToken?: string
+    expiresIn?: number
+    tokenEndpoint?: string
+    issuerUrl?: string
+    clientId?: string
+    scopes?: string
+    profileArn?: string
+    email?: string
+    error?: string
+  }>
+  cancelExternalIdpLogin: () => Promise<{ success: boolean }>
+  onExternalIdpCallback: (callback: (data: { url: string }) => void) => () => void
 
   // 启动 Social Auth 登录 (Google/GitHub)
   startSocialLogin: (provider: 'Google' | 'Github', usePrivateMode?: boolean) => Promise<{

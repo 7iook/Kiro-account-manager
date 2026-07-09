@@ -91,6 +91,11 @@ export interface KiroAuthTokenFile {
   region?: string
   clientIdHash?: string
   profileArn?: string
+  // external_idp (Azure AD) 专用
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  audience?: string
 }
 
 export interface WriteKiroAuthTokenInput {
@@ -98,7 +103,7 @@ export interface WriteKiroAuthTokenInput {
   refreshToken: string
   /** ISO 字符串。建议用 OIDC 返回的真实 expiresIn 算 */
   expiresAtIso: string
-  authMethod: 'IdC' | 'social'
+  authMethod: 'IdC' | 'social' | 'external_idp'
   provider: string
   region?: string
   startUrl?: string
@@ -106,6 +111,11 @@ export interface WriteKiroAuthTokenInput {
   clientId?: string
   clientSecret?: string
   profileArn?: string
+  // external_idp (Azure AD) 专用：写入 IDE token 供其自行刷新
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  audience?: string
 }
 
 export interface WriteKiroAuthTokenResult {
@@ -134,7 +144,23 @@ export async function writeKiroAuthTokenFile(
   const clientIdHash = computeClientIdHash(input.startUrl)
 
   const tokenData: Record<string, unknown> =
-    input.authMethod === 'social'
+    input.authMethod === 'external_idp'
+      ? {
+          // external_idp IDE token：camelCase + 微软元数据，无 registration 文件，
+          // 刷新由 Kiro IDE 通过 tokenEndpoint 自行完成。字段对齐 kiro-switch writer.py。
+          accessToken: input.accessToken,
+          refreshToken: input.refreshToken,
+          profileArn: input.profileArn,
+          expiresAt: input.expiresAtIso,
+          authMethod: 'external_idp',
+          provider: 'ExternalIdp',
+          tokenEndpoint: input.tokenEndpoint,
+          issuerUrl: input.issuerUrl,
+          clientId: input.clientId,
+          scopes: input.scopes,
+          ...(input.audience ? { audience: input.audience } : {})
+        }
+      : input.authMethod === 'social'
       ? {
           accessToken: input.accessToken,
           refreshToken: input.refreshToken,

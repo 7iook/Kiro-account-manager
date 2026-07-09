@@ -59,6 +59,10 @@ const api = {
       authMethod?: string
       accessToken?: string
       provider?: string
+      tokenEndpoint?: string
+      issuerUrl?: string
+      scopes?: string
+      profileArn?: string
     }
   }>, concurrency?: number, syncInfo?: boolean): Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }> => {
     return ipcRenderer.invoke('background-batch-refresh', accounts, concurrency, syncInfo)
@@ -98,6 +102,9 @@ const api = {
       region?: string
       authMethod?: string
       provider?: string
+      tokenEndpoint?: string
+      issuerUrl?: string
+      scopes?: string
     }
     idp?: string
   }>, concurrency?: number): Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }> => {
@@ -134,9 +141,12 @@ const api = {
     clientSecret: string
     region?: string
     startUrl?: string
-    authMethod?: 'IdC' | 'social'
-    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise'
+    authMethod?: 'IdC' | 'social' | 'external_idp'
+    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise' | 'AzureAD' | 'ExternalIdp'
     profileArn?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
     accountId?: string
   }): Promise<{
     success: boolean
@@ -175,6 +185,9 @@ const api = {
     profileArn?: string
     provider?: string
     scopes?: string[]
+    tokenEndpoint?: string
+    issuerUrl?: string
+    audience?: string
   }): Promise<{ success: boolean; error?: string; dbPath?: string }> => {
     return ipcRenderer.invoke('switch-account-cli', credentials)
   },
@@ -200,8 +213,13 @@ const api = {
     clientId: string
     clientSecret: string
     region?: string
-    authMethod?: string  // 'IdC' 或 'social'
-    provider?: string    // 'BuilderId', 'Github', 'Google'
+    authMethod?: string  // 'IdC' / 'social' / 'external_idp'
+    provider?: string    // 'BuilderId', 'Github', 'Google', 'AzureAD'
+    accessToken?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
+    profileArn?: string
   }): Promise<{
     success: boolean
     data?: {
@@ -244,8 +262,12 @@ const api = {
       clientId: string
       clientSecret: string
       region: string
-      authMethod: string  // 'IdC' 或 'social'
-      provider: string    // 'BuilderId', 'Github', 'Google'
+      authMethod: string  // 'IdC' / 'social' / 'external_idp'
+      provider: string    // 'BuilderId', 'Github', 'Google', 'AzureAD'
+      tokenEndpoint?: string
+      issuerUrl?: string
+      scopes?: string
+      profileArn?: string
     }
     error?: string
   }> => {
@@ -351,6 +373,48 @@ const api = {
   // 取消 IAM SSO 登录
   cancelIamSsoLogin: (): Promise<{ success: boolean }> => {
     return ipcRenderer.invoke('cancel-iam-sso-login')
+  },
+
+  // external_idp (Microsoft Entra) 浏览器登录 - 启动，返回授权 URL
+  startExternalIdpLogin: (email: string): Promise<{
+    success: boolean
+    authorizeUrl?: string
+    error?: string
+  }> => {
+    return ipcRenderer.invoke('start-external-idp-login', email)
+  },
+
+  // external_idp 登录 - 用户粘贴 kiro://...?code=... 回调链接后完成，返回完整 token 字段
+  completeExternalIdpLogin: (callbackUrl: string): Promise<{
+    success: boolean
+    accessToken?: string
+    refreshToken?: string
+    expiresIn?: number
+    tokenEndpoint?: string
+    issuerUrl?: string
+    clientId?: string
+    scopes?: string
+    profileArn?: string
+    email?: string
+    error?: string
+  }> => {
+    return ipcRenderer.invoke('complete-external-idp-login', callbackUrl)
+  },
+
+  // external_idp 登录 - 取消
+  cancelExternalIdpLogin: (): Promise<{ success: boolean }> => {
+    return ipcRenderer.invoke('cancel-external-idp-login')
+  },
+
+  // external_idp 登录 - 监听 deep-link 回调 (kiro://kiro.oauth/callback?code=...)
+  onExternalIdpCallback: (callback: (data: { url: string }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { url: string }): void => {
+      callback(data)
+    }
+    ipcRenderer.on('external-idp-callback', handler)
+    return () => {
+      ipcRenderer.removeListener('external-idp-callback', handler)
+    }
   },
 
   // 启动 Social Auth 登录 (Google/GitHub)

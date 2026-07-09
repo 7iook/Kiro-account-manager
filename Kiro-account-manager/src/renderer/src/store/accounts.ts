@@ -145,7 +145,8 @@ async function syncLocalSsoAccountAsync(
       email: verifyResult.data.email,
       userId: verifyResult.data.userId,
       nickname: verifyResult.data.email ? verifyResult.data.email.split('@')[0] : undefined,
-      idp: (importResult.data.provider || 'BuilderId') as 'BuilderId' | 'Google' | 'Github',
+      idp: ((): IdpType => { const p = importResult.data.provider; if (p === 'AzureAD' || p === 'ExternalIdp') return 'ExternalIdp'; if (p === 'BuilderId' || p === 'Enterprise' || p === 'Github' || p === 'Google' || p === 'IAM_SSO' || p === 'AWSIdC' || p === 'Internal') return p as IdpType; return 'BuilderId' })(),
+      profileArn: importResult.data.profileArn,
       credentials: {
         accessToken: verifyResult.data.accessToken,
         csrfToken: '',
@@ -154,8 +155,13 @@ async function syncLocalSsoAccountAsync(
         clientSecret: importResult.data.clientSecret || '',
         region: importResult.data.region || 'us-east-1',
         expiresAt: verifyResult.data.expiresIn ? now + verifyResult.data.expiresIn * 1000 : now + 3600 * 1000,
-        authMethod: importResult.data.authMethod as 'IdC' | 'social',
-        provider: (importResult.data.provider || 'BuilderId') as 'BuilderId' | 'Github' | 'Google'
+        authMethod: importResult.data.authMethod as 'IdC' | 'social' | 'external_idp' | undefined,
+        provider: importResult.data.provider as 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO' | 'AzureAD' | 'ExternalIdp' | undefined,
+        // external_idp 字段：之前静默丢失导致后续刷新必败（微软端点拿不到）
+        tokenEndpoint: importResult.data.tokenEndpoint,
+        issuerUrl: importResult.data.issuerUrl,
+        scopes: importResult.data.scopes,
+        profileArn: importResult.data.profileArn
       },
       subscription: {
         type: verifyResult.data.subscriptionType as SubscriptionType,
@@ -1138,7 +1144,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const result: BatchOperationResult = { success: 0, failed: 0, errors: [] }
 
     // 验证 idp 是否有效
-    const validIdps = ['Google', 'Github', 'BuilderId'] as const
+    // 扩展白名单：加 Enterprise/AzureAD/ExternalIdp/IAM_SSO（external_idp 账户入库必需）
+    const validIdps = ['Google', 'Github', 'BuilderId', 'Enterprise', 'AzureAD', 'ExternalIdp', 'IAM_SSO'] as const
     const normalizeIdp = (idp?: string): IdpType => {
       if (!idp) return 'Google'
       const normalized = validIdps.find(v => v.toLowerCase() === idp.toLowerCase())
@@ -1153,6 +1160,23 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         const id = uuidv4()
         const machineId = generateRandomMachineId()
 
+        // expiresAt 秒/毫秒兼容：kiro-go/CLIProxyAPI 导出是秒级 Unix，项目内部统一毫秒
+        // 阈值 1e12≈ 2001-09-09 的毫秒，秒级时间戳(~1.78e9) 远小于它，毫秒级(~1.78e12) 则大于
+        const rawExpires = (item as { expiresAt?: number }).expiresAt
+        const expiresAt = typeof rawExpires === 'number' && rawExpires > 0
+          ? (rawExpires < 1e12 ? rawExpires * 1000 : rawExpires)
+          : now + 3600 * 1000
+
+        // AccountImportItem 现已包含 external_idp 必需字段（见 types/account.ts），直接取
+        const itemExt = item as {
+          authMethod?: string
+          provider?: string
+          tokenEndpoint?: string
+          issuerUrl?: string
+          scopes?: string
+          profileArn?: string
+        }
+
         const account: Account = {
           id,
           createdAt: now,
@@ -1162,6 +1186,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           password: item.password,
           nickname: item.nickname,
           idp: normalizeIdp(item.idp as string),
+          profileArn: itemExt.profileArn,
           credentials: {
             accessToken: item.accessToken || '',
             csrfToken: item.csrfToken || '',
@@ -1169,7 +1194,14 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             clientId: item.clientId,
             clientSecret: item.clientSecret,
             region: item.region || 'us-east-1',
-            expiresAt: now + 3600 * 1000
+            expiresAt,
+            // external_idp / 其他 账户的完整 credentials 字段（之前丢了导致入库即废）
+            authMethod: itemExt.authMethod as 'IdC' | 'social' | 'external_idp' | undefined,
+            provider: itemExt.provider as 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO' | 'AzureAD' | 'ExternalIdp' | undefined,
+            tokenEndpoint: itemExt.tokenEndpoint,
+            issuerUrl: itemExt.issuerUrl,
+            scopes: itemExt.scopes,
+            profileArn: itemExt.profileArn
           },
           subscription: {
             type: 'Free'
@@ -1639,7 +1671,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         Enterprise: 0,
         AWSIdC: 0,
         Internal: 0,
-        IAM_SSO: 0
+        IAM_SSO: 0,
+        AzureAD: 0,
+        ExternalIdp: 0
       },
       activeCount: 0,
       expiringSoonCount: 0,
@@ -2200,14 +2234,24 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           }
         }
         if (target === 'cli' || target === 'both') {
+          const availCreds = (availableAccount as {
+            profileArn?: string
+            credentials?: { tokenEndpoint?: string; issuerUrl?: string; scopes?: string; audience?: string }
+          })
+          const availScopes = availCreds.credentials?.scopes
           window.api.switchAccountCli?.({
             accessToken: creds.accessToken || '',
             refreshToken: creds.refreshToken || '',
             clientId: creds.clientId,
             clientSecret: creds.clientSecret,
             region: creds.region || 'us-east-1',
-            profileArn: (availableAccount as { profileArn?: string }).profileArn,
-            provider: creds.provider
+            profileArn: availCreds.profileArn,
+            provider: creds.provider,
+            // external_idp: renderer→IPC 边界不能丢字段，否则刷新无可回退刚水号旧 token 写入
+            scopes: availScopes ? availScopes.split(/\s+/).filter(Boolean) : undefined,
+            tokenEndpoint: availCreds.credentials?.tokenEndpoint,
+            issuerUrl: availCreds.credentials?.issuerUrl,
+            audience: availCreds.credentials?.audience
           }).catch(err => console.warn('[AutoSwitch CLI] Failed:', err))
         }
       } else {

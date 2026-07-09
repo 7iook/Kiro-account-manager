@@ -58,7 +58,7 @@ interface VerifiedData {
 }
 
 type ImportMode = 'oidc' | 'sso' | 'login'
-type LoginType = 'builderid' | 'google' | 'github' | 'iamsso'
+type LoginType = 'builderid' | 'google' | 'github' | 'iamsso' | 'externalidp'
 
 export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): React.ReactNode {
   const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab } = useAccountsStore()
@@ -130,6 +130,11 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     interval: number
   } | null>(null)
 
+  // external_idp (Microsoft Entra) 登录相关状态
+  const [entraEmail, setEntraEmail] = useState('')
+  const [entraAuthorizeUrl, setEntraAuthorizeUrl] = useState<string | null>(null)
+  const [entraCallbackUrl, setEntraCallbackUrl] = useState('')
+
   // 清理轮询
   useEffect(() => {
     return () => {
@@ -182,6 +187,20 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
     return () => unsubscribe()
   }, [isLoggingIn, loginType])
+
+  // external_idp deep-link 自动回调：浏览器登录完系统把 kiro://...?code=... 交回本 app，
+  // 主进程转发 external-idp-callback 事件 → 自动完成，无需用户粘贴。
+  // 用 ref 持有最新 complete 函数，避免闭包捕获旧值。
+  const completeExternalIdpRef = useRef<(url?: string) => void>(() => {})
+  useEffect(() => {
+    const unsubscribe = window.api.onExternalIdpCallback?.((data) => {
+      if (data?.url) {
+        setEntraCallbackUrl(data.url)
+        completeExternalIdpRef.current(data.url)
+      }
+    })
+    return () => unsubscribe?.()
+  }, [])
 
   // 处理登录成功
   const handleLoginSuccess = async (tokenData: {
@@ -310,6 +329,136 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       setIsLoggingIn(false)
     }
   }
+
+  // 启动 external_idp (Microsoft Entra) 登录：拿授权 URL 并打开浏览器
+  const handleStartExternalIdpLogin = async () => {
+    const email = entraEmail.trim()
+    if (!email || !email.includes('@')) {
+      setError(isEn ? 'Please enter your organization email' : '请输入完整的组织邮箱')
+      return
+    }
+    setIsLoggingIn(true)
+    setError(null)
+    setEntraAuthorizeUrl(null)
+    setEntraCallbackUrl('')
+    try {
+      const result = await window.api.startExternalIdpLogin(email)
+      if (result.success && result.authorizeUrl) {
+        setEntraAuthorizeUrl(result.authorizeUrl)
+        // 打开系统浏览器（支持隐私模式）
+        window.api.openExternal(result.authorizeUrl, usePrivateMode)
+      } else {
+        setError(result.error || (isEn ? 'Failed to start login' : '启动登录失败'))
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : (isEn ? 'Failed to start login' : '启动登录失败'))
+    } finally {
+      setIsLoggingIn(false)
+    }
+  }
+
+  // 完成 external_idp 登录：换 token + 落库。
+  // urlOverride 来自 deep-link 自动回调（全自动）；无则取粘贴框（兜底）。
+  const handleCompleteExternalIdpLogin = async (urlOverride?: string) => {
+    const callbackUrl = (urlOverride ?? entraCallbackUrl).trim()
+    if (!callbackUrl) {
+      setError(isEn ? 'Please paste the callback link' : '请粘贴浏览器里的回调链接')
+      return
+    }
+    setIsSubmitting(true)
+    setError(null)
+    try {
+      const result = await window.api.completeExternalIdpLogin(callbackUrl)
+      if (!result.success || !result.accessToken) {
+        setError(result.error || (isEn ? 'Login failed' : '登录失败'))
+        return
+      }
+      // 用拿到的微软 token 走验证 + 查用量（authMethod=external_idp，profileArn 已带回）
+      const verify = await window.api.verifyAccountCredentials({
+        refreshToken: result.refreshToken || '',
+        clientId: result.clientId || '',
+        clientSecret: '',
+        region: 'us-east-1',
+        authMethod: 'external_idp',
+        provider: 'AzureAD',
+        accessToken: result.accessToken,
+        tokenEndpoint: result.tokenEndpoint,
+        issuerUrl: result.issuerUrl,
+        scopes: result.scopes,
+        profileArn: result.profileArn
+      })
+      if (!verify.success || !verify.data) {
+        setError(verify.error || (isEn ? 'Verification failed' : '账号验证失败'))
+        return
+      }
+      const { email: vEmail, userId } = verify.data
+      const finalEmail = vEmail || result.email || entraEmail.trim()
+      if (isAccountExists(finalEmail, userId, 'ExternalIdp')) {
+        setError(isEn ? 'This account already exists' : '该账号已存在，无需重复添加')
+        return
+      }
+      const now = Date.now()
+      addAccount({
+        email: finalEmail,
+        userId,
+        nickname: finalEmail ? finalEmail.split('@')[0] : undefined,
+        idp: 'ExternalIdp',
+        groupId: selectedGroupId,
+        credentials: {
+          accessToken: verify.data.accessToken,
+          csrfToken: '',
+          refreshToken: verify.data.refreshToken || result.refreshToken || '',
+          clientId: result.clientId || '',
+          clientSecret: '',
+          region: 'us-east-1',
+          expiresAt: verify.data.expiresIn ? now + verify.data.expiresIn * 1000 : now + 3600 * 1000,
+          authMethod: 'external_idp',
+          provider: 'ExternalIdp',
+          profileArn: verify.data.profileArn || result.profileArn,
+          tokenEndpoint: result.tokenEndpoint,
+          issuerUrl: result.issuerUrl,
+          scopes: result.scopes
+        },
+        subscription: {
+          type: verify.data.subscriptionType as SubscriptionType,
+          title: verify.data.subscriptionTitle,
+          daysRemaining: verify.data.daysRemaining,
+          expiresAt: verify.data.expiresAt,
+          managementTarget: verify.data.subscription?.managementTarget,
+          upgradeCapability: verify.data.subscription?.upgradeCapability,
+          overageCapability: verify.data.subscription?.overageCapability
+        },
+        usage: {
+          current: verify.data.usage.current,
+          limit: verify.data.usage.limit,
+          percentUsed: verify.data.usage.limit > 0
+            ? verify.data.usage.current / verify.data.usage.limit
+            : 0,
+          lastUpdated: now,
+          baseLimit: verify.data.usage.baseLimit,
+          baseCurrent: verify.data.usage.baseCurrent,
+          freeTrialLimit: verify.data.usage.freeTrialLimit,
+          freeTrialCurrent: verify.data.usage.freeTrialCurrent,
+          freeTrialExpiry: verify.data.usage.freeTrialExpiry,
+          bonuses: verify.data.usage.bonuses,
+          nextResetDate: verify.data.usage.nextResetDate,
+          resourceDetail: verify.data.usage.resourceDetail
+        },
+        tags: [],
+        status: 'active',
+        lastUsedAt: now
+      })
+      resetForm()
+      onClose()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : (isEn ? 'Login failed' : '完成登录失败'))
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  // 让 deep-link 回调 ref 始终指向最新的 complete 函数（闭包防陈旧）
+  completeExternalIdpRef.current = handleCompleteExternalIdpLogin
 
   // 启动 IAM SSO 登录 (Authorization Code flow)
   const handleStartIamSsoLogin = async () => {
@@ -663,8 +812,13 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       clientId?: string
       clientSecret?: string
       region?: string
-      authMethod?: 'IdC' | 'social'
+      authMethod?: 'IdC' | 'social' | 'external_idp'
       provider?: string
+      accessToken?: string
+      tokenEndpoint?: string
+      issuerUrl?: string
+      scopes?: string
+      profileArn?: string
     }>
 
     const trimmed = oidcBatchData.trim()
@@ -730,9 +884,11 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           return
         }
 
-        // 根据 provider 自动确定 authMethod
+        // 根据 provider 自动确定 authMethod（external_idp 优先）
         const credProvider = cred.provider || 'BuilderId'
-        const credAuthMethod = cred.authMethod || ((credProvider === 'BuilderId' || credProvider === 'Enterprise') ? 'IdC' : 'social')
+        const isExtIdp = credProvider === 'AzureAD' || credProvider === 'ExternalIdp' || cred.authMethod === 'external_idp'
+        const credAuthMethod = isExtIdp ? 'external_idp'
+          : cred.authMethod || ((credProvider === 'BuilderId' || credProvider === 'Enterprise') ? 'IdC' : 'social')
 
         const result = await window.api.verifyAccountCredentials({
           refreshToken: cred.refreshToken,
@@ -740,12 +896,17 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           clientSecret: cred.clientSecret || '',
           region: cred.region || 'us-east-1',
           authMethod: credAuthMethod,
-          provider: credProvider
+          provider: credProvider,
+          accessToken: cred.accessToken,
+          tokenEndpoint: cred.tokenEndpoint,
+          issuerUrl: cred.issuerUrl,
+          scopes: cred.scopes,
+          profileArn: cred.profileArn
         })
 
         if (result.success && result.data) {
           const { email, userId } = result.data
-          const provider = (cred.provider || 'BuilderId') as 'BuilderId' | 'Enterprise' | 'Github' | 'Google'
+          const provider = (cred.provider || 'BuilderId') as 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'AzureAD' | 'ExternalIdp'
           
           if (isAccountExists(email, userId, provider)) {
             // 已存在的不记入失败，也从输入框中移除
@@ -754,15 +915,18 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           }
           
           // 根据 provider 确定 idp 和 authMethod
-          const idpMap: Record<string, 'BuilderId' | 'Enterprise' | 'Github' | 'Google'> = {
+          const idpMap: Record<string, 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'AzureAD' | 'ExternalIdp'> = {
             'BuilderId': 'BuilderId',
             'Enterprise': 'Enterprise',
             'Github': 'Github',
-            'Google': 'Google'
+            'Google': 'Google',
+            'AzureAD': 'ExternalIdp',
+            'ExternalIdp': 'ExternalIdp'
           }
           const idp = idpMap[provider] || 'BuilderId'
-          // GitHub 和 Google 使用 social 认证方式，BuilderId 和 Enterprise 使用 IdC
-          const authMethod = cred.authMethod || ((provider === 'BuilderId' || provider === 'Enterprise') ? 'IdC' : 'social')
+          // external_idp 用 external_idp；GitHub/Google 用 social；BuilderId/Enterprise 用 IdC
+          const authMethod = isExtIdp ? 'external_idp'
+            : cred.authMethod || ((provider === 'BuilderId' || provider === 'Enterprise') ? 'IdC' : 'social')
           
           const now = Date.now()
           addAccount({
@@ -782,7 +946,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
               authMethod,
               provider,
-              profileArn: result.data.profileArn
+              profileArn: result.data.profileArn || cred.profileArn,
+              tokenEndpoint: cred.tokenEndpoint,
+              issuerUrl: cred.issuerUrl,
+              scopes: cred.scopes
             },
             subscription: {
               type: result.data.subscriptionType as SubscriptionType,
@@ -987,6 +1154,11 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setIsLoggingIn(false)
     setBuilderIdLoginData(null)
     setCopied(false)
+    // 清理 external_idp 登录状态
+    setEntraEmail('')
+    setEntraAuthorizeUrl(null)
+    setEntraCallbackUrl('')
+    void window.api.cancelExternalIdpLogin?.()
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current)
       pollIntervalRef.current = null
@@ -1257,6 +1429,27 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                         <span className="text-xs text-muted-foreground">IAM Identity Center SSO</span>
                       </div>
                     </button>
+
+                    {/* Microsoft Entra (external_idp / Your organization) */}
+                    <button
+                      className="group w-full h-14 flex items-center px-4 gap-4 bg-background hover:bg-muted border border-border rounded-xl transition-all duration-200 hover:shadow-md hover:border-primary/30"
+                      onClick={() => {
+                        setLoginType('externalidp')
+                      }}
+                    >
+                      <div className="w-8 h-8 flex items-center justify-center bg-white dark:bg-slate-800 rounded-full shadow-sm border dark:border-slate-600 p-1.5 group-hover:scale-110 transition-transform">
+                        <svg viewBox="0 0 23 23" className="w-full h-full">
+                          <path fill="#f25022" d="M1 1h10v10H1z"/>
+                          <path fill="#7fba00" d="M12 1h10v10H12z"/>
+                          <path fill="#00a4ef" d="M1 12h10v10H1z"/>
+                          <path fill="#ffb900" d="M12 12h10v10H12z"/>
+                        </svg>
+                      </div>
+                      <div className="flex flex-col items-start">
+                        <span className="text-sm font-semibold text-foreground">{isEn ? 'Microsoft Entra' : '微软 Entra 组织账号'}</span>
+                        <span className="text-xs text-muted-foreground">{isEn ? 'Your organization (External IdP)' : '你的组织 (External IdP)'}</span>
+                      </div>
+                    </button>
                   </div>
 
                   {/* IAM SSO 输入框 */}
@@ -1369,6 +1562,88 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                         variant="destructive" 
                         className="w-full"
                         onClick={handleCancelLogin}
+                      >
+                        {isEn ? 'Cancel' : '取消登录'}
+                      </Button>
+                    </div>
+                  )}
+
+                  {/* Microsoft Entra: 输入 email 启动 */}
+                  {loginType === 'externalidp' && !entraAuthorizeUrl && (
+                    <div className="space-y-4 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700">
+                      <div className="space-y-2">
+                        <Label htmlFor="entraEmail" className="text-sm font-medium">{isEn ? 'Organization Email' : '组织邮箱'}</Label>
+                        <Input
+                          id="entraEmail"
+                          type="email"
+                          placeholder="user@your-company.com"
+                          value={entraEmail}
+                          onChange={(e) => setEntraEmail(e.target.value)}
+                          className="font-mono text-sm"
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          {isEn ? 'Your Microsoft Entra / Azure AD organization account' : '你的微软 Entra / Azure AD 组织账号邮箱'}
+                        </p>
+                      </div>
+                      <Button
+                        className="w-full"
+                        onClick={handleStartExternalIdpLogin}
+                        disabled={!entraEmail.trim() || isLoggingIn}
+                      >
+                        {isLoggingIn ? (isEn ? 'Starting...' : '启动中...') : (isEn ? 'Start Login (opens browser)' : '开始登录（打开浏览器）')}
+                      </Button>
+                    </div>
+                  )}
+
+                  {/* Microsoft Entra: 浏览器登录后粘贴回调链接 */}
+                  {loginType === 'externalidp' && entraAuthorizeUrl && (
+                    <div className="space-y-4 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700">
+                      <div className="p-3 bg-primary/[0.04] rounded-lg border border-primary/15">
+                        <div className="flex items-start gap-2">
+                          <Info className="w-4 h-4 text-primary mt-0.5 shrink-0" />
+                          <ol className="text-xs text-primary/90 list-decimal list-inside space-y-1">
+                            <li>{isEn ? 'Finish sign-in in the opened browser (email + password)' : '在打开的浏览器里完成登录（邮箱 + 密码）'}</li>
+                            <li>{isEn ? 'When the browser asks to open this app, click Allow — login completes automatically' : '当浏览器提示"打开此应用"时点允许，登录会自动完成'}</li>
+                            <li>{isEn ? 'If nothing happens, copy the kiro:// link and paste below' : '若无反应，复制 kiro:// 链接粘到下方兜底'}</li>
+                          </ol>
+                        </div>
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="entraCallback" className="text-sm font-medium">{isEn ? 'Callback Link (kiro://...)' : '回调链接 (kiro://...)'}</Label>
+                        <Input
+                          id="entraCallback"
+                          type="text"
+                          placeholder="kiro://kiro.oauth/callback?code=..."
+                          value={entraCallbackUrl}
+                          onChange={(e) => setEntraCallbackUrl(e.target.value)}
+                          className="font-mono text-xs"
+                        />
+                      </div>
+                      <div className="flex gap-2">
+                        <Button
+                          className="flex-1"
+                          onClick={() => handleCompleteExternalIdpLogin()}
+                          disabled={!entraCallbackUrl.trim() || isSubmitting}
+                        >
+                          {isSubmitting ? (isEn ? 'Completing...' : '完成中...') : (isEn ? 'Complete' : '完成登录')}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          onClick={() => {
+                            window.api.openExternal(entraAuthorizeUrl, usePrivateMode)
+                          }}
+                        >
+                          {isEn ? 'Reopen' : '重开浏览器'}
+                        </Button>
+                      </div>
+                      <Button
+                        variant="destructive"
+                        className="w-full"
+                        onClick={() => {
+                          setEntraAuthorizeUrl(null)
+                          setEntraCallbackUrl('')
+                          void window.api.cancelExternalIdpLogin?.()
+                        }}
                       >
                         {isEn ? 'Cancel' : '取消登录'}
                       </Button>

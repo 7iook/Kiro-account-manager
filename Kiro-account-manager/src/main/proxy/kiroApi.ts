@@ -1300,14 +1300,43 @@ export async function callKiroApiStream(
       
       const agent = getNetworkAgent(account)
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
-      const response = agent
+      // [TIMING] 捕捉发请求前的时间。下面的 fetch 多耗时 = 后端回 TTFB 时间(不含思考)。
+      const kiroCallStart = Date.now()
+      const timingReqId = Math.random().toString(36).slice(2, 8)
+      console.log(`[TIMING:kiro] [${timingReqId}] fetch-start endpoint=${endpoint.name} payload=${payloadStr.length}B model=${requestedModelId || 'default'}`)
+      let response = agent
         ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
         : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
+      // [TIMING] response 头到手。这个时长 = 网络流量 + Kiro 后端处理到不得不开始发流。继续看 first-content 才知道首字节内容时间。
+      console.log(`[TIMING:kiro] [${timingReqId}] fetch-response elapsed=${Date.now() - kiroCallStart}ms status=${response.status}`)
 
       if (response.status === 429) {
-        console.log(`[KiroAPI] Endpoint ${endpoint.name} quota exhausted, trying next...`)
-        lastError = new Error(`Quota exhausted on ${endpoint.name}`)
-        continue
+        // 429 = rate limit(短期请求过多),不是永久配额耗尽。
+        // 策略:同端点指数退避 + 重试(默认 3 次)。Retry-After header 优先(HTTP 标准)。
+        // 都失败才 continue 到下一端点。参考:GitHub kirodotdev/Kiro#8998 credits 充足也 429,
+        // 时间序列证明 rate limit 窗口通常 10-15 秒后恢复,退避重试能救回大多数 burst 失败。
+        const RATE_LIMIT_MAX_RETRIES = 3
+        let retried = 0
+        while (response.status === 429 && retried < RATE_LIMIT_MAX_RETRIES) {
+          const retryAfterHeader = response.headers.get('retry-after')
+          const asSec = retryAfterHeader ? parseInt(retryAfterHeader, 10) : NaN
+          const waitMs = !isNaN(asSec) && asSec > 0 ? Math.min(asSec * 1000, 15000)
+            : (retried === 0 ? 2000 : retried === 1 ? 5000 : 10000)
+          console.log(`[KiroAPI] ${endpoint.name} 429 rate-limited, backoff ${waitMs}ms retry ${retried + 1}/${RATE_LIMIT_MAX_RETRIES}`)
+          await new Promise(r => setTimeout(r, waitMs))
+          throwIfAborted(signal)
+          response = agent
+            ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+            : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
+          retried++
+        }
+        if (response.status === 429) {
+          console.log(`[KiroAPI] ${endpoint.name} still rate-limited after ${RATE_LIMIT_MAX_RETRIES} retries, trying next endpoint...`)
+          lastError = new Error(`Rate limited on ${endpoint.name} after ${RATE_LIMIT_MAX_RETRIES} retries`)
+          continue
+        }
+        console.log(`[KiroAPI] ${endpoint.name} recovered from 429 after ${retried} retries`)
+        // 重试成功,response 已更新,fall through 到下面 401/403 检查 → not-ok 检查 → stream 解析
       }
 
       if (response.status === 401 || response.status === 403) {
@@ -1327,7 +1356,7 @@ export async function callKiroApiStream(
       // 解析 Event Stream
       // 传入 modelId + payloadStr 用于精确 token 计算（contextUsage 反推 + tiktoken）
       const inputChars = payloadStr.length
-      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr)
+      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr, timingReqId, kiroCallStart)
       return
     } catch (error) {
       if (signal?.aborted) {
@@ -1458,7 +1487,9 @@ async function parseEventStream(
   inputChars: number = 0,  // 输入字符长度（兜底估算用）
   signal?: AbortSignal,
   modelId?: string,        // 模型 ID，用于 contextUsagePercentage 反推 inputTokens
-  payloadStr?: string      // 请求 payload JSON 字符串，用于 tiktoken 精确计算
+  payloadStr?: string,     // 请求 payload JSON 字符串，用于 tiktoken 精确计算
+  timingReqId?: string,    // [TIMING] 请求相关小 id，串联日志
+  timingKiroCallStart?: number  // [TIMING] fetch-start 时间戳，用于算 first-content 相对 fetch 的总时间
 ): Promise<void> {
   const reader = body.getReader()
   const abort = () => {
@@ -1480,6 +1511,9 @@ async function parseEventStream(
   let collectedOutputText = ''
   // 是否已拿到 Kiro 真实 tokenUsage（最高优先级，锁定后不再被 contextUsage/tiktoken 覆盖）
   let hasRealTokenUsage = false
+  // [TIMING] 首个可见内容事件打点（assistantResponseEvent 或 reasoningContentEvent）
+  const streamParseStart = Date.now()
+  let firstContentLogged = false
   
   // 流式事件聚合计数（logStreamEvents 开启时，结束后输出摘要而非逐条输出）
   const streamEventCounts: Record<string, number> = {}
@@ -1538,6 +1572,22 @@ async function parseEventStream(
     }
     return { name, input }
   }
+  // 解析 <tool_use id="..." name="..."> {json body} </tool_use> 泄漏格式(Anthropic 标准格式)
+  // 与 <invoke> 不同：body 直接是 JSON 对象,不用 <parameter> 标签
+  const parseToolUseBlock = (rawBlock: string): { name: string; input: Record<string, unknown> } | null => {
+    const nameMatch = rawBlock.match(/<tool_use\b[^>]*\bname="([^"]+)"/)
+    if (!nameMatch) return null
+    const name = nameMatch[1]
+    const bodyMatch = rawBlock.match(/<tool_use\b[^>]*>([\s\S]*?)<\/tool_use>/)
+    if (!bodyMatch) return null
+    const body = bodyMatch[1].trim()
+    let input: Record<string, unknown> = {}
+    if (body) {
+      try { input = JSON.parse(body) as Record<string, unknown> }
+      catch { input = { _raw: body } }  // JSON 坏了兜底原文,让下游 tool 至少收到点东西
+    }
+    return { name, input }
+  }
   const stripToolPrefix = (pre: string): string => {
     const fc = pre.match(/<function_calls>\s*$/)
     if (fc) return pre.slice(0, pre.length - fc[0].length)
@@ -1551,7 +1601,7 @@ async function parseEventStream(
     return !s.slice(i).includes('</invoke>')
   }
   const pendingToolTail = (s: string): number => {
-    const markers = ['<function_calls>', '<invoke name=', '</invoke>', '</function_calls>', '<parameter name=', '</parameter>', 'count']
+    const markers = ['<function_calls>', '<invoke name=', '</invoke>', '</function_calls>', '<parameter name=', '</parameter>', '<tool_use', '</tool_use>', 'count']
     let hold = 0
     for (const tag of markers) {
       for (let k = Math.min(s.length, tag.length - 1); k >= 1; k--) {
@@ -1575,6 +1625,30 @@ async function parseEventStream(
       await onChunk(s)
       totalOutputChars += s.length
       collectedOutputText += s
+    }
+    // 提取所有已闭合的 <tool_use>(Anthropic 标准格式,Opus 4.8 常见泄漏)
+    for (;;) {
+      const fi = leakCarry.indexOf('<tool_use')
+      if (fi === -1) break
+      const ci = leakCarry.indexOf('</tool_use>', fi)
+      if (ci === -1) break // 未闭合,等更多帧
+      const endIdx = ci + '</tool_use>'.length
+      const rawBlock = leakCarry.slice(fi, endIdx)
+      const tool = parseToolUseBlock(rawBlock)
+      if (tool) {
+        await emit(leakCarry.slice(0, fi))
+        leakedTools.push(tool)
+        if (toolLeakDebug) {
+          try {
+            console.log('[tool-leak-fix] parsed leaked <tool_use>:', tool.name, JSON.stringify(tool.input).slice(0, 120))
+          } catch { /* ignore */ }
+        }
+        leakCarry = leakCarry.slice(endIdx)
+      } else {
+        // 匹配了但 parse 失败 —— 极罕见,原样输出避免死循环
+        await emit(leakCarry.slice(0, endIdx))
+        leakCarry = leakCarry.slice(endIdx)
+      }
     }
     // 提取所有已闭合的 invoke
     for (;;) {
@@ -1682,6 +1756,12 @@ async function parseEventStream(
             
             // 根据 event type 处理不同类型的事件
             if (eventType === 'assistantResponseEvent' || event.assistantResponseEvent) {
+              if (!firstContentLogged) {
+                firstContentLogged = true
+                const sinceParse = Date.now() - streamParseStart
+                const sinceFetch = timingKiroCallStart ? Date.now() - timingKiroCallStart : sinceParse
+                console.log(`[TIMING:kiro] [${timingReqId || '??????'}] first-content (assistant) elapsed=${sinceFetch}ms from-fetch-start, parse-phase=${sinceParse}ms`)
+              }
               const assistantResp = event.assistantResponseEvent || event
               const content = assistantResp.content as string | undefined
               if (content) {
@@ -1968,6 +2048,12 @@ async function parseEventStream(
             // 处理 reasoningContentEvent - Thinking 模式的推理内容
             // Kiro ReasoningContentEvent 字段：[text, redactedContent, signature]
             if (eventType === 'reasoningContentEvent' || event.reasoningContentEvent) {
+              if (!firstContentLogged) {
+                firstContentLogged = true
+                const sinceParse = Date.now() - streamParseStart
+                const sinceFetch = timingKiroCallStart ? Date.now() - timingKiroCallStart : sinceParse
+                console.log(`[TIMING:kiro] [${timingReqId || '??????'}] first-content (reasoning) elapsed=${sinceFetch}ms from-fetch-start, parse-phase=${sinceParse}ms`)
+              }
               const reasoning = event.reasoningContentEvent || event
               if (reasoning.text) {
                 proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
@@ -2266,6 +2352,10 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
   }
+  // external_idp (Azure AD) 需 TokenType header 走外部 IdP 校验路径，否则 CW REST 拒 403 "Invalid token"
+  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
+    headers['TokenType'] = 'EXTERNAL_IDP'
+  }
 
   // 获取该账号类型对应的备用 ARN（403 时兜底，避免每次请求都重复尝试）
   const fallbackArn = resolveProfileArn(account)
@@ -2318,6 +2408,10 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
     'User-Agent': getKiroUserAgent(machineId),
     'x-amz-user-agent': getKiroAmzUserAgent(machineId),
     'x-amzn-codewhisperer-optout': 'true'
+  }
+  // external_idp (Azure AD) 需 TokenType header，否则 ListAvailableModels 403 "Invalid token"
+  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
+    headers['TokenType'] = 'EXTERNAL_IDP'
   }
 
   const allModels: KiroModel[] = []
@@ -2417,6 +2511,10 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
   }
+  // external_idp (Azure AD) 需 TokenType header 走外部 IdP 校验路径
+  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
+    headers['TokenType'] = 'EXTERNAL_IDP'
+  }
 
   const profileArn = resolveProfileArn(account)
   const body = JSON.stringify(profileArn ? { profileArn } : {})
@@ -2467,6 +2565,10 @@ export async function fetchSubscriptionToken(
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
   }
+  // external_idp (Azure AD) 需 TokenType header
+  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
+    headers['TokenType'] = 'EXTERNAL_IDP'
+  }
 
   const profileArn = resolveProfileArn(account)
 
@@ -2515,6 +2617,10 @@ export async function setUserPreference(
     'x-amz-user-agent': getSubscriptionAmzUserAgent(machineId),
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
+  }
+  // external_idp (Azure AD) 需 TokenType header
+  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
+    headers['TokenType'] = 'EXTERNAL_IDP'
   }
 
   const profileArn = resolveProfileArn(account)

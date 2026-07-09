@@ -101,11 +101,92 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
       if (format === 'json') {
         // JSON 格式：完整导出数据
         const data = JSON.parse(content)
+        // 识别 kiro-go / CLIProxyAPI 导出的 external_idp 账户（单对象或数组，无 version/accounts 包装）
+        // 兼容 camelCase (老版本) 和 snake_case (kiro-go CLIProxyAPI 新版) 两种字段命名
+        const pick = <T,>(o: Record<string, unknown>, ...keys: string[]): T | undefined => {
+          for (const k of keys) {
+            const v = o[k]
+            if (v !== undefined && v !== null && v !== '') return v as T
+          }
+          return undefined
+        }
+        const isMsEndpoint = (u?: string): boolean => !!u && /^https:\/\/login\.(microsoftonline|microsoft|windows)\.(com|net)\//i.test(u)
+        const isExtIdp = (raw: unknown): boolean => {
+          if (!raw || typeof raw !== 'object') return false
+          const o = raw as Record<string, unknown>
+          const authMethod = pick<string>(o, 'authMethod', 'auth_method')
+          const provider = pick<string>(o, 'provider')
+          const refreshToken = pick<string>(o, 'refreshToken', 'refresh_token')
+          const tokenEndpoint = pick<string>(o, 'tokenEndpoint', 'token_endpoint')
+          const looksExtIdp = authMethod === 'external_idp'
+            || provider === 'AzureAD' || provider === 'ExternalIdp'
+            || isMsEndpoint(tokenEndpoint)
+          return looksExtIdp && !!refreshToken && !!tokenEndpoint
+        }
+        // 从 JWT accessToken 里解 preferred_username / email / upn (email 字段缺失时回退)
+        const emailFromJwt = (token?: string): string => {
+          if (!token) return ''
+          try {
+            const parts = token.split('.')
+            if (parts.length < 2) return ''
+            let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+            while (b64.length % 4) b64 += '='
+            const json = decodeURIComponent(atob(b64).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''))
+            const p = JSON.parse(json) as { email?: string; preferred_username?: string; upn?: string; unique_name?: string }
+            return p.email || p.preferred_username || p.upn || p.unique_name || ''
+          } catch { return '' }
+        }
+        // 支持数字秒/毫秒 和 ISO 字符串(kiro-go 新版用 "expired": "2026-07-07T09:18:52Z")
+        const parseExpiresAt = (raw: unknown): number | undefined => {
+          if (typeof raw === 'number' && raw > 0) return raw
+          if (typeof raw === 'string' && raw) {
+            const t = Date.parse(raw)
+            if (!isNaN(t)) return t
+          }
+          return undefined
+        }
         if (data.version && data.accounts) {
           const result = importFromExportData(data)
           const skippedInfo = result.errors.find(e => e.id === 'skipped')
           const skippedMsg = skippedInfo ? `，${skippedInfo.error}` : ''
           alert(`导入完成：成功 ${result.success} 个${skippedMsg}`)
+        } else if (Array.isArray(data) ? data.some(isExtIdp) : isExtIdp(data)) {
+          // kiro-go / CLIProxyAPI external_idp（Azure AD）账户导入
+          const arr = (Array.isArray(data) ? data : [data]).filter(isExtIdp) as Record<string, unknown>[]
+          const items = arr.map((o) => {
+            const accessToken = pick<string>(o, 'accessToken', 'access_token')
+            const refreshToken = pick<string>(o, 'refreshToken', 'refresh_token') as string
+            const clientId = pick<string>(o, 'clientId', 'client_id')
+            const tokenEndpoint = pick<string>(o, 'tokenEndpoint', 'token_endpoint')
+            const issuerUrl = pick<string>(o, 'issuerUrl', 'issuer_url')
+            const profileArn = pick<string>(o, 'profileArn', 'profile_arn')
+            const scopes = pick<string>(o, 'scopes', 'scope')
+            const providerRaw = pick<string>(o, 'provider')
+            // provider 缺失时,tokenEndpoint 是微软域名就推断为 AzureAD
+            const provider = providerRaw || (isMsEndpoint(tokenEndpoint) ? 'AzureAD' : 'ExternalIdp')
+            const emailRaw = pick<string>(o, 'email')
+            const email = emailRaw || emailFromJwt(accessToken)
+            const region = pick<string>(o, 'region') || 'us-east-1'
+            const expiresAt = parseExpiresAt(o.expiresAt ?? o.expires_at ?? o.expired)
+            return {
+              email,
+              refreshToken,
+              accessToken,
+              clientId,
+              region,
+              idp: 'ExternalIdp',
+              authMethod: 'external_idp',
+              provider,
+              tokenEndpoint,
+              issuerUrl,
+              scopes,
+              profileArn,
+              expiresAt,
+              groupId: currentGroupId
+            }
+          })
+          const result = importAccounts(items)
+          alert(`导入完成：成功 ${result.success} 个 Azure AD (external_idp) 账户（分组：${groupName}）`)
         } else {
           alert('无效的 JSON 文件格式')
         }

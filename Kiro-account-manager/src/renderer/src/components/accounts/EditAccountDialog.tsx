@@ -388,7 +388,7 @@ export function EditAccountDialog({
                 variant="secondary"
                 className="w-full h-10 rounded-xl font-medium"
                 onClick={handleVerifyAndRefresh}
-                disabled={isVerifying || !refreshToken || (account?.credentials.authMethod !== 'social' && (!clientId || !clientSecret))}
+                disabled={isVerifying || !refreshToken || (account?.credentials.authMethod !== 'social' && account?.credentials.authMethod !== 'external_idp' && (!clientId || !clientSecret))}
               >
                 {isVerifying ? (
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />
