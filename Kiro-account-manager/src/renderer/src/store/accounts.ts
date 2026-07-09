@@ -134,7 +134,13 @@ async function syncLocalSsoAccountAsync(
       clientSecret: importResult.data.clientSecret || '',
       region: importResult.data.region,
       authMethod: importResult.data.authMethod,
-      provider: importResult.data.provider
+      provider: importResult.data.provider,
+      // external_idp 验证/刷新走微软端点，必须带这些字段，否则报"缺少 tokenEndpoint"
+      accessToken: importResult.data.accessToken,
+      tokenEndpoint: importResult.data.tokenEndpoint,
+      issuerUrl: importResult.data.issuerUrl,
+      scopes: importResult.data.scopes,
+      profileArn: importResult.data.profileArn
     })
     if (!verifyResult.success || !verifyResult.data) return
 
