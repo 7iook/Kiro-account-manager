@@ -831,7 +831,18 @@ export const AccountCard = memo(function AccountCard({
 
             {/* Right: Actions */}
             <div className="flex items-center gap-0.5">
-               {account.isActive ? (
+               {/* 切换到此账号：激活账号也可再点一次，重新把登录态写进 IDE */}
+               <Button
+                 size="icon"
+                 variant="ghost"
+                 className="h-7 w-7 hover:bg-primary/10 hover:text-primary transition-colors"
+                 onClick={(e) => { e.stopPropagation(); handleSwitch() }}
+                 title={isEn ? 'Switch to this account' : '切换到此账号'}
+               >
+                 <Power className="h-3.5 w-3.5" />
+               </Button>
+               {/* 退出登录：仅当前激活账号显示 */}
+               {account.isActive && (
                  <Button
                    size="icon"
                    variant="ghost"
@@ -840,16 +851,6 @@ export const AccountCard = memo(function AccountCard({
                    title={isEn ? 'Logout (clear SSO cache)' : '退出登录（清除 SSO 缓存）'}
                  >
                    <LogOut className="h-3.5 w-3.5" />
-                 </Button>
-               ) : (
-                 <Button
-                   size="icon"
-                   variant="ghost"
-                   className="h-7 w-7 hover:bg-primary/10 hover:text-primary transition-colors"
-                   onClick={(e) => { e.stopPropagation(); handleSwitch() }}
-                   title={isEn ? 'Switch to this account' : '切换到此账号'}
-                 >
-                   <Power className="h-3.5 w-3.5" />
                  </Button>
                )}
                

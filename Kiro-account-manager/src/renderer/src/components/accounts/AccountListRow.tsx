@@ -557,7 +557,8 @@ function AccountListRowComponent({
           </>
         )}
 
-        {!account.isActive && !isUnauthorized && (
+        {/* 切换到该账号：激活账号也可再点一次，重新把登录态写进 IDE */}
+        {!isUnauthorized && (
           <Button
             size="icon"
             variant="ghost"
