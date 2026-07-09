@@ -2052,6 +2052,9 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
           provider?: string
           profileArn?: string
           expiresAt?: number
+          tokenEndpoint?: string
+          issuerUrl?: string
+          scopes?: string
         }
       }>
       autoRefreshEnabled?: boolean
@@ -2088,7 +2091,11 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
           authMethod: creds.authMethod,
           accessToken: creds.accessToken,
           provider: creds.provider,
-          profileArn: creds.profileArn
+          profileArn: creds.profileArn,
+          // external_idp 主进程自动刷新走微软端点，必须带这些字段，否则报"缺少 tokenEndpoint"
+          tokenEndpoint: creds.tokenEndpoint,
+          issuerUrl: creds.issuerUrl,
+          scopes: creds.scopes
         }
       })
     }

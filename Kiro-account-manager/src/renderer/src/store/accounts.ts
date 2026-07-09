@@ -1440,6 +1440,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         accessToken?: string
         provider?: string
         profileArn?: string
+        tokenEndpoint?: string
+        issuerUrl?: string
+        scopes?: string
       }
     }> = []
 
@@ -1459,7 +1462,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           authMethod: account.credentials.authMethod,
           accessToken: account.credentials.accessToken,
           provider: account.credentials.provider || account.idp,
-          profileArn: account.credentials.profileArn
+          profileArn: account.credentials.profileArn,
+          // external_idp 刷新走微软端点，必须带这些字段，否则报"缺少 tokenEndpoint"
+          tokenEndpoint: account.credentials.tokenEndpoint,
+          issuerUrl: account.credentials.issuerUrl,
+          scopes: account.credentials.scopes
         }
       })
     }
@@ -1596,6 +1603,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         region?: string
         authMethod?: string
         provider?: string
+        tokenEndpoint?: string
+        issuerUrl?: string
+        scopes?: string
       }
       idp?: string
     }> = []
@@ -1614,7 +1624,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           clientSecret: account.credentials.clientSecret,
           region: account.credentials.region,
           authMethod: account.credentials.authMethod,
-          provider: account.credentials.provider
+          provider: account.credentials.provider,
+          // external_idp 401 重试刷新走微软端点，必须带这些字段
+          tokenEndpoint: account.credentials.tokenEndpoint,
+          issuerUrl: account.credentials.issuerUrl,
+          scopes: account.credentials.scopes
         },
         idp: account.idp
       })
@@ -2440,6 +2454,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         accessToken?: string
         provider?: string
         profileArn?: string
+        tokenEndpoint?: string
+        issuerUrl?: string
+        scopes?: string
       }
     }> = []
     
@@ -2470,7 +2487,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             authMethod: account.credentials.authMethod,
             accessToken: account.credentials.accessToken,
             provider: account.credentials.provider,
-            profileArn: account.credentials.profileArn
+            profileArn: account.credentials.profileArn,
+            // external_idp 刷新走微软端点，必须带这些字段，否则报"缺少 tokenEndpoint"
+            tokenEndpoint: account.credentials.tokenEndpoint,
+            issuerUrl: account.credentials.issuerUrl,
+            scopes: account.credentials.scopes
           }
         })
       }
