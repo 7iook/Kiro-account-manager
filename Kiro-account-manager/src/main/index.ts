@@ -5040,6 +5040,8 @@ app.whenReady().then(async () => {
       const isExternalIdp = provider === 'AzureAD' || provider === 'ExternalIdp'
 
       // 切号前先刷新 token（和 IDE 切号一致）
+      let finalRefreshToken = refreshToken
+      let finalExpiresIn = 3600
       if (refreshToken) {
         const authMethod = (provider === 'Google' || provider === 'Github') ? 'social'
           : isExternalIdp ? 'external_idp' : undefined
@@ -5047,6 +5049,9 @@ app.whenReady().then(async () => {
         const refreshResult = await refreshTokenByMethod(refreshToken, clientId || '', clientSecret || '', region, authMethod, undefined, { tokenEndpoint, scopes: scopes?.join(' ') })
         if (refreshResult.success && refreshResult.accessToken) {
           accessToken = refreshResult.accessToken
+          // 微软 external_idp 刷新会轮换 refreshToken，必须写回轮换后的值，否则下次 CLI 自刷用作废 v1
+          finalRefreshToken = refreshResult.refreshToken || refreshToken
+          finalExpiresIn = refreshResult.expiresIn ?? 3600
           console.log('[Switch CLI] Token refreshed successfully')
         } else {
           console.warn(`[Switch CLI] Token refresh failed: ${refreshResult.error}, using existing token`)
@@ -5078,10 +5083,10 @@ app.whenReady().then(async () => {
       })
 
       // 构建 token JSON（snake_case 字段名，与 kiro-cli Rust 结构一致）
-      const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString()
+      const expiresAt = new Date(Date.now() + finalExpiresIn * 1000).toISOString()
       const tokenData: Record<string, unknown> = {
         access_token: accessToken,
-        refresh_token: refreshToken,
+        refresh_token: finalRefreshToken,
         expires_at: expiresAt,
         region
       }
@@ -5110,8 +5115,25 @@ app.whenReady().then(async () => {
       // 构建 SQL 语句
       const sqlStatements: string[] = [
         'CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT);',
+        'CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);',
         `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredTokenKey}', '${JSON.stringify(tokenData).replace(/'/g, "''")}');`
       ]
+
+      // state 表 api.codewhisperer.profile：external_idp / social 必须写，否则 kiro-cli 报
+      // "profileArn is required for this request"（实测，见 kiro-switch cli_writer.py inject_external_idp/inject_social）。
+      // ★ 严格只含 arn + profile_name 两键——多写 profileName/profile_arn 会让 kiro-cli 的 serde 判 profileArn 无效。
+      // IdC/BuilderId 不写（走 device-registration 路径，占位符 ARN 反而触发 REST 403）；无 ARN 时清掉残留。
+      const STATE_PROFILE_KEY = 'api.codewhisperer.profile'
+      if ((isExternalIdp || isSocial) && resolvedProfileArn) {
+        const profileName = isExternalIdp ? 'ExternalIdp_Default_Profile' : 'Social_Default_Profile'
+        const profileObj = { arn: resolvedProfileArn, profile_name: profileName }
+        sqlStatements.push(
+          `INSERT OR REPLACE INTO state (key, value) VALUES ('${STATE_PROFILE_KEY}', '${JSON.stringify(profileObj).replace(/'/g, "''")}');`
+        )
+      } else if (!resolvedProfileArn) {
+        // BuilderId 等无 ARN：清掉可能残留的上一个账号 profile，避免 CLI 误用旧 ARN
+        sqlStatements.push(`DELETE FROM state WHERE key = '${STATE_PROFILE_KEY}';`)
+      }
 
       // 写入 device-registration（仅 IdC 登录；social/external_idp 不需要）
       if (clientId && clientSecret && !isSocial && !isExternalIdp) {

@@ -112,11 +112,13 @@ export function EditAccountDialog({
   // 验证并刷新信息
   const handleVerifyAndRefresh = async () => {
     const isSocial = account?.credentials.authMethod === 'social'
+    const isExternalIdp = account?.credentials.authMethod === 'external_idp'
     if (!refreshToken) {
       setError('请填写 Refresh Token')
       return
     }
-    if (!isSocial && (!clientId || !clientSecret)) {
+    // external_idp 无 clientSecret，与 social 一样豁免 clientId/clientSecret 校验
+    if (!isSocial && !isExternalIdp && (!clientId || !clientSecret)) {
       setError('请填写 Client ID 和 Client Secret')
       return
     }
@@ -131,7 +133,13 @@ export function EditAccountDialog({
         clientSecret,
         region,
         authMethod: account?.credentials.authMethod,
-        provider: account?.credentials.provider || account?.idp
+        provider: account?.credentials.provider || account?.idp,
+        // external_idp 刷新走微软端点，必须带这些字段，否则 verify 内部刷新报"缺少 tokenEndpoint"
+        accessToken: account?.credentials.accessToken,
+        tokenEndpoint: account?.credentials.tokenEndpoint,
+        issuerUrl: account?.credentials.issuerUrl,
+        scopes: account?.credentials.scopes,
+        profileArn: account?.profileArn || account?.credentials.profileArn
       })
 
       if (result.success && result.data) {
