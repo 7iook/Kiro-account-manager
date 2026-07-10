@@ -1246,7 +1246,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                       {isEn ? 'Complete login in browser and enter this code:' : '请在浏览器中完成登录，并输入以下代码：'}
                     </p>
                     <div className="flex items-center justify-center gap-2">
-                      <code className="text-2xl font-bold tracking-widest bg-white dark:bg-gray-800 px-4 py-2 rounded border">
+                      <code className="text-2xl font-bold tracking-widest bg-primary/10 text-primary px-4 py-2 rounded-lg border border-primary/20">
                         {builderIdLoginData.userCode}
                       </code>
                       <Button 
@@ -1454,7 +1454,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
                   {/* IAM SSO 输入框 */}
                   {loginType === 'iamsso' && !iamSsoLoginData && (
-                    <div className="space-y-4 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700">
+                    <div className="space-y-4 p-4 bg-muted/40 rounded-xl border border-foreground/10">
                       <div className="space-y-2">
                         <Label htmlFor="ssoStartUrl" className="text-sm font-medium">{isEn ? 'SSO Start URL' : 'SSO Start URL'}</Label>
                         <Input
@@ -1478,7 +1478,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                             onChange={(e) => {
                               if (e.target.value !== 'custom') setRegion(e.target.value)
                             }}
-                            className="flex-1 h-10 px-3 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+                            className="flex-1 h-10 px-3 rounded-md border border-foreground/15 bg-[var(--glass-bg)] backdrop-blur-md text-sm shadow-sm transition-all hover:border-foreground/25 focus:outline-none focus:border-primary/50 focus:ring-2 focus:ring-primary/30"
                           >
                             <optgroup label="US">
                               <option value="us-east-1">us-east-1 (N. Virginia)</option>
@@ -1518,7 +1518,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                             value={region}
                             onChange={(e) => setRegion(e.target.value)}
                             placeholder={isEn ? 'e.g., cn-north-1' : '例如: cn-north-1'}
-                            className="w-32 h-10 px-3 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+                            className="w-32 h-10 px-3 rounded-md border border-foreground/15 bg-[var(--glass-bg)] backdrop-blur-md text-sm shadow-sm transition-all hover:border-foreground/25 focus:outline-none focus:border-primary/50 focus:ring-2 focus:ring-primary/30"
                           />
                         </div>
                       </div>
@@ -1534,7 +1534,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
                   {/* IAM SSO 授权中 */}
                   {loginType === 'iamsso' && iamSsoLoginData && (
-                    <div className="space-y-4 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700">
+                    <div className="space-y-4 p-4 bg-muted/40 rounded-xl border border-foreground/10">
                       <div className="text-center space-y-2">
                         <p className="text-sm font-medium">{isEn ? 'Enter this code in browser:' : '在浏览器中输入此代码:'}</p>
                         <div className="flex items-center justify-center gap-2">
@@ -1570,7 +1570,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
                   {/* Microsoft Entra: 输入 email 启动 */}
                   {loginType === 'externalidp' && !entraAuthorizeUrl && (
-                    <div className="space-y-4 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700">
+                    <div className="space-y-4 p-4 bg-muted/40 rounded-xl border border-foreground/10">
                       <div className="space-y-2">
                         <Label htmlFor="entraEmail" className="text-sm font-medium">{isEn ? 'Organization Email' : '组织邮箱'}</Label>
                         <Input
@@ -1597,7 +1597,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
                   {/* Microsoft Entra: 浏览器登录后粘贴回调链接 */}
                   {loginType === 'externalidp' && entraAuthorizeUrl && (
-                    <div className="space-y-4 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700">
+                    <div className="space-y-4 p-4 bg-muted/40 rounded-xl border border-foreground/10">
                       <div className="p-3 bg-primary/[0.04] rounded-lg border border-primary/15">
                         <div className="flex items-start gap-2">
                           <Info className="w-4 h-4 text-primary mt-0.5 shrink-0" />
