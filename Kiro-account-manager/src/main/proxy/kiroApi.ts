@@ -1300,15 +1300,9 @@ export async function callKiroApiStream(
       
       const agent = getNetworkAgent(account)
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
-      // [TIMING] 捕捉发请求前的时间。下面的 fetch 多耗时 = 后端回 TTFB 时间(不含思考)。
-      const kiroCallStart = Date.now()
-      const timingReqId = Math.random().toString(36).slice(2, 8)
-      console.log(`[TIMING:kiro] [${timingReqId}] fetch-start endpoint=${endpoint.name} payload=${payloadStr.length}B model=${requestedModelId || 'default'}`)
       let response = agent
         ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
         : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
-      // [TIMING] response 头到手。这个时长 = 网络流量 + Kiro 后端处理到不得不开始发流。继续看 first-content 才知道首字节内容时间。
-      console.log(`[TIMING:kiro] [${timingReqId}] fetch-response elapsed=${Date.now() - kiroCallStart}ms status=${response.status}`)
 
       if (response.status === 429) {
         // 429 = rate limit(短期请求过多),不是永久配额耗尽。
@@ -1356,7 +1350,7 @@ export async function callKiroApiStream(
       // 解析 Event Stream
       // 传入 modelId + payloadStr 用于精确 token 计算（contextUsage 反推 + tiktoken）
       const inputChars = payloadStr.length
-      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr, timingReqId, kiroCallStart)
+      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr)
       return
     } catch (error) {
       if (signal?.aborted) {
@@ -1487,9 +1481,7 @@ async function parseEventStream(
   inputChars: number = 0,  // 输入字符长度（兜底估算用）
   signal?: AbortSignal,
   modelId?: string,        // 模型 ID，用于 contextUsagePercentage 反推 inputTokens
-  payloadStr?: string,     // 请求 payload JSON 字符串，用于 tiktoken 精确计算
-  timingReqId?: string,    // [TIMING] 请求相关小 id，串联日志
-  timingKiroCallStart?: number  // [TIMING] fetch-start 时间戳，用于算 first-content 相对 fetch 的总时间
+  payloadStr?: string      // 请求 payload JSON 字符串，用于 tiktoken 精确计算
 ): Promise<void> {
   const reader = body.getReader()
   const abort = () => {
@@ -1511,10 +1503,6 @@ async function parseEventStream(
   let collectedOutputText = ''
   // 是否已拿到 Kiro 真实 tokenUsage（最高优先级，锁定后不再被 contextUsage/tiktoken 覆盖）
   let hasRealTokenUsage = false
-  // [TIMING] 首个可见内容事件打点（assistantResponseEvent 或 reasoningContentEvent）
-  const streamParseStart = Date.now()
-  let firstContentLogged = false
-  
   // 流式事件聚合计数（logStreamEvents 开启时，结束后输出摘要而非逐条输出）
   const streamEventCounts: Record<string, number> = {}
   
@@ -1638,11 +1626,6 @@ async function parseEventStream(
       if (tool) {
         await emit(leakCarry.slice(0, fi))
         leakedTools.push(tool)
-        if (toolLeakDebug) {
-          try {
-            console.log('[tool-leak-fix] parsed leaked <tool_use>:', tool.name, JSON.stringify(tool.input).slice(0, 120))
-          } catch { /* ignore */ }
-        }
         leakCarry = leakCarry.slice(endIdx)
       } else {
         // 匹配了但 parse 失败 —— 极罕见,原样输出避免死循环
@@ -1665,13 +1648,6 @@ async function parseEventStream(
         if (m.index > consumedEnd + 30) break
         const tool = parseInvokeBody(m[1], m[2])
         leakedTools.push(tool)
-        if (toolLeakDebug) {
-          try {
-            console.log('[tool-leak-fix] parsed leaked tool:', tool.name, JSON.stringify(tool.input).slice(0, 120))
-          } catch {
-            /* ignore */
-          }
-        }
         consumedEnd = m.index + m[0].length
       }
       const fcClose = leakCarry.slice(consumedEnd).match(/^\s*<\/function_calls>/)
@@ -1756,12 +1732,6 @@ async function parseEventStream(
             
             // 根据 event type 处理不同类型的事件
             if (eventType === 'assistantResponseEvent' || event.assistantResponseEvent) {
-              if (!firstContentLogged) {
-                firstContentLogged = true
-                const sinceParse = Date.now() - streamParseStart
-                const sinceFetch = timingKiroCallStart ? Date.now() - timingKiroCallStart : sinceParse
-                console.log(`[TIMING:kiro] [${timingReqId || '??????'}] first-content (assistant) elapsed=${sinceFetch}ms from-fetch-start, parse-phase=${sinceParse}ms`)
-              }
               const assistantResp = event.assistantResponseEvent || event
               const content = assistantResp.content as string | undefined
               if (content) {
@@ -2048,12 +2018,6 @@ async function parseEventStream(
             // 处理 reasoningContentEvent - Thinking 模式的推理内容
             // Kiro ReasoningContentEvent 字段：[text, redactedContent, signature]
             if (eventType === 'reasoningContentEvent' || event.reasoningContentEvent) {
-              if (!firstContentLogged) {
-                firstContentLogged = true
-                const sinceParse = Date.now() - streamParseStart
-                const sinceFetch = timingKiroCallStart ? Date.now() - timingKiroCallStart : sinceParse
-                console.log(`[TIMING:kiro] [${timingReqId || '??????'}] first-content (reasoning) elapsed=${sinceFetch}ms from-fetch-start, parse-phase=${sinceParse}ms`)
-              }
               const reasoning = event.reasoningContentEvent || event
               if (reasoning.text) {
                 proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)

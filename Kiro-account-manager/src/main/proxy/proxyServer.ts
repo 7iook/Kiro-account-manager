@@ -2487,12 +2487,6 @@ export class ProxyServer {
     const body = await this.readBody(req, signal)
     this.throwIfAborted(signal)
     const request: OpenAIChatRequest = JSON.parse(body)
-    // [DEBUG:thinking-forward] 打印 OpenAI 兼容路径的 thinking / reasoning_effort 字段
-    console.log('[DEBUG:thinking-forward] /v1/chat/completions', JSON.stringify({
-      model: request.model,
-      thinking: (request as unknown as Record<string, unknown>).thinking,
-      reasoning_effort: (request as unknown as Record<string, unknown>).reasoning_effort
-    }))
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
@@ -2916,50 +2910,6 @@ export class ProxyServer {
     const body = await this.readBody(req, signal)
     this.throwIfAborted(signal)
     const request: ClaudeRequest = JSON.parse(body)
-    // [DEBUG:thinking-forward] 打印客户端(如 Claude Code)透传的 thinking / reasoning_effort 字段,
-    // 用来验证"反代根据客户端参数决定 effort"是否符合预期。上线可删,不影响功能。
-    console.log('[DEBUG:thinking-forward] /v1/messages', JSON.stringify({
-      model: request.model,
-      thinking: (request as unknown as Record<string, unknown>).thinking,
-      reasoning_effort: (request as unknown as Record<string, unknown>).reasoning_effort,
-      anthropic_beta: (request as unknown as Record<string, unknown>).anthropic_beta
-    }))
-    // [DEBUG:compact-probe] 用于诊断 Claude Code /compact 命令的行为
-    // /compact 的机制:客户端发一次带"Summarize the conversation"prompt 的普通 POST
-    // 完事就本地存摘要,不会有第二次特殊请求。这里打印关键字段判断是不是压缩请求
-    // 及请求负载完整性。上线可删。
-    try {
-      const rawReq = request as unknown as Record<string, unknown>
-      const msgs = Array.isArray(request.messages) ? request.messages : []
-      const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null
-      const lastContentStr = lastMsg
-        ? (typeof lastMsg.content === 'string'
-            ? lastMsg.content
-            : JSON.stringify(lastMsg.content))
-        : ''
-      const systemStr = typeof request.system === 'string'
-        ? request.system
-        : (Array.isArray(request.system) ? JSON.stringify(request.system) : '')
-      // 关键词打分:同时命中 "summar" + "conversation" 大概率是压缩请求
-      const lowerLast = (lastContentStr || '').toLowerCase()
-      const isLikelyCompact = /summar/.test(lowerLast) && /(conversation|context|so far)/.test(lowerLast)
-      console.log('[DEBUG:compact-probe] /v1/messages', JSON.stringify({
-        model: request.model,
-        messagesCount: msgs.length,
-        lastRole: lastMsg?.role,
-        lastLen: lastContentStr.length,
-        lastContentHead: lastContentStr.slice(0, 400),
-        systemHead: systemStr.slice(0, 300),
-        systemLen: systemStr.length,
-        hasContextManagement: !!rawReq.context_management,
-        contextManagementValue: rawReq.context_management,
-        maxTokens: request.max_tokens,
-        stream: request.stream,
-        isLikelyCompact
-      }))
-    } catch (e) {
-      console.log('[DEBUG:compact-probe] error', e instanceof Error ? e.message : String(e))
-    }
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
