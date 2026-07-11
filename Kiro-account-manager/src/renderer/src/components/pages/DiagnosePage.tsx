@@ -69,9 +69,21 @@ const DEFAULT_TARGETS: DiagnoseTarget[] = [
     expectStatus: [200, 400, 403, 405]
   },
   {
-    id: 'kiro-codewhisperer', label: { en: 'CodeWhisperer API', zh: 'CodeWhisperer API' },
+    id: 'kiro-runtime-v2', label: { en: 'Kiro Runtime API (V2)', zh: 'Kiro Runtime API (V2)' },
+    url: 'https://runtime.us-east-1.kiro.dev/',
+    category: 'kiro', description: { en: 'Kiro new Runtime API (2026-07 migration, stream)', zh: 'Kiro 新 Runtime API(2026-07 迁移后主 stream 端点)' },
+    expectStatus: [200, 400, 403, 405]
+  },
+  {
+    id: 'kiro-management-v2', label: { en: 'Kiro Management API (V2)', zh: 'Kiro 管理 API (V2)' },
+    url: 'https://management.us-east-1.kiro.dev/',
+    category: 'kiro', description: { en: 'Kiro new Management API (2026-07 migration, metadata)', zh: 'Kiro 新管理 API(2026-07 迁移后元数据端点)' },
+    expectStatus: [200, 400, 403, 405]
+  },
+  {
+    id: 'kiro-codewhisperer', label: { en: 'CodeWhisperer API (V1 legacy)', zh: 'CodeWhisperer API (V1 旧)' },
     url: 'https://q.us-east-1.amazonaws.com/',
-    category: 'kiro', description: { en: 'Kiro main API endpoint (q.amazonaws.com)', zh: 'Kiro 主 API 端点（q.amazonaws.com）' },
+    category: 'kiro', description: { en: 'Legacy Kiro API endpoint (2026-06 before, us grace period)', zh: '旧 Kiro API 端点(2026-06 之前,us grace period 内可用)' },
     expectStatus: [200, 400, 403, 405]
   },
   {

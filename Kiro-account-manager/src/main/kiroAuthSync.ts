@@ -39,15 +39,33 @@ export const KIRO_BUILDER_ID_PLACEHOLDER_ARN = 'arn:aws:codewhisperer:us-east-1:
 // Social 登录（Github/Google）共用的 Kiro 后端固定 profileArn
 export const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
 
-// Enterprise 备用 profileArn（自动获取失败时使用，区域动态替换）
-const ENTERPRISE_FALLBACK_PROFILE_ID = 'VNECVYCYYAWN'
-const ENTERPRISE_FALLBACK_ACCOUNT_ID = '610548660232'
+// Enterprise 备用 profileArn(自动获取失败/ListAvailableProfiles 返空时使用)
+//
+// 2026-07-12 实测证据(两个真实账户 GET /ListAvailableModels + POST stream API):
+// ✅ V2 fallback (316704942615:H3A4HCGR4WEC) + management.eu-central-1.kiro.dev 返 200 + 13 个真实模型
+// ✅ V2 fallback + runtime.eu-central-1.kiro.dev stream API 返 200 + 模型回复“Hi”
+// ❌ V1 legacy (610548660232:VNECVYCYYAWN) 在任何 region + 任何 host 均 403 Invalid token(广义作废)
+// 详见 .agent-workspace/.archive/2026-07-12/kiro-endpoint-migration/*-rca.md
+const ENTERPRISE_FALLBACK_PROFILE_ID = 'H3A4HCGR4WEC'
+const ENTERPRISE_FALLBACK_ACCOUNT_ID = '316704942615'
+
+// V1 legacy(2026-07 已废):新/旧用户 JSON 里可能存的旧值,应被视为占位符→
+// resolveProfileArn 时触发 fallback 返 V2 真实值。实测任何 host + region 都拒。
+const _ENTERPRISE_LEGACY_V1_ACCOUNT_ID = '610548660232'
+const _ENTERPRISE_LEGACY_V1_PROFILE_ID = 'VNECVYCYYAWN'
 export function getEnterpriseFallbackArn(region?: string): string {
   const r = region?.startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
   return `arn:aws:codewhisperer:${r}:${ENTERPRISE_FALLBACK_ACCOUNT_ID}:profile/${ENTERPRISE_FALLBACK_PROFILE_ID}`
 }
 
-const PLACEHOLDER_PROFILE_ARNS = new Set<string>([KIRO_BUILDER_ID_PLACEHOLDER_ARN])
+const PLACEHOLDER_PROFILE_ARNS = new Set<string>([
+  KIRO_BUILDER_ID_PLACEHOLDER_ARN,
+  // 2026-07 迁移:V1 legacy Enterprise fallback,所有 region 变体
+  // 实测 EU/US 各 profileArn 组合 + management.{eu,us} host 全 403,视为过期占位符
+  // 导致 resolveProfileArn 回落到 V2 fallback 真实值
+  `arn:aws:codewhisperer:us-east-1:${_ENTERPRISE_LEGACY_V1_ACCOUNT_ID}:profile/${_ENTERPRISE_LEGACY_V1_PROFILE_ID}`,
+  `arn:aws:codewhisperer:eu-central-1:${_ENTERPRISE_LEGACY_V1_ACCOUNT_ID}:profile/${_ENTERPRISE_LEGACY_V1_PROFILE_ID}`,
+])
 
 /** 检查给定 ARN 是不是已知占位符（旧版反代 / Kiro IDE 自身可能写入的脏数据） */
 export function isPlaceholderProfileArn(arn: string | undefined | null): boolean {

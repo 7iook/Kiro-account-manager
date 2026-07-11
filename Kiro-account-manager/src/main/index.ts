@@ -23,6 +23,8 @@ import {
   parseAccessTokenClaims,
   watchKiroAuthTokenFile,
   resolveProfileArnForWrite,
+  isPlaceholderProfileArn,
+  getEnterpriseFallbackArn,
   KIRO_AUTH_TOKEN_PATH
 } from './kiroAuthSync'
 import { openaiToKiro } from './proxy/translator'
@@ -99,30 +101,31 @@ function setupAutoUpdater(): void {
 
 // ============ Kiro API 调用 ============
 const KIRO_API_BASE = 'https://app.kiro.dev/service/KiroWebPortalService/operation'
-// REST API 端点配置 - 官方 Kiro 插件仅支持 us-east-1 和 eu-central-1
+// REST API 端点配置(2026-07 迁移,per-region)
+// - V2:management.{region}.kiro.dev — 实测 eu 账户发到 us host 会 403 Invalid token
+// - V1:q.{region}.amazonaws.com(旧,保留作 fallback — eu 侧已停服/us 侧 grace period)
 const KIRO_REST_API_ENDPOINTS: Record<string, string> = {
+  'us-east-1': 'https://management.us-east-1.kiro.dev',
+  'eu-central-1': 'https://management.eu-central-1.kiro.dev'
+}
+const KIRO_REST_API_ENDPOINTS_V1_FALLBACK: Record<string, string> = {
   'us-east-1': 'https://q.us-east-1.amazonaws.com',
   'eu-central-1': 'https://q.eu-central-1.amazonaws.com'
 }
 
-// 根据 SSO 区域映射到最近的 REST API 端点
+// 根据 SSO 区域映射到最近的 REST API 端点(V2 全局)
 function getRestApiBase(ssoRegion?: string): string {
   if (!ssoRegion) return KIRO_REST_API_ENDPOINTS['us-east-1']
-  // 如果是支持的端点区域，直接使用
   if (KIRO_REST_API_ENDPOINTS[ssoRegion]) return KIRO_REST_API_ENDPOINTS[ssoRegion]
-  // EU 区域映射到 eu-central-1
   if (ssoRegion.startsWith('eu-')) return KIRO_REST_API_ENDPOINTS['eu-central-1']
-  // 其他区域默认 us-east-1
   return KIRO_REST_API_ENDPOINTS['us-east-1']
 }
 
-// 获取备用 REST API 端点（用于 fallback）
+// 获取备用 REST API 端点(用于 fallback,返 V1 旧 host)
 function getFallbackRestApiBase(ssoRegion?: string): string {
-  const primary = getRestApiBase(ssoRegion)
-  // 返回另一个端点作为 fallback
-  return primary === KIRO_REST_API_ENDPOINTS['eu-central-1']
-    ? KIRO_REST_API_ENDPOINTS['us-east-1']
-    : KIRO_REST_API_ENDPOINTS['eu-central-1']
+  if (!ssoRegion) return KIRO_REST_API_ENDPOINTS_V1_FALLBACK['us-east-1']
+  if (ssoRegion.startsWith('eu-')) return KIRO_REST_API_ENDPOINTS_V1_FALLBACK['eu-central-1']
+  return KIRO_REST_API_ENDPOINTS_V1_FALLBACK['us-east-1']
 }
 
 // API 类型配置
@@ -1273,6 +1276,15 @@ async function getUsageLimitsRest(
   const machineId = accountMachineId || getCurrentMachineId()
   const logTag = email || `token:${accessToken?.slice(-6) || '?'}`
   console.log(`[Kiro REST API] GetUsageLimits [${logTag}] region=${ssoRegion || 'default'}`)
+
+  // 2026-07 迁移:V1 legacy Enterprise fallback ARN(610548660232:VNECVYCYYAWN)已废,
+  // 后端拒 400 "Invalid profileArn";isPlaceholderProfileArn 识别后自动 fallback 到 V2 真实值。
+  // 实测证据:eu 账户 + V2 fallback (316704942615:H3A4HCGR4WEC) + management.eu-central-1 返 200。
+  if (profileArn && isPlaceholderProfileArn(profileArn)) {
+    const fallbackArn = getEnterpriseFallbackArn(ssoRegion)
+    console.log(`[Kiro REST API] Legacy V1 profileArn detected, using V2 fallback: ${fallbackArn}`)
+    profileArn = fallbackArn
+  }
   
   const params = new URLSearchParams({
     origin: 'AI_EDITOR',

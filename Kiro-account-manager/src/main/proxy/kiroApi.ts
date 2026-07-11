@@ -143,8 +143,71 @@ async function fetchWithProxy(url: string, options: RequestInit, account?: Proxy
   return await fetch(url, options)
 }
 
-// Kiro API 端点配置
+// ============ Kiro API 端点 SSOT(2026-07 迁移)============
+//
+// AWS 把 Kiro 从 CodeWhisperer/Amazon Q 拆离到独立域名 + 新命名空间。
+// - Stream (GenerateAssistantResponse):runtime.{region}.kiro.dev(V2) / 旧 host(V1 fallback,仅 us 短期兼容)
+// - Management (ListProfiles/Models/Subscriptions/Preferences):management.us-east-1.kiro.dev(V2 全局)
+// - X-Amz-Target 前缀:AmazonCodeWhispererStreamingService.* → KiroRuntimeService.*
+// - TokenType header:所有 IdC/BuilderId/social 统一 SSO_OIDC(仅真 Azure external_idp 保留 EXTERNAL_IDP)
+// 详见 .agent-workspace/.archive/2026-07-12/kiro-endpoint-migration/*-rca.md
+
+/** V2 Kiro Runtime host(stream API,按 region 分发)*/
+function getKiroRuntimeHost(region?: string): string {
+  const r = region?.startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
+  return `https://runtime.${r}.kiro.dev`
+}
+void getKiroRuntimeHost // 内部保留,当前未直接引用(KIRO_ENDPOINTS 数组已 hardcode 两个 region V2 URL)
+
+/** V2 Kiro Management host(元数据 API,per-region 分发)
+ * 2026-07-12 实测证据:eu 账户 → management.eu-central-1.kiro.dev 返 200 拿 13 个模型;
+ *                          us 账户 → management.us-east-1.kiro.dev 返 200 拿 15 个模型。
+ * eu 账户发到 us-east-1 host 会 403 Invalid token(cross-region auth 拒)。
+ */
+function getKiroManagementHost(region?: string): string {
+  const r = region?.startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
+  return `https://management.${r}.kiro.dev`
+}
+
+const TOKEN_TYPE_SSO_OIDC = 'SSO_OIDC'
+const TOKEN_TYPE_EXTERNAL_IDP = 'EXTERNAL_IDP'
+
+/**
+ * 根据账户类型返回 TokenType header 值(2026-07 迁移后)
+ * - external_idp / ExternalIdp(真 Azure AD): EXTERNAL_IDP
+ * - 其它所有(IdC / BuilderId / Github / Google): SSO_OIDC
+ * 抓包证据:官方 Kiro IDE 1.0.116 stream + management API 请求全带 TokenType: SSO_OIDC
+ */
+function getTokenTypeHeader(account: ProxyAccount): string {
+  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
+    return TOKEN_TYPE_EXTERNAL_IDP
+  }
+  return TOKEN_TYPE_SSO_OIDC
+}
+
+// Kiro API 端点配置(V2 优先 + V1 fallback)
 const KIRO_ENDPOINTS = [
+  // ============ V2 端点(2026-07 迁移后主端点)============
+  // 抓包证据:官方 Kiro IDE 1.0.116 stream 请求
+  //   POST https://runtime.{region}.kiro.dev/(根路径)
+  //   Content-Type: application/x-amz-json-1.0
+  //   X-Amz-Target: KiroRuntimeService.GenerateAssistantResponse
+  //   TokenType: SSO_OIDC
+  {
+    url: 'https://runtime.us-east-1.kiro.dev/',
+    origin: 'AI_EDITOR',
+    amzTarget: 'KiroRuntimeService.GenerateAssistantResponse',
+    name: 'KiroRuntime-US',
+    protocol: 'generateAssistantResponse' as const
+  },
+  {
+    url: 'https://runtime.eu-central-1.kiro.dev/',
+    origin: 'AI_EDITOR',
+    amzTarget: 'KiroRuntimeService.GenerateAssistantResponse',
+    name: 'KiroRuntime-EU',
+    protocol: 'generateAssistantResponse' as const
+  },
+  // ============ V1 端点(旧,保留作 fallback,eu 侧已停服 · us 侧 grace period)============
   {
     url: 'https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse',
     origin: 'AI_EDITOR',
@@ -167,10 +230,12 @@ const KIRO_ENDPOINTS = [
   }
 ]
 
-// Kiro 版本号（跟随官方 IDE 更新）
-const KIRO_VERSION = '0.12.155'
-const AWS_SDK_VERSION = '1.0.34'
-const AWS_STREAMING_API_VERSION = '1.0.34'
+// Kiro 版本号(2026-07 迁移:对齐官方 IDE 1.0.116 抓包证据)
+// V2 host 严格校验 UA,旧值(0.12.155 / codewhispererstreaming#1.0.34 / m/E)会报
+// misleading “bearer token invalid”。V1 endpoint 不严格校验 UA,新值也接受。
+const KIRO_VERSION = '1.0.116'
+const AWS_SDK_VERSION = '1.0.0'
+const AWS_STREAMING_API_VERSION = '1.0.0'
 
 const OS_PLATFORM = process.platform === 'win32' ? 'win32' : process.platform === 'darwin' ? 'macos' : 'linux'
 const OS_RELEASE = (() => { try { return require('os').release() } catch { return '10.0.0' } })()
@@ -178,11 +243,13 @@ const NODE_VERSION = process.versions.node || '22.22.0'
 
 function getKiroUserAgent(machineId?: string): string {
   const suffix = machineId ? `KiroIDE-${KIRO_VERSION}-${machineId}` : `KiroIDE-${KIRO_VERSION}`
-  return `aws-sdk-js/${AWS_SDK_VERSION} ua/2.1 os/${OS_PLATFORM}#${OS_RELEASE} lang/js md/nodejs#${NODE_VERSION} api/codewhispererstreaming#${AWS_STREAMING_API_VERSION} m/E ${suffix}`
+  // 2026-07 迁移:UA API 段 codewhispererstreaming → kiroruntime, m/E → m/N(拓包证据)
+  return `aws-sdk-js/${AWS_SDK_VERSION} ua/2.1 os/${OS_PLATFORM}#${OS_RELEASE} lang/js md/nodejs#${NODE_VERSION} api/kiroruntime#${AWS_STREAMING_API_VERSION} m/N ${suffix}`
 }
 
 function getKiroAmzUserAgent(machineId?: string): string {
-  const suffix = machineId ? `KiroIDE ${KIRO_VERSION} ${machineId}` : `KiroIDE-${KIRO_VERSION}`
+  // 2026-07 迁移:suffix 用短横分隔(与主 UA 一致),不再用空格
+  const suffix = machineId ? `KiroIDE-${KIRO_VERSION}-${machineId}` : `KiroIDE-${KIRO_VERSION}`
   return `aws-sdk-js/${AWS_SDK_VERSION} ${suffix}`
 }
 
@@ -1177,49 +1244,77 @@ function getAccountMachineId(accountId: string, accountMachineId?: string): stri
   return generateStableMachineId(accountId)
 }
 
-// 获取认证方式对应的请求头
-function getAuthHeaders(account: ProxyAccount, _endpoint: typeof KIRO_ENDPOINTS[0]): Record<string, string> {
+// 获取认证方式对应的请求头(2026-07 迁移后)
+// - V2 端点(runtime.*.kiro.dev):Content-Type = application/x-amz-json-1.0(AWS RPC 序列化)
+// - V1 端点(codewhisperer / q.*.amazonaws.com):保留 application/json(旧 SDK 序列化)
+// - TokenType:统一 SSO_OIDC(仅真 Azure AD external_idp 用 EXTERNAL_IDP)
+function getAuthHeaders(account: ProxyAccount, endpoint: typeof KIRO_ENDPOINTS[0]): Record<string, string> {
   const machineId = getAccountMachineId(account.id, account.machineId)
   // 按配置的 agent 模式（vibe 或 spec）设置 header
   const agentMode = configuredAgentMode
-  
+
+  // V2 端点用 x-amz-json-1.0;V1 端点保留旧 Content-Type
+  const isV2Endpoint = endpoint.url.includes('.kiro.dev')
+  const contentType = isV2Endpoint ? 'application/x-amz-json-1.0' : 'application/json'
+
   const headers: Record<string, string> = {
-    'content-type': 'application/json',
+    'content-type': contentType,
     'x-amzn-kiro-agent-mode': agentMode,
     'x-amz-user-agent': getKiroAmzUserAgent(machineId),
     'user-agent': getKiroUserAgent(machineId),
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=3',
-    'Authorization': `Bearer ${account.accessToken}`
-  }
-
-  // Enterprise External IdP 需要额外的 TokenType header（官方 addExternalIdpTokenTypeMiddleware）
-  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
-    headers['TokenType'] = 'EXTERNAL_IDP'
+    'Authorization': `Bearer ${account.accessToken}`,
+    // 抓包证据:所有账户类型统一 SSO_OIDC(仅 external_idp 用 EXTERNAL_IDP)
+    'TokenType': getTokenTypeHeader(account),
+    // 2026-07: X-Amz-Target 是 AWS SDK RPC 协议的必需 header,声明调用哪个 service.operation
+    // - V2 端点(runtime.*.kiro.dev)强制要求,缺失会返 400 UnknownOperationException
+    // - V1 端点(REST 路径风格)不严格要求,但加了也接受
+    // 值从 KIRO_ENDPOINTS 数组每项的 amzTarget 字段来
+    'X-Amz-Target': endpoint.amzTarget
   }
 
   return headers
 }
 
-// 获取排序后的端点列表（根据首选端点配置）
-function getSortedEndpoints(preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'): typeof KIRO_ENDPOINTS {
-  if (!preferredEndpoint) return KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI')
-  
+// 获取排序后的端点列表(根据 account.region 与首选端点配置)
+// 2026-07 迁移后的策略:
+//   - V2 端点(runtime.*.kiro.dev) 总是优先,按 account.region 选单一 EU/US endpoint
+//   - V1 端点作 fallback(仅 us,eu 侧 V1 已停服),preferredEndpoint 只影响 V1 内部顺序
+//   - amazonq-cli 保留单端点不回退行为
+function getSortedEndpoints(
+  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli',
+  region?: string
+): typeof KIRO_ENDPOINTS {
   // AmazonQ CLI 模式：只用这一个端点，失败不回退
   if (preferredEndpoint === 'amazonq-cli') {
     return KIRO_ENDPOINTS.filter(ep => ep.name === 'AmazonQCLI')
   }
-  
-  const preferredName = preferredEndpoint === 'codewhisperer' ? 'CodeWhisperer' : 'AmazonQ'
-  
-  const sorted = KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI')
-  sorted.sort((a, b) => {
-    if (a.name === preferredName) return -1
-    if (b.name === preferredName) return 1
-    return 0
+
+  // V2 端点按 region 分发(eu account → EU host, us/其它 account → US host)
+  // V1 端点历史上全是 us,不按 region 过滤;eu account 若 V2 失败仍可尝试 V1 us 作最后 fallback
+  const wantEuRegion = region?.startsWith('eu-')
+  const v2Endpoints = KIRO_ENDPOINTS.filter(ep => {
+    if (!ep.name.startsWith('KiroRuntime')) return false
+    return wantEuRegion ? ep.name === 'KiroRuntime-EU' : ep.name === 'KiroRuntime-US'
   })
-  
-  return sorted
+
+  const v1Endpoints = KIRO_ENDPOINTS.filter(ep =>
+    ep.name !== 'AmazonQCLI' && !ep.name.startsWith('KiroRuntime')
+  )
+
+  // V1 内部按 preferredEndpoint 排序(codewhisperer/amazonq 二选一优先)
+  if (preferredEndpoint) {
+    const preferredName = preferredEndpoint === 'codewhisperer' ? 'CodeWhisperer' : 'AmazonQ'
+    v1Endpoints.sort((a, b) => {
+      if (a.name === preferredName) return -1
+      if (b.name === preferredName) return 1
+      return 0
+    })
+  }
+
+  // V2 优先(2026-07 迁移后主端点),V1 作 fallback
+  return [...v2Endpoints, ...v1Endpoints]
 }
 
 function getAbortError(signal?: AbortSignal): Error {
@@ -1245,7 +1340,7 @@ export async function callKiroApiStream(
 ): Promise<void> {
   const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
   // 所有账号类型均走正常端点优先级（含 fallback），不再强制 Enterprise 走 CodeWhisperer
-  const endpoints = getSortedEndpoints(preferredEndpoint)
+  const endpoints = getSortedEndpoints(preferredEndpoint, account.region)
 
   // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底，流式端点自动不传占位符）
   if (!account.profileArn && isEnterprise) {
@@ -1576,11 +1671,14 @@ async function parseEventStream(
     }
     return { name, input }
   }
+  // Opus 4.8 已知会在工具调用边界前插入一个多余的英文词（社区实测 court/count/call 三种都高频出现，
+  // 随会话/版本随机，不是固定替换），此前只处理了 count，court/call 会原样泄漏成可见文本
+  const STRAY_TOKEN_RE = /\b(?:court|count|call)\s*$/
   const stripToolPrefix = (pre: string): string => {
     const fc = pre.match(/<function_calls>\s*$/)
     if (fc) return pre.slice(0, pre.length - fc[0].length)
-    const ct = pre.match(/count\s*$/)
-    if (ct) return pre.slice(0, pre.length - ct[0].length)
+    const st = pre.match(STRAY_TOKEN_RE)
+    if (st) return pre.slice(0, pre.length - st[0].length)
     return pre
   }
   const hasOpenInvoke = (s: string): boolean => {
@@ -1589,7 +1687,7 @@ async function parseEventStream(
     return !s.slice(i).includes('</invoke>')
   }
   const pendingToolTail = (s: string): number => {
-    const markers = ['<function_calls>', '<invoke name=', '</invoke>', '</function_calls>', '<parameter name=', '</parameter>', '<tool_use', '</tool_use>', 'count']
+    const markers = ['<function_calls>', '<invoke name=', '</invoke>', '</function_calls>', '<parameter name=', '</parameter>', '<tool_use', '</tool_use>', 'court', 'count', 'call']
     let hold = 0
     for (const tag of markers) {
       for (let k = Math.min(s.length, tag.length - 1); k >= 1; k--) {
@@ -1599,9 +1697,9 @@ async function parseEventStream(
         }
       }
     }
-    const cm = s.match(/count\s*$/)
+    const cm = s.match(STRAY_TOKEN_RE)
     if (cm && cm[0].length > hold) hold = cm[0].length
-    const cm2 = s.match(/count\s*<[\s\S]*$/)
+    const cm2 = s.match(/\b(?:court|count|call)\s*<[\s\S]*$/)
     if (cm2 && cm2[0].length > hold) hold = cm2[0].length
     return hold
   }
@@ -2286,16 +2384,65 @@ export interface KiroModel {
   availableOrigins?: string[] | null
 }
 
-// 根据账号区域获取 Q Service 端点（官方插件使用 q.{region}.amazonaws.com）
-function getQServiceEndpoint(region?: string): string {
-  if (region?.startsWith('eu-')) return 'https://q.eu-central-1.amazonaws.com'
-  return 'https://q.us-east-1.amazonaws.com'
+// ============ 跨账户共享模型 catalog(2026-07 迁移) ============
+//
+// 背景:AWS 端 IdC provisioning 限制导致某些账户(如 eu-central-1 IdC)accessToken
+// 无法通过 management.us-east-1.kiro.dev 的 controlplane 校验(403 Invalid token),
+// 即使换任何 profileArn 也一样;而同一账户的 stream API(runtime.*.kiro.dev)则完全通过。
+//
+// 策略:任何账户 fetchKiroModels 成功 → 写入此模块级缓存;
+//        后续失败账户 → 读缓存,让用户至少能看到“KAC 里已知的完整模型清单”。
+// NEVER 硬编码模型清单(过时/不真实/无 rate multiplier/context window 等元数据)。
+//
+// 实测(2026-07-12):us 账户 GET /ListAvailableModels 返 15 个真实模型
+// (含 claude-sonnet-5/opus-4.8/rate multiplier/context window 完整元数据);
+// eu 账户 403,回落此共享 catalog 显示同样 15 个,反代 stream 依然可用。
+//
+// TTL 30 min:模型 catalog 变化频率低于单账户缓存的 5 min,给用户提供更稳定 UI。
+// 详见 .agent-workspace/.archive/2026-07-12/kiro-endpoint-migration/*-rca.md
+
+interface SharedModelCatalog {
+  models: KiroModel[]
+  timestamp: number
+  sourceEmail?: string  // 来源账户,用于日志和潜在的 UI 提示
+}
+const SHARED_MODEL_CATALOG_TTL_MS = 30 * 60 * 1000
+let sharedModelCatalog: SharedModelCatalog | null = null
+
+function getSharedModelCatalog(): SharedModelCatalog | null {
+  if (!sharedModelCatalog) return null
+  if (Date.now() - sharedModelCatalog.timestamp > SHARED_MODEL_CATALOG_TTL_MS) return null
+  return sharedModelCatalog
 }
 
-// 根据账号区域获取 CodeWhisperer Runtime 端点
+function setSharedModelCatalog(models: KiroModel[], account: ProxyAccount): void {
+  if (!models || models.length === 0) return
+  sharedModelCatalog = {
+    models: models.map(m => ({ ...m })),
+    timestamp: Date.now(),
+    sourceEmail: account.email
+  }
+  console.log(`[KiroAPI] Shared model catalog updated: ${models.length} models from ${account.email || account.id.slice(0, 8)}`)
+}
+
+/** 外部可读(供其它模块如 UI 层使用),返回当前共享 catalog 的 clone 或 null */
+export function getSharedModelCatalogSnapshot(): KiroModel[] | null {
+  const shared = getSharedModelCatalog()
+  return shared ? shared.models.map(m => ({ ...m })) : null
+}
+
+// 2026-07 迁移:q.{region}.amazonaws.com → management.{region}.kiro.dev(per-region)
+// 此函数用于元数据 API(ListAvailableModels/Subscriptions/CreateSubscriptionToken/setUserPreference),
+// stream 端点由 KIRO_ENDPOINTS 数组独立管理。
+// 实测:eu 账户发到 us-east-1 host 会 403 Invalid token,必须按账户 region 分发。
+function getQServiceEndpoint(region?: string): string {
+  return getKiroManagementHost(region)
+}
+
+// 2026-07 迁移:codewhisperer.{region}.amazonaws.com → management.{region}.kiro.dev(per-region)
+// 此函数用于 fetchEnterpriseProfileArn 调 ListAvailableProfiles。
 function getCodeWhispererEndpoint(region?: string): string {
-  if (region?.startsWith('eu-')) return 'https://codewhisperer.eu-central-1.amazonaws.com'
-  return 'https://codewhisperer.us-east-1.amazonaws.com'
+  return getKiroManagementHost(region)
 }
 
 /**
@@ -2309,7 +2456,7 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
   const machineId = getAccountMachineId(account.id, account.machineId)
 
   const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
+    'Content-Type': 'application/x-amz-json-1.0',
     'Authorization': `Bearer ${account.accessToken}`,
     'x-amz-user-agent': getKiroAmzUserAgent(machineId),
     'user-agent': getKiroUserAgent(machineId),
@@ -2317,9 +2464,8 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
     'amz-sdk-request': 'attempt=1; max=1'
   }
   // external_idp (Azure AD) 需 TokenType header 走外部 IdP 校验路径，否则 CW REST 拒 403 "Invalid token"
-  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
-    headers['TokenType'] = 'EXTERNAL_IDP'
-  }
+  // 2026-07 迁移:所有账户类型统一 SSO_OIDC(仅 external_idp 用 EXTERNAL_IDP)
+  headers['TokenType'] = getTokenTypeHeader(account)
 
   // 获取该账号类型对应的备用 ARN（403 时兜底，避免每次请求都重复尝试）
   const fallbackArn = resolveProfileArn(account)
@@ -2371,12 +2517,17 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
     'Accept': 'application/json',
     'User-Agent': getKiroUserAgent(machineId),
     'x-amz-user-agent': getKiroAmzUserAgent(machineId),
-    'x-amzn-codewhisperer-optout': 'true'
+    'x-amzn-codewhisperer-optout': 'true',
+    // 补齐官方 Kiro IDE / AWS SDK 标准请求头 —— eu-central-1 等区域端点前置校验更严
+    // 缺失这些 header 时会以通用 403 "Invalid token" 拒绝,不是 token 真的无效
+    // 参考同文件 fetchEnterpriseProfileArn / 订阅函数 / 主流式接口(均已带这三个 header)
+    'x-amzn-kiro-agent-mode': getAgentMode(),
+    'amz-sdk-invocation-id': uuidv4(),
+    'amz-sdk-request': 'attempt=1; max=1'
   }
   // external_idp (Azure AD) 需 TokenType header，否则 ListAvailableModels 403 "Invalid token"
-  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
-    headers['TokenType'] = 'EXTERNAL_IDP'
-  }
+  // 2026-07 迁移:所有账户类型统一 SSO_OIDC(仅 external_idp 用 EXTERNAL_IDP)
+  headers['TokenType'] = getTokenTypeHeader(account)
 
   const allModels: KiroModel[] = []
   let nextToken: string | undefined
@@ -2403,13 +2554,42 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
       if (nextToken) params.set('nextToken', nextToken)
 
       const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
+      // 诊断日志:临时打印请求上下文(修 eu-central-1 刷模型问题用,验证通过后可移除)
+      console.log(`[KiroAPI] ListAvailableModels →`, {
+        url,
+        region: account.region,
+        profileArn: arnForModels,
+        provider: account.provider,
+        authMethod: account.authMethod,
+        agentMode: headers['x-amzn-kiro-agent-mode'],
+        accessTokenPreview: account.accessToken ? `${account.accessToken.slice(0, 20)}...${account.accessToken.slice(-10)}` : '(empty)'
+      })
       throwIfAborted(signal)
       const response = await fetchWithProxy(url, { method: 'GET', headers, signal }, account)
       throwIfAborted(signal)
       
       if (!response.ok) {
         const errBody = await response.text().catch(() => '')
-        console.error(`[KiroAPI] ListAvailableModels failed: ${response.status}`, errBody.slice(0, 300))
+        // 诊断日志:失败时打印完整上下文 + response headers,便于定位是端点/token/参数哪一层的问题
+        console.error(`[KiroAPI] ListAvailableModels failed: ${response.status}`, {
+          url,
+          region: account.region,
+          profileArn: arnForModels,
+          provider: account.provider,
+          authMethod: account.authMethod,
+          errBody: errBody.slice(0, 500),
+          responseHeaders: Object.fromEntries(response.headers.entries())
+        })
+        // 2026-07 迁移:单账户失败(如 eu IdC provisioning 限制)→ 读跨账户共享 catalog
+        // (由其它成功账户填充,例如同一 KAC 里的 us 账户)
+        if (allModels.length === 0) {
+          const shared = getSharedModelCatalog()
+          if (shared) {
+            console.warn(`[KiroAPI] Fetch failed, using shared catalog (${shared.models.length} models from ${shared.sourceEmail})`)
+            return shared.models.map(m => ({ ...m }))
+          }
+          console.warn('[KiroAPI] Fetch failed and no shared catalog available; returning empty list (UI 将提示先用其它账户刷一次)')
+        }
         break
       }
 
@@ -2418,11 +2598,23 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
       nextToken = data.nextToken
     } while (nextToken)
 
+    // 2026-07 迁移:成功 fetch → 写入跨账户共享 catalog(供其它 fetch 失败的账户读取)
+    if (allModels.length > 0) {
+      setSharedModelCatalog(allModels, account)
+    }
     return allModels
   } catch (error) {
     if (signal?.aborted) throw getAbortError(signal)
     console.error('[KiroAPI] ListAvailableModels error:', error)
-    return allModels.length > 0 ? allModels : []
+    // 2026-07 迁移:网络错误/host 不可达时 → 读跨账户共享 catalog
+    if (allModels.length === 0) {
+      const shared = getSharedModelCatalog()
+      if (shared) {
+        console.warn(`[KiroAPI] Network error, using shared catalog (${shared.models.length} models from ${shared.sourceEmail})`)
+        return shared.models.map(m => ({ ...m }))
+      }
+    }
+    return allModels
   }
 }
 
@@ -2476,9 +2668,8 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
     'amz-sdk-request': 'attempt=1; max=1'
   }
   // external_idp (Azure AD) 需 TokenType header 走外部 IdP 校验路径
-  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
-    headers['TokenType'] = 'EXTERNAL_IDP'
-  }
+  // 2026-07 迁移:所有账户类型统一 SSO_OIDC(仅 external_idp 用 EXTERNAL_IDP)
+  headers['TokenType'] = getTokenTypeHeader(account)
 
   const profileArn = resolveProfileArn(account)
   const body = JSON.stringify(profileArn ? { profileArn } : {})
@@ -2530,9 +2721,8 @@ export async function fetchSubscriptionToken(
     'amz-sdk-request': 'attempt=1; max=1'
   }
   // external_idp (Azure AD) 需 TokenType header
-  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
-    headers['TokenType'] = 'EXTERNAL_IDP'
-  }
+  // 2026-07 迁移:所有账户类型统一 SSO_OIDC(仅 external_idp 用 EXTERNAL_IDP)
+  headers['TokenType'] = getTokenTypeHeader(account)
 
   const profileArn = resolveProfileArn(account)
 
@@ -2583,9 +2773,8 @@ export async function setUserPreference(
     'amz-sdk-request': 'attempt=1; max=1'
   }
   // external_idp (Azure AD) 需 TokenType header
-  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
-    headers['TokenType'] = 'EXTERNAL_IDP'
-  }
+  // 2026-07 迁移:所有账户类型统一 SSO_OIDC(仅 external_idp 用 EXTERNAL_IDP)
+  headers['TokenType'] = getTokenTypeHeader(account)
 
   const profileArn = resolveProfileArn(account)
   const bodyPayload: Record<string, unknown> = {

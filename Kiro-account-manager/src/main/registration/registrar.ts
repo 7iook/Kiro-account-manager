@@ -1491,7 +1491,12 @@ export class Registrar {
 
     const usageUA = 'aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18'
 
-    for (const baseURL of ['https://q.us-east-1.amazonaws.com/getUsageLimits', 'https://q.eu-central-1.amazonaws.com/getUsageLimits']) {
+    // 2026-07 迁移:V2 优先(management.us-east-1.kiro.dev) + V1 host 作 fallback(us grace period)
+    for (const baseURL of [
+      'https://management.us-east-1.kiro.dev/getUsageLimits',
+      'https://q.us-east-1.amazonaws.com/getUsageLimits',
+      'https://q.eu-central-1.amazonaws.com/getUsageLimits'
+    ]) {
       const usageURL = baseURL + '?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true'
       const usageResp = await this.doGet(usageURL, {
         'Accept': 'application/json',
