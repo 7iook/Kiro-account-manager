@@ -1284,6 +1284,11 @@ async function getUsageLimitsRest(
     const fallbackArn = getEnterpriseFallbackArn(ssoRegion)
     console.log(`[Kiro REST API] Legacy V1 profileArn detected, using V2 fallback: ${fallbackArn}`)
     profileArn = fallbackArn
+  } else if (!profileArn && ssoRegion?.startsWith('eu-')) {
+    // EU management API 后端强制要求 profileArn(2026-07),不传直接 400 Invalid profileArn
+    // 无存量时自动 fallback 到本 region V2 真实值(实测 316704942615:H3A4HCGR4WEC 在任一 EU Enterprise account 下都接受)
+    profileArn = getEnterpriseFallbackArn(ssoRegion)
+    console.log(`[Kiro REST API] EU account missing profileArn, using V2 EU fallback: ${profileArn}`)
   }
   
   const params = new URLSearchParams({
@@ -3682,7 +3687,7 @@ app.whenReady().then(async () => {
             }
             return undefined
           }),
-          getUsageAndLimits(accessToken, idp, undefined, accountMachineId, region, account?.email, authMethod)
+          getUsageAndLimits(accessToken, idp, account?.profileArn, accountMachineId, region, account?.email, authMethod)
         ])
         return parseUsageResponse(usageResult, undefined, userInfoResult)
       } catch (apiError) {
@@ -3728,7 +3733,7 @@ app.whenReady().then(async () => {
                 }
                 return undefined
               }),
-              getUsageAndLimits(refreshResult.accessToken, idp, undefined, accountMachineId, region, undefined, authMethod)
+              getUsageAndLimits(refreshResult.accessToken, idp, account?.profileArn, accountMachineId, region, undefined, authMethod)
             ])
             
             // 返回结果并包含新凭证
@@ -3978,7 +3983,7 @@ app.whenReady().then(async () => {
                   }
                 }
                 console.log(`[BackgroundRefresh] Account ${account.id} machineId: ${account.machineId || 'undefined'}`)
-                const rawUsage = await getUsageAndLimits(newAccessToken, idp, undefined, account.machineId, region, undefined, authMethod) as UsageResponse
+                const rawUsage = await getUsageAndLimits(newAccessToken, idp, account.profileArn, account.machineId, region, undefined, authMethod) as UsageResponse
                 
                 // 解析使用量数据
                 const creditUsage = rawUsage.usageBreakdownList?.find(b => b.resourceType === 'CREDIT')
@@ -4611,7 +4616,7 @@ app.whenReady().then(async () => {
         userInfo?: { email?: string; userId?: string }
       }
       
-      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, undefined, undefined, region, undefined, authMethod) as UsageResponse
+      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, credentials.profileArn, undefined, region, undefined, authMethod) as UsageResponse
       
       // 解析用户信息
       const email = usageResult.userInfo?.email || ''
