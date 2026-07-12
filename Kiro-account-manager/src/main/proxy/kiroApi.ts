@@ -2614,6 +2614,104 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
   }
 }
 
+// ============ 多 profile 登录路径(2026-07-13 新增,与老 fetchEnterpriseProfileArn 并存)============
+// 决策卡 v2:external_idp + IdC 多 profile 场景共用此函数
+// 老 fetchEnterpriseProfileArn 一行不动(3 处调用点契约保护:fetchKiroModels 自愈 / fetchAvailableSubscriptions / index.ts 里 3 处)
+// 参见 .agent-workspace/.archive/2026-07-13/multi-profile-import/multi-profile-import-decision-card.md
+
+/** 归一化后的 Kiro Profile 结构(防腐层:后端字段变化不泄漏到 renderer) */
+export interface KiroProfile {
+  /** 完整 ARN(去重键的一部分) */
+  profileArn: string
+  /** 展示名(UI 主标题,可选,fallback ARN 尾段) */
+  profileName?: string
+  /** AWS 账号名(UI 副标题,可选) */
+  accountName?: string
+  /** profile 所在 region(us-east-1 / eu-central-1) */
+  region?: string
+}
+
+/** ListAvailableProfiles 返空数组时抛的错误常量,供上游 catch 通过 error.message 精准匹配 */
+export const NO_PROFILES_AVAILABLE = 'NO_PROFILES_AVAILABLE'
+
+/** fetchEnterpriseProfiles 可注入依赖(测试用,生产不传;通过依赖注入避免测试真实网络) */
+export interface FetchEnterpriseProfilesDeps {
+  fetcher?: (url: string, options: RequestInit, account?: ProxyAccount) => Promise<Response>
+}
+
+/**
+ * 拉取 external_idp / IdC 账户下所有可用 Kiro Profile(专给多 profile 登录路径)。
+ * - 与老 fetchEnterpriseProfileArn 并存,老函数一行不动
+ * - 空数组 → 抛 NO_PROFILES_AVAILABLE(不返空数组给上游,避免空态歧义)
+ * - 4xx/5xx → 抛错并透传 status + backend errorMessage,不吞(不做 fetchEnterpriseProfileArn 里的 403 fallback)
+ * - 单 profile → 返 1 元素数组(不"退化"成单值,类型稳定)
+ */
+export async function fetchEnterpriseProfiles(
+  account: ProxyAccount,
+  deps: FetchEnterpriseProfilesDeps = {}
+): Promise<Array<KiroProfile>> {
+  const fetcher = deps.fetcher ?? fetchWithProxy
+  const baseUrl = getCodeWhispererEndpoint(account.region)
+  const url = `${baseUrl}/ListAvailableProfiles`
+  const machineId = getAccountMachineId(account.id, account.machineId)
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/x-amz-json-1.0',
+    'Authorization': `Bearer ${account.accessToken}`,
+    'x-amz-user-agent': getKiroAmzUserAgent(machineId),
+    'user-agent': getKiroUserAgent(machineId),
+    'amz-sdk-invocation-id': uuidv4(),
+    'amz-sdk-request': 'attempt=1; max=1',
+    'TokenType': getTokenTypeHeader(account)
+  }
+
+  const response = await fetcher(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({})
+  }, account)
+
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '')
+    const trimmed = errBody.slice(0, 300)
+    console.error(`[KiroAPI] fetchEnterpriseProfiles failed: ${response.status}`, trimmed)
+    // 决策卡 §3:失败(4xx/5xx)→ 抛错并透传 status + backend errorMessage,不吞
+    // 不做 fetchEnterpriseProfileArn 里的 403 fallback(多 profile 登录路径必须真实拿到 profiles)
+    throw new Error(`ListAvailableProfiles HTTP ${response.status}: ${trimmed || response.statusText}`)
+  }
+
+  const data = await response.json() as {
+    profiles?: Array<{ arn?: string; profileName?: string; accountName?: string; region?: string }>
+  }
+  const rawProfiles = Array.isArray(data.profiles) ? data.profiles : []
+
+  if (rawProfiles.length === 0) {
+    console.warn('[KiroAPI] fetchEnterpriseProfiles: no profiles returned')
+    throw new Error(NO_PROFILES_AVAILABLE)
+  }
+
+  // 归一化后端 raw shape → KiroProfile(防腐层:后端字段变化不泄漏到 renderer)
+  const profiles: KiroProfile[] = rawProfiles
+    .filter((p): p is { arn: string } & Record<string, string | undefined> =>
+      typeof p?.arn === 'string' && p.arn.length > 0
+    )
+    .map((p) => ({
+      profileArn: p.arn,
+      profileName: p.profileName,
+      accountName: p.accountName,
+      region: p.region
+    }))
+
+  if (profiles.length === 0) {
+    // 全部 profile 都没 arn(异常但保护性)
+    console.warn('[KiroAPI] fetchEnterpriseProfiles: profiles present but none has arn')
+    throw new Error(NO_PROFILES_AVAILABLE)
+  }
+
+  console.log(`[KiroAPI] fetchEnterpriseProfiles resolved ${profiles.length} profile(s)`)
+  return profiles
+}
+
 // 获取 Kiro 官方模型列表（支持分页，与官方插件一致传递 profileArn）
 export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
   const baseUrl = getQServiceEndpoint(account.region)

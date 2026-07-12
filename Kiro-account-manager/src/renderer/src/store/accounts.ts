@@ -1254,13 +1254,24 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const result: BatchOperationResult = { success: 0, failed: 0, errors: [] }
     const { accounts: existingAccounts } = get()
     
-    // 检查账户是否已存在（同邮箱+同provider 或 同userId 才算重复）
-    const isAccountExists = (email: string, userId?: string, provider?: string): boolean => {
+    // 检查账户是否已存在（同userId 视为主键;副键扩为 email + provider + profileArn 三元组）
+    // 2026-07-13 多 profile 支持:同 email + 同 provider + 不同 profileArn 视为不同账户
+    //   - 传入 profileArn 时:三元组完全相同才算重复(允许多 profile 并存)
+    //   - 未传 profileArn 时:维持旧副键 (email, provider),向后兼容 OIDC / BuilderId / Social 等无 profile 概念的登录
+    // TODO(下轮): 与 AddAccountDialog:65-74 的同名闭包函数收敛为单一 helper(§SSOT 债务台账已登记)
+    const isAccountExists = (email: string, userId?: string, provider?: string, profileArn?: string): boolean => {
       return Array.from(existingAccounts.values()).some(acc => {
         // userId 相同则重复
         if (userId && acc.userId === userId) return true
-        // email 相同且 provider 相同则重复（允许同邮箱不同登录方式）
-        if (acc.email === email && acc.credentials.provider === provider) return true
+        // email 相同且 provider 相同 → 进入三元组判定
+        if (acc.email === email && acc.credentials.provider === provider) {
+          // 传入 profileArn:必须完全相同才算重复
+          if (profileArn !== undefined && profileArn !== '') {
+            return acc.credentials.profileArn === profileArn
+          }
+          // 未传 profileArn:维持旧副键行为(向后兼容)
+          return true
+        }
         return false
       })
     }
@@ -1282,8 +1293,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const accountsToAdd: Account[] = []
 
     for (const accountData of uniqueAccounts) {
-      // 检查本地是否已存在（传入 provider 参数）
-      if (isAccountExists(accountData.email, accountData.userId, accountData.credentials?.provider)) {
+      // 检查本地是否已存在（传入 provider + profileArn,§三元组副键）
+      if (isAccountExists(accountData.email, accountData.userId, accountData.credentials?.provider, accountData.credentials?.profileArn)) {
         skipped++
         continue
       }

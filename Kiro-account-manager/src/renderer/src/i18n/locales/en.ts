@@ -496,6 +496,17 @@ const en = {
     batchItemImportFailed: 'Import Failed',
     batchCompleted: 'Batch registration completed',
     batchStopped: 'Batch stopped at {done}/{total}'
+  },
+
+  // Multi-profile select dialog (external_idp / IdC login when profile count >= 2)
+  profileSelectDialog: {
+    title: 'Select Kiro profiles to import',
+    description: 'Already-imported profiles are grayed out',
+    selectAll: 'Select all',
+    confirm: 'Import selected',
+    cancel: 'Cancel',
+    alreadyImported: 'Already imported',
+    batchImportPartialFail: '{success}/{total} imported successfully'
   }
 }
 

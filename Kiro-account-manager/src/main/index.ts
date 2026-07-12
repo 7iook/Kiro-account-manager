@@ -16,7 +16,8 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, setProfileArnPersistCallback, setAgentMode } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, setProfileArnPersistCallback, setAgentMode, type KiroProfile } from './proxy/kiroApi'
+import { resolveProfileArnForVerify, buildCompleteLoginResult } from './proxy/profile-selection'
 import {
   writeKiroAuthTokenFile,
   readKiroAuthTokenFile,
@@ -4686,24 +4687,24 @@ app.whenReady().then(async () => {
       
       console.log('[Verify] Success! Email:', email)
 
-      // Enterprise 账号：验证时自动获取 profileArn（BuilderId/Social 不需要调 API）
-      let enterpriseProfileArn: string | undefined
+      // Enterprise 账号：验证时决定 profileArn(v2 SSOT · resolveProfileArnForVerify)
+      // - credentials.profileArn 传入(renderer 多 profile 场景已选定)→ 优先使用不再调 fetch
+      // - 未传入 + isEnterprise → fetchEnterpriseProfileArn 兜底(向后兼容原行为)
+      // - 未传入 + 非 Enterprise → undefined(BuilderId / Social 不需要)
       const isEnt = provider === 'Enterprise' || authMethod === 'external_idp'
-      if (isEnt) {
-        try {
-          enterpriseProfileArn = await fetchEnterpriseProfileArn({
-            id: '',
-            accessToken: refreshResult.accessToken!,
-            region: region || 'us-east-1',
-            provider,
-            authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined
-          })
-          if (enterpriseProfileArn) {
-            console.log(`[Verify] Enterprise profileArn auto-resolved: ${enterpriseProfileArn}`)
-          }
-        } catch (e) {
-          console.warn('[Verify] Failed to fetch Enterprise profileArn:', e)
-        }
+      const enterpriseProfileArn = await resolveProfileArnForVerify(
+        {
+          providedProfileArn: credentials.profileArn,
+          isEnterprise: isEnt,
+          accessToken: refreshResult.accessToken!,
+          region: region || 'us-east-1',
+          provider,
+          authMethod
+        },
+        (acc) => fetchEnterpriseProfileArn(acc)
+      )
+      if (enterpriseProfileArn) {
+        console.log(`[Verify] Enterprise profileArn resolved: ${enterpriseProfileArn}`)
       }
       
       return {
@@ -5928,10 +5929,12 @@ app.whenReady().then(async () => {
         return { success: false, error: '换取 Token 响应缺少 access_token' }
       }
 
-      // 用微软 access_token 调 ListAvailableProfiles 拿 profileArn（复用现有函数）
-      let profileArn: string | undefined
+      // 用微软 access_token 调 ListAvailableProfiles 拿所有可用 profiles(v2:多 profile 支持)
+      // 空数组 / 4xx / 5xx 都 catch:登录 token 换取已成功,只是 profiles 拿不到,不阻塞整体登录流程
+      // (与老 fetchEnterpriseProfileArn 兜底 undefined 行为一致 · renderer 侧看到 profiles=[] 会给用户提示)
+      let profiles: KiroProfile[] = []
       try {
-        profileArn = await fetchEnterpriseProfileArn({
+        profiles = await fetchEnterpriseProfiles({
           id: '',
           accessToken: tok.access_token,
           region: 'us-east-1',
@@ -5939,21 +5942,18 @@ app.whenReady().then(async () => {
           authMethod: 'external_idp'
         })
       } catch (e) {
-        console.warn('[ExternalIdpLogin] fetchEnterpriseProfileArn failed:', e)
+        console.warn('[ExternalIdpLogin] fetchEnterpriseProfiles failed:', e)
       }
 
-      const result = {
-        success: true,
-        accessToken: tok.access_token,
-        refreshToken: tok.refresh_token || '',
-        expiresIn: tok.expires_in ?? 3600,
-        tokenEndpoint: saved.tokenEndpoint,
-        issuerUrl: saved.issuerUrl,
-        clientId: saved.clientId,
-        scopes: saved.scopes.join(' '),
-        profileArn,
-        email: saved.email
-      }
+      const result = buildCompleteLoginResult(
+        {
+          accessToken: tok.access_token,
+          refreshToken: tok.refresh_token,
+          expiresIn: tok.expires_in
+        },
+        profiles,
+        saved
+      )
       externalIdpLoginState = null
       return result
     } catch (error) {

@@ -496,6 +496,17 @@ const zh = {
     batchItemImportFailed: '导入失败',
     batchCompleted: '批量注册已完成',
     batchStopped: '批量已停止 {done}/{total}'
+  },
+
+  // 多 profile 选择框(external_idp / IdC 登录后 profile ≥2 时使用)
+  profileSelectDialog: {
+    title: '选择要导入的 Kiro Profile',
+    description: '已导入的项自动置灰',
+    selectAll: '全选',
+    confirm: '导入选中项',
+    cancel: '取消',
+    alreadyImported: '已导入',
+    batchImportPartialFail: '{success}/{total} 个导入成功'
   }
 }
 

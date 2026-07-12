@@ -394,7 +394,19 @@ const api = {
     issuerUrl?: string
     clientId?: string
     scopes?: string
+    /** 老字段:N=1 时 = profiles[0].profileArn(向后兼容 renderer 旧代码单 profile 路径) */
     profileArn?: string
+    /**
+     * 新字段(2026-07-13 多 profile 支持):后端所有可用 profile。
+     * renderer 用它做单/多 profile 分叉(N=1 自动导入 / N≥2 弹选择框)。
+     * 拿不到 profile(4xx / 5xx / NO_PROFILES_AVAILABLE)时为 [](登录 token 仍已成功换取)。
+     */
+    profiles?: Array<{
+      profileArn: string
+      profileName?: string
+      accountName?: string
+      region?: string
+    }>
     email?: string
     error?: string
   }> => {

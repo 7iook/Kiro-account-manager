@@ -5,6 +5,12 @@ import { useTranslation } from '@/hooks/useTranslation'
 import type { SubscriptionType } from '@/types/account'
 import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff } from 'lucide-react'
 import { splitCredentialLine } from '@/lib/utils'
+import { ProfileSelectDialog } from './ProfileSelectDialog'
+import {
+  pickProfileImportStrategy,
+  runBatchProfileImport,
+  type KiroProfileForSelect
+} from './profileImportHelpers'
 
 interface AddAccountDialogProps {
   isOpen: boolean
@@ -63,14 +69,25 @@ type LoginType = 'builderid' | 'google' | 'github' | 'iamsso' | 'externalidp'
 export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): React.ReactNode {
   const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab } = useAccountsStore()
 
-  // 检查账户是否已存在（同userId 或 同邮箱+同provider 才算重复）
-  const isAccountExists = (email: string, userId: string, provider?: string): boolean => {
+  // 检查账户是否已存在
+  //   主键: userId (强前提, 相同即重复)
+  //   副键: (email, provider, profileArn) 三元组
+  // 2026-07-13 多 profile 支持: 同 email + 同 provider + 不同 profileArn 视为不同账户
+  //   - 传入 profileArn 时: 三元组完全相同才算重复 (允许多 profile 并存)
+  //   - 未传 profileArn 时: 维持旧副键 (email, provider), 向后兼容 OIDC / BuilderId / Social 等无 profile 概念的登录
+  // TODO(下轮): 与 store/accounts.ts:1256 的同名闭包函数收敛为单一 helper (§SSOT 债务台账已登记)
+  const isAccountExists = (email: string, userId: string, provider?: string, profileArn?: string): boolean => {
     return Array.from(accounts.values()).some(acc => {
-      // userId 相同则重复（主要判断依据）
+      // userId 相同则重复(主键)
       if (userId && acc.userId === userId) return true
-      // email 非空且相同，且 provider 相同则重复（允许同邮箱不同登录方式）
-      // 企业账号可能没有 email，所以 email 为空时不用 email 判断
-      if (email && acc.email === email && acc.credentials.provider === provider) return true
+      // 副键: email + provider (企业账号可能没有 email, email 为空时不用 email 判断)
+      if (email && acc.email === email && acc.credentials.provider === provider) {
+        // 三元组: 传入 profileArn 时必须完全相同才算重复
+        if (profileArn !== undefined && profileArn !== '') {
+          return acc.credentials.profileArn === profileArn
+        }
+        return true
+      }
       return false
     })
   }
@@ -134,6 +151,23 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const [entraEmail, setEntraEmail] = useState('')
   const [entraAuthorizeUrl, setEntraAuthorizeUrl] = useState<string | null>(null)
   const [entraCallbackUrl, setEntraCallbackUrl] = useState('')
+
+  // 多 profile 导入选择框 pending state
+  // 当 completeExternalIdpLogin 返 profiles.length >= 2 时暂存,等用户点确认后 batch 导入
+  const [pendingMultiProfile, setPendingMultiProfile] = useState<{
+    profiles: KiroProfileForSelect[]
+    alreadyImportedArns: Set<string>
+    loginResult: {
+      accessToken: string
+      refreshToken?: string
+      clientId?: string
+      tokenEndpoint?: string
+      issuerUrl?: string
+      scopes?: string
+      email?: string
+    }
+    fallbackEmail: string
+  } | null>(null)
 
   // 清理轮询
   useEffect(() => {
@@ -373,7 +407,35 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         setError(result.error || (isEn ? 'Login failed' : '登录失败'))
         return
       }
-      // 用拿到的微软 token 走验证 + 查用量（authMethod=external_idp，profileArn 已带回）
+      // 多 profile 分叉:profiles.length ≥ 2 → 弹选择框,暂存 loginResult
+      // (决策卡 v2 §4 UX=C 自适应,N≤1 走原自动路径零 UI 变化)
+      const fallbackEmail = result.email || entraEmail.trim()
+      const strategy = pickProfileImportStrategy(
+        result.profiles,
+        accounts,
+        fallbackEmail,
+        ['ExternalIdp', 'IdC']
+      )
+      if (strategy.mode === 'select') {
+        setPendingMultiProfile({
+          profiles: strategy.profiles,
+          alreadyImportedArns: strategy.alreadyImportedArns,
+          loginResult: {
+            accessToken: result.accessToken,
+            refreshToken: result.refreshToken,
+            clientId: result.clientId,
+            tokenEndpoint: result.tokenEndpoint,
+            issuerUrl: result.issuerUrl,
+            scopes: result.scopes,
+            email: result.email
+          },
+          fallbackEmail
+        })
+        // 关闭"正在提交"状态,让用户在弹框里操作
+        setIsSubmitting(false)
+        return
+      }
+      // 用拿到的微软 token 走验证 + 查用量(authMethod=external_idp,profileArn 已带回)
       const verify = await window.api.verifyAccountCredentials({
         refreshToken: result.refreshToken || '',
         clientId: result.clientId || '',
@@ -393,7 +455,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       }
       const { email: vEmail, userId } = verify.data
       const finalEmail = vEmail || result.email || entraEmail.trim()
-      if (isAccountExists(finalEmail, userId, 'ExternalIdp')) {
+      const finalProfileArn = verify.data.profileArn || result.profileArn
+      if (isAccountExists(finalEmail, userId, 'ExternalIdp', finalProfileArn)) {
         setError(isEn ? 'This account already exists' : '该账号已存在，无需重复添加')
         return
       }
@@ -459,6 +522,126 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
   // 让 deep-link 回调 ref 始终指向最新的 complete 函数（闭包防陈旧）
   completeExternalIdpRef.current = handleCompleteExternalIdpLogin
+
+  // 多 profile 选择框 · 确认导入(串行 M 次 verify + M 次 addAccount,失败不阻塞)
+  // 决策卡 v2 §3 幂等 + 降级:isProfileAlreadyImported 命中的跳过,verify 失败的记录错误继续下一个
+  const handleConfirmMultiProfile = async (selected: KiroProfileForSelect[]): Promise<void> => {
+    if (!pendingMultiProfile) return
+    const { loginResult, fallbackEmail } = pendingMultiProfile
+    setIsSubmitting(true)
+    setError(null)
+    try {
+      const outcome = await runBatchProfileImport({
+        selected,
+        isDuplicate: (profileArn) => isAccountExists(fallbackEmail, '', 'ExternalIdp', profileArn),
+        duplicateMessage: isEn ? 'already imported' : '已导入',
+        verifyForProfile: async (profileArn) => {
+          const verify = await window.api.verifyAccountCredentials({
+            refreshToken: loginResult.refreshToken || '',
+            clientId: loginResult.clientId || '',
+            clientSecret: '',
+            region: 'us-east-1',
+            authMethod: 'external_idp',
+            provider: 'AzureAD',
+            accessToken: loginResult.accessToken,
+            tokenEndpoint: loginResult.tokenEndpoint,
+            issuerUrl: loginResult.issuerUrl,
+            scopes: loginResult.scopes,
+            profileArn
+          })
+          if (!verify.success || !verify.data) {
+            return { success: false, error: verify.error }
+          }
+          return { success: true, data: verify.data }
+        },
+        addAccountForVerify: (verifyData, profile) => {
+          const now = Date.now()
+          const finalEmail = verifyData.email || fallbackEmail
+          const finalProfileArn = verifyData.profileArn || profile.profileArn
+          // 二次幂等:防并发/重复触发时 addAccount 前再核一次
+          if (isAccountExists(finalEmail, verifyData.userId as string, 'ExternalIdp', finalProfileArn)) {
+            throw new Error(isEn ? 'already imported' : '已导入')
+          }
+          const vd = verifyData as unknown as VerifiedData
+          addAccount({
+            email: finalEmail,
+            userId: verifyData.userId as string,
+            nickname: finalEmail ? finalEmail.split('@')[0] : undefined,
+            idp: 'ExternalIdp',
+            groupId: selectedGroupId,
+            credentials: {
+              accessToken: verifyData.accessToken,
+              csrfToken: '',
+              refreshToken: verifyData.refreshToken || loginResult.refreshToken || '',
+              clientId: loginResult.clientId || '',
+              clientSecret: '',
+              region: 'us-east-1',
+              expiresAt: vd.expiresIn ? now + vd.expiresIn * 1000 : now + 3600 * 1000,
+              authMethod: 'external_idp',
+              provider: 'ExternalIdp',
+              profileArn: finalProfileArn,
+              tokenEndpoint: loginResult.tokenEndpoint,
+              issuerUrl: loginResult.issuerUrl,
+              scopes: loginResult.scopes
+            },
+            subscription: {
+              type: vd.subscriptionType as SubscriptionType,
+              title: vd.subscriptionTitle,
+              daysRemaining: vd.daysRemaining,
+              expiresAt: vd.expiresAt,
+              managementTarget: vd.subscription?.managementTarget,
+              upgradeCapability: vd.subscription?.upgradeCapability,
+              overageCapability: vd.subscription?.overageCapability
+            },
+            usage: {
+              current: vd.usage.current,
+              limit: vd.usage.limit,
+              percentUsed: vd.usage.limit > 0 ? vd.usage.current / vd.usage.limit : 0,
+              lastUpdated: now,
+              baseLimit: vd.usage.baseLimit,
+              baseCurrent: vd.usage.baseCurrent,
+              freeTrialLimit: vd.usage.freeTrialLimit,
+              freeTrialCurrent: vd.usage.freeTrialCurrent,
+              freeTrialExpiry: vd.usage.freeTrialExpiry,
+              bonuses: vd.usage.bonuses,
+              nextResetDate: vd.usage.nextResetDate,
+              resourceDetail: vd.usage.resourceDetail
+            },
+            tags: [],
+            status: 'active',
+            lastUsedAt: now
+          })
+        }
+      })
+      // 汇总:全成功则关弹框走 onClose;部分/全失败则显示汇总错误让用户重试
+      if (outcome.errors.length === 0) {
+        setPendingMultiProfile(null)
+        resetForm()
+        onClose()
+      } else {
+        const summary = t('profileSelectDialog.batchImportPartialFail', {
+          success: outcome.successCount,
+          total: selected.length
+        })
+        const detail = outcome.errors
+          .map(e => `• ${e.profileName || e.profileArn}: ${e.message}`)
+          .join('\n')
+        setError(`${summary}\n${detail}`)
+        // 关闭 pending 保留结果供用户查看 error(可再次点登录重来)
+        setPendingMultiProfile(null)
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : (isEn ? 'Batch import failed' : '批量导入失败'))
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  const handleCancelMultiProfile = (): void => {
+    setPendingMultiProfile(null)
+    // 决策卡 §Invariant 4:取消 → 不导入任何账户,不留半成品状态
+    setIsSubmitting(false)
+  }
 
   // 启动 IAM SSO 登录 (Authorization Code flow)
   const handleStartIamSsoLogin = async () => {
@@ -1168,6 +1351,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   if (!isOpen) return null
 
   return (
+    <>
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/50" onClick={onClose} />
 
@@ -2149,5 +2333,13 @@ email----password----refreshToken----clientId----clientSecret`
         </CardContent>
       </Card>
     </div>
+    <ProfileSelectDialog
+      open={!!pendingMultiProfile}
+      profiles={pendingMultiProfile?.profiles ?? []}
+      alreadyImportedArns={pendingMultiProfile?.alreadyImportedArns ?? new Set()}
+      onConfirm={handleConfirmMultiProfile}
+      onCancel={handleCancelMultiProfile}
+    />
+    </>
   )
 }
