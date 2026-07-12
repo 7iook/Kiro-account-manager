@@ -1626,7 +1626,10 @@ async function parseEventStream(
   //       （同名同参丢弃，避免重复执行）后注入救回。
   // 开关：环境变量 KIRO_TOOL_LEAK_FIX=off 可回退到原逐帧 <tool_use> 过滤。
   const toolLeakFixEnabled = (process.env.KIRO_TOOL_LEAK_FIX || 'on').toLowerCase().trim() !== 'off'
+  // 调试开关:默认关闭,`set KIRO_TOOL_LEAK_DEBUG=1 && npm run dev` 开启详细跟踪(carry/emit/rescue/leak-to-client 日志)
   const toolLeakDebug = process.env.KIRO_TOOL_LEAK_DEBUG === '1'
+  // 调试信号 pattern:只在 raw content / emit 后内容命中时 log(避免正常文本刷屏)
+  const SUSPICIOUS_LEAK_PATTERN = /<tool_use|<invoke|<function_results|\b(?:court|count|call)\b/
   let leakCarry = ''
   const leakedTools: Array<{ name: string; input: Record<string, unknown> }> = []
   const seenToolSigs = new Set<string>()
@@ -1655,19 +1658,27 @@ async function parseEventStream(
     }
     return { name, input }
   }
-  // 解析 <tool_use id="..." name="..."> {json body} </tool_use> 泄漏格式(Anthropic 标准格式)
-  // 与 <invoke> 不同：body 直接是 JSON 对象,不用 <parameter> 标签
+  // 解析 <tool_use id="..." name="..."> {body} </tool_use> 泄漏格式(Anthropic 标准格式)
+  // 2026-07-12 升级:支持 3 种错配 close tag(model 常混：</tool_use> / </invoke> / </function_calls>)
+  //           body 可以是 JSON 对象或 <parameter>...</parameter> XML 格式（model 混合 mimic）
   const parseToolUseBlock = (rawBlock: string): { name: string; input: Record<string, unknown> } | null => {
     const nameMatch = rawBlock.match(/<tool_use\b[^>]*\bname="([^"]+)"/)
     if (!nameMatch) return null
     const name = nameMatch[1]
-    const bodyMatch = rawBlock.match(/<tool_use\b[^>]*>([\s\S]*?)<\/tool_use>/)
+    // 支持任一 close tag:</tool_use> / </invoke> / </function_calls>
+    const bodyMatch = rawBlock.match(/<tool_use\b[^>]*>([\s\S]*?)<\/(?:tool_use|invoke|function_calls)>/)
     if (!bodyMatch) return null
     const body = bodyMatch[1].trim()
     let input: Record<string, unknown> = {}
     if (body) {
-      try { input = JSON.parse(body) as Record<string, unknown> }
-      catch { input = { _raw: body } }  // JSON 坏了兜底原文,让下游 tool 至少收到点东西
+      // 混合格式检测：如果 body 含 <parameter> 就用 XML parser,否则当 JSON 解
+      if (body.includes('<parameter')) {
+        const parsed = parseInvokeBody(name, body)
+        input = parsed.input
+      } else {
+        try { input = JSON.parse(body) as Record<string, unknown> }
+        catch { input = { _raw: body } }  // JSON 坏了兜底原文,让下游 tool 至少收到点东西
+      }
     }
     return { name, input }
   }
@@ -1686,8 +1697,21 @@ async function parseEventStream(
     if (i === -1) return false
     return !s.slice(i).includes('</invoke>')
   }
+  // 2026-07-12 新增:检测未闭合的 <tool_use 开标签(Kiro backend 分帧极细,一帧 17 字节就能到达,必须 hold-back)
+  // 2026-07-12 升级:支持 3 种错配 close tag(model mimic history 时常混：</tool_use> / </invoke> / </function_calls>)
+  const hasOpenToolUse = (s: string): boolean => {
+    const i = s.lastIndexOf('<tool_use')
+    if (i === -1) return false
+    const after = s.slice(i)
+    return !after.includes('</tool_use>') && !after.includes('</invoke>') && !after.includes('</function_calls>')
+  }
+  const hasOpenFunctionResults = (s: string): boolean => {
+    const i = s.lastIndexOf('<function_results')
+    if (i === -1) return false
+    return !s.slice(i).includes('</function_results>')
+  }
   const pendingToolTail = (s: string): number => {
-    const markers = ['<function_calls>', '<invoke name=', '</invoke>', '</function_calls>', '<parameter name=', '</parameter>', '<tool_use', '</tool_use>', 'court', 'count', 'call']
+    const markers = ['<function_calls>', '<invoke name=', '</invoke>', '</function_calls>', '<parameter name=', '</parameter>', '<tool_use', '</tool_use>', '<function_results', '</function_results>', 'court', 'count', 'call']
     let hold = 0
     for (const tag of markers) {
       for (let k = Math.min(s.length, tag.length - 1); k >= 1; k--) {
@@ -1706,30 +1730,103 @@ async function parseEventStream(
   // 处理 leakCarry：正常文本经 onChunk 输出，泄漏工具暂存 leakedTools。isFlush 时吐出残留。
   // async：emit await onChunk 以保留 SSE 背压（慢客户端时暂停拉流，避免内存堆积）
   const filterToolLeak = async (isFlush: boolean): Promise<void> => {
+    if (toolLeakDebug) {
+      const tail = leakCarry.slice(Math.max(0, leakCarry.length - 80))
+      console.log(`[tool-leak-fix] filterToolLeak(isFlush=${isFlush}) carry.length=${leakCarry.length} tail=${JSON.stringify(tail)}`)
+    }
     const emit = async (s: string): Promise<void> => {
       if (!s) return
+      // [LEAK-TO-CLIENT] 如果 emit 到客户端的内容含可疑 XML/stray token pattern = 漏网泄漏到 client 了
+      if (toolLeakDebug && SUSPICIOUS_LEAK_PATTERN.test(s)) {
+        console.log(`[tool-leak-fix] [LEAK-TO-CLIENT] len=${s.length}:`, JSON.stringify(s.slice(0, 250)))
+      }
       await onChunk(s)
       totalOutputChars += s.length
       collectedOutputText += s
     }
     // 提取所有已闭合的 <tool_use>(Anthropic 标准格式,Opus 4.8 常见泄漏)
+    // 2026-07-12 升级:close tag 支持 3 种(</tool_use> / </invoke> / </function_calls>) model 混配时也能命中
     for (;;) {
       const fi = leakCarry.indexOf('<tool_use')
       if (fi === -1) break
-      const ci = leakCarry.indexOf('</tool_use>', fi)
+      // 找最早出现的 close tag(任一种)
+      const closeCandidates: Array<{ tag: string; len: number }> = [
+        { tag: '</tool_use>', len: '</tool_use>'.length },
+        { tag: '</invoke>', len: '</invoke>'.length },
+        { tag: '</function_calls>', len: '</function_calls>'.length }
+      ]
+      let ci = -1
+      let closeLen = 0
+      for (const cand of closeCandidates) {
+        const idx = leakCarry.indexOf(cand.tag, fi)
+        if (idx !== -1 && (ci === -1 || idx < ci)) {
+          ci = idx
+          closeLen = cand.len
+        }
+      }
       if (ci === -1) break // 未闭合,等更多帧
-      const endIdx = ci + '</tool_use>'.length
+      const endIdx = ci + closeLen
       const rawBlock = leakCarry.slice(fi, endIdx)
       const tool = parseToolUseBlock(rawBlock)
       if (tool) {
         await emit(leakCarry.slice(0, fi))
         leakedTools.push(tool)
+        if (toolLeakDebug) console.log(`[tool-leak-fix] parsed <tool_use name="${tool.name}">, input.keys=[${Object.keys(tool.input).join(',')}], close=${leakCarry.slice(ci, endIdx)}`)
         leakCarry = leakCarry.slice(endIdx)
       } else {
-        // 匹配了但 parse 失败 —— 极罕见,原样输出避免死循环
-        await emit(leakCarry.slice(0, endIdx))
+        // 2026-07-12 遗漏修正:Opus 4.8 常见 <tool_use id="..."> 缺 name= 属性 → parseToolUseBlock 返 null
+        // 旧代码在这里 await emit(rawBlock) 原样输出 → 客户端收到 raw XML → 误识为已执行 tool → stop_reason=end_turn → 对话直接中断。
+        // 新代码:静默剥离不 emit(无 name 无法 rescue,丢弃比中断对话好)；同时 debug log 捕获现场
+        await emit(leakCarry.slice(0, fi))
+        if (toolLeakDebug) console.log(`[tool-leak-fix] 剥离无 name 的 <tool_use> block 不 emit, len=${endIdx - fi}, raw preview:`, rawBlock.slice(0, 200).replace(/\s+/g, ' '))
         leakCarry = leakCarry.slice(endIdx)
       }
+    }
+    // 2026-07-12 新增:提取所有已闭合的 <function_results>（Opus 4.8 幻觉的“假 tool result”）
+    // 背景:模型自己在文本里 emit `<function_results id="...">Error calling tool ...</function_results>` 假装 tool 已执行 →
+    //       客户端（Claude Code）收到会认为 tool 已完成一轮（尽管是幻觉）→ stop_reason=end_turn → 对话直接中断，后续 tool 全失败。
+    // 修法:直接剥离整块不 emit 到客户端（不 rescue，因为是幻觉不能重新执行）。
+    for (;;) {
+      const fi = leakCarry.indexOf('<function_results')
+      if (fi === -1) break
+      const ci = leakCarry.indexOf('</function_results>', fi)
+      if (ci === -1) break // 未闭合,等更多帧
+      const endIdx = ci + '</function_results>'.length
+      await emit(leakCarry.slice(0, fi))
+      if (toolLeakDebug) console.log(`[tool-leak-fix] 剥离幻觉 <function_results> block 不 emit, len=${endIdx - fi}, preview:`, leakCarry.slice(fi, Math.min(fi + 200, endIdx)).replace(/\s+/g, ' '))
+      leakCarry = leakCarry.slice(endIdx)
+    }
+    // 2026-07-12 关键修复:跨帧分片时未闭合的 <tool_use / <function_results 必须 hold-back
+    // Kiro backend 分帧极细,一帧 17 字节就可能仅到达 "\n\n<tool_use id=\"t";close tag 可能在 20+ 帧后才拼到。
+    // 旧代码仅 <invoke> 有 hasOpenInvoke hold-back,<tool_use / <function_results 无,
+    // 导致 leakCarry 里未闭合的 <tool_use 会被 pendingToolTail 误判为 "非 prefix"(尾部 "t" 不匹配 marker prefix)→
+    // 整段 emit 到客户端 → XML 泄漏 + 对话中断。
+    // 修法:发现未闭合 open tag 时,剥掉它之前的正常文本,leakCarry 保留 open tag 及之后字符,等下一帧拼接 close tag。
+    if (hasOpenToolUse(leakCarry)) {
+      if (isFlush) {
+        await emit(leakCarry)
+        leakCarry = ''
+        return
+      }
+      const ti = leakCarry.indexOf('<tool_use')
+      const safe = leakCarry.slice(0, ti)
+      await emit(safe)
+      if (toolLeakDebug) console.log(`[tool-leak-fix] [HOLD-BACK-tool_use] open 无 close,hold-back 从 pos=${ti} 到末尾,carry.length=${leakCarry.length}`)
+      leakCarry = leakCarry.slice(ti)
+      return
+    }
+    if (hasOpenFunctionResults(leakCarry)) {
+      if (isFlush) {
+        await emit(leakCarry)
+        leakCarry = ''
+        return
+      }
+      const fi = leakCarry.indexOf('<function_results')
+      const safe = leakCarry.slice(0, fi)
+      await emit(safe)
+      if (toolLeakDebug) console.log(`[tool-leak-fix] [HOLD-BACK-function_results] open 无 close,hold-back 从 pos=${fi} 到末尾,carry.length=${leakCarry.length}`)
+      leakCarry = leakCarry.slice(fi)
+      return
     }
     // 提取所有已闭合的 invoke
     for (;;) {
@@ -1833,8 +1930,12 @@ async function parseEventStream(
               const assistantResp = event.assistantResponseEvent || event
               const content = assistantResp.content as string | undefined
               if (content) {
+                // [RAW] Kiro backend raw 帧含可疑 XML/stray token,后续追踪过滤是否命中
+                if (toolLeakDebug && SUSPICIOUS_LEAK_PATTERN.test(content)) {
+                  console.log(`[tool-leak-fix] [RAW-assistantResponseEvent] len=${content.length}:`, JSON.stringify(content.slice(0, 250)))
+                }
                 if (toolLeakFixEnabled) {
-                  // 跨帧过滤：分离正常文本与泄漏的工具调用 XML
+                  // 跨帧过滤:分离正常文本与泄漏的工具调用 XML
                   leakCarry += content
                   await filterToolLeak(false)
                 } else {
@@ -1856,6 +1957,9 @@ async function parseEventStream(
               const codeResp = event.codeEvent || event
               const content = codeResp.content as string | undefined
               if (content) {
+                if (toolLeakDebug && SUSPICIOUS_LEAK_PATTERN.test(content)) {
+                  console.log(`[tool-leak-fix] [RAW-codeEvent] len=${content.length}:`, JSON.stringify(content.slice(0, 250)))
+                }
                 if (toolLeakFixEnabled) {
                   leakCarry += content
                   await filterToolLeak(false)
@@ -2266,16 +2370,18 @@ async function parseEventStream(
         try { sig = toolSig(lt.name, lt.input) } catch { sig = lt.name + '|?' }
         if (seenToolSigs.has(sig)) {
           deduped++
+          if (toolLeakDebug) console.log(`[tool-leak-fix] [DEDUP-SKIP] name=${lt.name} sig=${sig.slice(0, 100)}`)
           continue
         }
         seenToolSigs.add(sig)
         leakIdCounter++
         const rescuedId = `toolleakfix_${Date.now().toString(36)}_${leakIdCounter.toString(36)}`
+        if (toolLeakDebug) console.log(`[tool-leak-fix] [RESCUE] id=${rescuedId} name=${lt.name} input=${JSON.stringify(lt.input).slice(0, 200)}`)
         await onChunk('', { toolUseId: rescuedId, name: lt.name, input: lt.input })
         rescued++
       }
       if (rescued > 0 || toolLeakDebug) {
-        proxyLogger.info('Kiro', `Tool-leak-fix: leaked=${leakedTools.length} rescued=${rescued} deduped=${deduped}`)
+        proxyLogger.info('Kiro', `Tool-leak-fix: leaked=${leakedTools.length} rescued=${rescued} deduped=${deduped} seen_sigs=${seenToolSigs.size}`)
       }
     }
 
@@ -2302,6 +2408,8 @@ async function parseEventStream(
     proxyLogger.info('Kiro', 'Stream complete, final usage', usage)
     onComplete(usage)
   } catch (error) {
+    // [STREAM-ERROR] 调试:看 stream 提前中断的根因(filterToolLeak 抛错 / event 解析异常 / abort)
+    if (toolLeakDebug) console.log(`[tool-leak-fix] [STREAM-ERROR]`, error instanceof Error ? `${error.name}: ${error.message}` : String(error))
     onError(signal?.aborted ? getAbortError(signal) : error as Error)
   } finally {
     signal?.removeEventListener('abort', abort)
