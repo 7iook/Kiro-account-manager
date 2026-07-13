@@ -2554,13 +2554,56 @@ function getCodeWhispererEndpoint(region?: string): string {
 }
 
 /**
- * Enterprise 账号获取 profileArn（通过 CodeWhisperer Runtime 的 /ListAvailableProfiles）
- * 官方 IDE 在认证后通过此 API 获取可用 profiles，用户选择后存储 ARN。
+ * 从 profileArn 解析真实数据面 region。
+ * arn 格式:arn:aws:codewhisperer:{region}:{accountId}:profile/{profileId}
+ * 跨 region 用户:身份 SSO region(refresh 用)可能 ≠ profile region(数据面 API 用)
+ */
+export function parseRegionFromProfileArn(arn: string | undefined | null): string | undefined {
+  if (!arn) return undefined
+  const parts = arn.split(':')
+  // arn:aws:codewhisperer:{region}:...
+  if (parts.length >= 4 && parts[0] === 'arn' && parts[2] === 'codewhisperer') {
+    return parts[3] || undefined
+  }
+  return undefined
+}
+
+/** 已知 CodeWhisperer profile 可能存在的 region 集合(用于跨 region 探测) */
+const KNOWN_CW_REGIONS: readonly string[] = ['us-east-1', 'eu-central-1']
+
+/** 单次 region 尝试:200 返数组(可能空);非 200 返 null 表示这个 region 拒了 */
+async function tryListProfilesAt(
+  account: ProxyAccount,
+  region: string,
+  headers: Record<string, string>
+): Promise<Array<{ arn?: string; profileName?: string }> | null> {
+  const baseUrl = getCodeWhispererEndpoint(region)
+  const url = `${baseUrl}/ListAvailableProfiles`
+  const response = await fetchWithProxy(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({})
+  }, account)
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '')
+    console.warn(`[KiroAPI] ListAvailableProfiles @${region} → ${response.status} ${errBody.slice(0, 150)}`)
+    return null
+  }
+  const data = await response.json() as { profiles?: Array<{ arn?: string; profileName?: string }> }
+  return data.profiles || []
+}
+
+/**
+ * Enterprise 账号获取 profileArn(通过 CodeWhisperer Runtime 的 /ListAvailableProfiles)
+ * 官方 IDE 在认证后通过此 API 获取可用 profiles,用户选择后存储 ARN。
  * 反代自动取第一个 profile。
+ *
+ * 跨 region 用户支持(2026-07-14):身份 SSO region ≠ profile region 的场景
+ *   - 用户 SSO 在 eu-central-1(refresh 用),但组织 profile 挂在 us-east-1
+ *   - 首选 account.region 打,profiles=[] 时自动跨 region 探测已知的 CW region
+ *   - 找到有 profile 的 region → 返 arn(caller 可用 parseRegionFromProfileArn 解析真 region 用于后续 API)
  */
 export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<string | undefined> {
-  const baseUrl = getCodeWhispererEndpoint(account.region)
-  const url = `${baseUrl}/ListAvailableProfiles`
   const machineId = getAccountMachineId(account.id, account.machineId)
 
   const headers: Record<string, string> = {
@@ -2571,43 +2614,45 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
   }
-  // external_idp (Azure AD) 需 TokenType header 走外部 IdP 校验路径，否则 CW REST 拒 403 "Invalid token"
+  // external_idp (Azure AD) 需 TokenType header 走外部 IdP 校验路径,否则 CW REST 拒 403 "Invalid token"
   // 2026-07 迁移:所有账户类型统一 SSO_OIDC(仅 external_idp 用 EXTERNAL_IDP)
   headers['TokenType'] = getTokenTypeHeader(account)
 
-  // 获取该账号类型对应的备用 ARN（403 时兜底，避免每次请求都重复尝试）
+  // 获取该账号类型对应的备用 ARN(403 时兜底,避免每次请求都重复尝试)
   const fallbackArn = resolveProfileArn(account)
 
+  // 探测顺序:account.region 优先,其他已知 CW region 兜底(去重)
+  const primaryRegion = account.region || 'us-east-1'
+  const probeRegions = [primaryRegion, ...KNOWN_CW_REGIONS.filter(r => r !== primaryRegion)]
+  console.log(`[KiroAPI] fetchEnterpriseProfileArn probe order: [${probeRegions.join(', ')}]`)
+
+  let lastAccessDenied = false
   try {
-    const response = await fetchWithProxy(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({})
-    }, account)
-
-    if (!response.ok) {
-      const errBody = await response.text().catch(() => '')
-      console.error(`[KiroAPI] ListAvailableProfiles failed: ${response.status}`, errBody.slice(0, 200))
-      // 403 = 无权限（BuilderId/Social 账号不支持此 API）→ 返回备用 ARN 作为缓存，不再重复尝试
-      if (response.status === 403 && fallbackArn) {
-        console.log(`[KiroAPI] Using fallback profileArn for ${account.provider || 'unknown'}: ${fallbackArn}`)
-        return fallbackArn
+    for (const region of probeRegions) {
+      const profiles = await tryListProfilesAt(account, region, headers)
+      if (profiles === null) {
+        // 该 region 拒了(403/500 等)→ 继续下一个 region
+        lastAccessDenied = true
+        continue
       }
-      return undefined
+      if (profiles.length === 0) {
+        // 该 region 200 但空 → 该 region 无 profile,试下一个
+        console.log(`[KiroAPI] @${region}: profiles=[] · try next region`)
+        continue
+      }
+      const arn = profiles[0].arn
+      if (arn) {
+        console.log(`[KiroAPI] Enterprise profileArn resolved @${region}: ${arn}`)
+        return arn
+      }
     }
-
-    const data = await response.json() as { profiles?: Array<{ arn?: string; profileName?: string }> }
-    const profiles = data.profiles || []
-    if (profiles.length === 0) {
-      console.warn('[KiroAPI] ListAvailableProfiles: no profiles returned')
-      return undefined
+    // 所有 region 都试完 · 空
+    if (lastAccessDenied && fallbackArn) {
+      console.log(`[KiroAPI] All regions denied; using fallback profileArn for ${account.provider || 'unknown'}: ${fallbackArn}`)
+      return fallbackArn
     }
-
-    const arn = profiles[0].arn
-    if (arn) {
-      console.log(`[KiroAPI] Enterprise profileArn resolved: ${arn}`)
-    }
-    return arn || undefined
+    console.warn('[KiroAPI] ListAvailableProfiles: no profiles across all known regions')
+    return undefined
   } catch (error) {
     console.error('[KiroAPI] fetchEnterpriseProfileArn error:', error)
     return undefined

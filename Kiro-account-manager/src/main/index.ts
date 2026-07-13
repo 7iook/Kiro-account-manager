@@ -16,7 +16,7 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, setProfileArnPersistCallback, setAgentMode, type KiroProfile } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setAgentMode, type KiroProfile } from './proxy/kiroApi'
 import { resolveProfileArnForVerify, buildCompleteLoginResult } from './proxy/profile-selection'
 import {
   writeKiroAuthTokenFile,
@@ -1249,11 +1249,11 @@ async function fetchRestApi(
     'User-Agent': getKiroUserAgent(machineId),
     'x-amz-user-agent': getKiroAmzUserAgent(machineId)
   }
-  // Enterprise External IdP (Azure AD) token: CodeWhisperer REST 需要 TokenType 标识才会使用
-  // 外部 IdP token 验证路径（否则默认按 AWS SSO token 校验→"bearer token invalid" 403）
-  if (authMethod === 'external_idp') {
-    headers['TokenType'] = 'EXTERNAL_IDP'
-  }
+  // TokenType 分发(2026-07 迁移铁律 · 与 kiroApi.fetchEnterpriseProfileArn 保持一致):
+  // - external_idp (Azure AD) → 'EXTERNAL_IDP' 走外部 IdP 校验路径
+  // - 其他(IdC/BuilderId/Social) → 'SSO_OIDC' 走 AWS SSO OIDC 校验路径
+  // 后端在 2026-07 迁移后开始严格校验 TokenType header,缺 header 被当 legacy 拒 403 "Invalid token"
+  headers['TokenType'] = authMethod === 'external_idp' ? 'EXTERNAL_IDP' : 'SSO_OIDC'
   const url = `${baseUrl}${path}`
   if (agent) {
     return await undiciFetch(url, {
@@ -1307,13 +1307,13 @@ async function getUsageLimitsRest(
   const fallbackBase = getFallbackRestApiBase(ssoRegion)
   
   let response = await fetchRestApi(primaryBase, path, accessToken, machineId, authMethod)
-  
+
   // 如果主端点返回 403，尝试备用端点
   if (response.status === 403) {
     console.log(`[Kiro REST API] Primary 403, fallback → ${fallbackBase}`)
     response = await fetchRestApi(fallbackBase, path, accessToken, machineId, authMethod)
   }
-  
+
   if (!response.ok) {
     const errorText = await response.text()
     console.error(`[Kiro REST API] GetUsageLimits failed: ${response.status}`, errorText)
@@ -4566,6 +4566,35 @@ app.whenReady().then(async () => {
 
       console.log('[Verify] Step 2: Getting user info...')
 
+      // Step 1.5: 先 resolve 真实 profileArn(§4.8 sweep · 修 profileArn 归属根因)
+      // - 用户传入 profileArn → 直接用(renderer 多 profile 场景 M 次 verify)
+      // - 未传 + Enterprise/IdC/external_idp → 调 fetchEnterpriseProfileArn(ListAvailableProfiles)拿组织真实值
+      // - 未传 + BuilderId/Social → undefined(不需要)
+      // 修根因:老 handler 先跑 usage 用 fallback ARN(不属于用户组织)→ 403 "Invalid token"
+      //         新顺序在 usage 前 resolve 真值,避免硬 fallback 到外域 profile 被后端拒 token
+      const isEntPre = provider === 'Enterprise' || authMethod === 'external_idp'
+      const resolvedProfileArn = await resolveProfileArnForVerify(
+        {
+          providedProfileArn: credentials.profileArn,
+          isEnterprise: isEntPre,
+          accessToken: refreshResult.accessToken!,
+          region: region || 'us-east-1',
+          provider,
+          authMethod
+        },
+        (acc) => fetchEnterpriseProfileArn(acc)
+      )
+      console.log('[Verify] Step 1.5: resolvedProfileArn:', resolvedProfileArn || '(undefined · non-Enterprise or fetch failed)')
+
+      // Step 1.6: 从 profileArn 解析真实数据面 region(跨 region 用户支持 · 2026-07-14)
+      // 用户 SSO region(refresh 用)可能 ≠ profile region(数据面 API 用)
+      // 例:身份 SSO 在 eu-central-1 · 但组织 profile 挂在 us-east-1 · usage/models/stream 必须用 profile region
+      const parsedProfileRegion = parseRegionFromProfileArn(resolvedProfileArn)
+      const dataPlaneRegion = parsedProfileRegion || region || 'us-east-1'
+      if (parsedProfileRegion && parsedProfileRegion !== region) {
+        console.log(`[Verify] Cross-region user: SSO=${region} · profile=${parsedProfileRegion} · using profile region for data-plane API`)
+      }
+
       // Step 2: 调用 GetUserUsageAndLimits 获取用户信息
       interface Bonus {
         bonusCode?: string
@@ -4617,7 +4646,7 @@ app.whenReady().then(async () => {
         userInfo?: { email?: string; userId?: string }
       }
       
-      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, credentials.profileArn, undefined, region, undefined, authMethod) as UsageResponse
+      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, resolvedProfileArn, undefined, dataPlaneRegion, undefined, authMethod) as UsageResponse
       
       // 解析用户信息
       const email = usageResult.userInfo?.email || ''
