@@ -1392,6 +1392,9 @@ export async function callKiroApiStream(
       console.log(`[KiroAPI]   - Has profileArn: ${requestPayload.profileArn !== undefined}`)
       console.log(`[KiroAPI]   - Agent mode: ${headers['x-amzn-kiro-agent-mode']}`)
       console.log(`[KiroAPI]   - Payload size: ${payloadStr.length} bytes`)
+      if (requestPayload.additionalModelRequestFields && Object.keys(requestPayload.additionalModelRequestFields).length > 0) {
+        console.log(`[KiroAPI]   - additionalModelRequestFields: ${JSON.stringify(requestPayload.additionalModelRequestFields)}`)
+      }
       
       const agent = getNetworkAgent(account)
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)

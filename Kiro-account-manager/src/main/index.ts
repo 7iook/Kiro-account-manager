@@ -26,6 +26,7 @@ import {
   resolveProfileArnForWrite,
   isPlaceholderProfileArn,
   getEnterpriseFallbackArn,
+  KIRO_SOCIAL_PROFILE_ARN,
   KIRO_AUTH_TOKEN_PATH
 } from './kiroAuthSync'
 import { openaiToKiro } from './proxy/translator'
@@ -1389,6 +1390,15 @@ async function getUsageAndLimits(
   email?: string,             // 用于日志标识
   authMethod?: string         // external_idp (Azure AD) 需传入以加 TokenType header
 ): Promise<UnifiedUsageResponse> {
+  // 社交账户（Google/Github）在 REST GetUsageLimits 也强制要求 profileArn，
+  // 但账户存储层没有对应字段（社交本身没 profileArn 概念）。用官方社交 profile
+  // 固定 ARN 兜底，行为与 Kiro IDE 自动注入一致（参见 kiroAuthSync KIRO_SOCIAL_PROFILE_ARN）。
+  // 判定：authMethod='social'（新导入路径），或 idp=Google/Github（历史账户 authMethod 可能为 undefined）。
+  // RCA: .agent-workspace/.archive/2026-07-14/usage-refresh-zero/
+  const isSocial = authMethod === 'social' || idp === 'Google' || idp === 'Github'
+  if (isSocial && !profileArn) {
+    profileArn = KIRO_SOCIAL_PROFILE_ARN
+  }
   if (currentUsageApiType === 'rest') {
     // 使用 REST API (GetUsageLimits)
     const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email, authMethod)
@@ -4151,6 +4161,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('background-batch-check', async (_event, accounts: Array<{
     id: string
     email: string
+    profileArn?: string
     credentials: {
       accessToken: string
       refreshToken?: string
@@ -4195,8 +4206,11 @@ app.whenReady().then(async () => {
             }
 
             // 调用 API 获取用量和用户信息（根据配置选择 REST 或 CBOR 格式）
+            // profileArn 必须透传：Kiro REST GetUsageLimits 对社交/Enterprise 有效账户要求 profileArn
+            // 存在，undefined 会 400 "Improperly formed request" → usage 永远 0。
+            // RCA: .agent-workspace/.archive/2026-07-14/usage-refresh-zero/
             const [usageRes, userInfoRes] = await Promise.allSettled([
-              getUsageAndLimits(accessToken, idp, undefined, undefined, account.credentials?.region, account.email, account.credentials?.authMethod) as Promise<{
+              getUsageAndLimits(accessToken, idp, account.profileArn, undefined, account.credentials?.region, account.email, account.credentials?.authMethod) as Promise<{
                 usageBreakdownList?: Array<{
                   resourceType?: string
                   displayName?: string

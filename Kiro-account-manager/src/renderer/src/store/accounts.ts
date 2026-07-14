@@ -1612,6 +1612,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const accountsToCheck: Array<{
       id: string
       email: string
+      profileArn?: string
       credentials: {
         accessToken: string
         refreshToken?: string
@@ -1634,6 +1635,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       accountsToCheck.push({
         id,
         email: account.email,
+        // profileArn 顶层字段必须一并透传给主进程，否则 background-batch-check
+        // 走 REST GetUsageLimits 会以 undefined profileArn 被 Kiro 后端 400
+        // "Improperly formed request"，导致 usage 永远保持初始 0。
+        // RCA: .agent-workspace/.archive/2026-07-14/usage-refresh-zero/
+        profileArn: account.profileArn || account.credentials.profileArn,
         credentials: {
           accessToken: account.credentials.accessToken,
           refreshToken: account.credentials.refreshToken,
