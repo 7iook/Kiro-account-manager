@@ -388,9 +388,9 @@ export function mapModelId(model: string): string {
   const lower = modelId.toLowerCase()
   // 1) 显式 alias 映射优先
   if (MODEL_ID_MAP[lower]) return MODEL_ID_MAP[lower]
-  // 2) 看似 Kiro 支持的 Claude 模型格式 (claude-{sonnet|haiku|opus}-{ver})，原样透传
-  //    用于向前兼容尚未加入 MODEL_ID_MAP 的新发布模型
+  // 2) Kiro 支持的动态模型家族原样透传，用于向前兼容尚未加入静态 alias 的新版本
   if (/^claude-(sonnet|haiku|opus)-/.test(lower)) return modelId
+  if (/^gpt-\d+(?:\.\d+)*(?:-[a-z0-9]+)*$/.test(lower)) return modelId
   // 3) 完全未知的 model（用户拼错/不存在），兜底到 default 避免直接 400
   console.warn(`[Kiro API] Unknown model "${modelId}" → fallback to "${MODEL_ID_MAP.default}"`)
   return MODEL_ID_MAP.default
