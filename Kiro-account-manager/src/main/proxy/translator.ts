@@ -76,13 +76,20 @@ export interface ThinkingConfig {
 function buildThinkingFields(
   thinkingConfig: ThinkingConfig | undefined,
   clientThinking?: { type: string; budget_tokens?: number; display?: string },
-  clientReasoningEffort?: string
+  clientReasoningEffort?: string,
+  modelId?: string
 ): Record<string, unknown> | undefined {
   // 客户端明确关闭 thinking
   if (clientThinking?.type === 'disabled') return undefined
 
+  // GPT 家族在 Kiro 后端 additionalModelRequestFieldsSchema 里不接受 thinking，
+  // 无 schema 时任何 fallback 注入都会 REQUEST_BODY_INVALID (400)。见 §5.2 & 反代日志 20260714。
+  // 有 thinkingConfig 时（未来 Kiro 若给 GPT 家族加 output_config/reasoning schema）走正常映射即可。
+  const isGptFamily = typeof modelId === 'string' && /^gpt-/i.test(modelId)
+
   // 没有模型元数据时，回退到旧逻辑：仅传 { thinking: { type: 'adaptive' } }
   if (!thinkingConfig) {
+    if (isGptFamily) return undefined
     if (clientThinking && clientThinking.type !== 'disabled') {
       return { thinking: { type: 'adaptive' } }
     }
@@ -167,6 +174,16 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
     if (!Array.isArray(request.input)) {
       throw new Error('Responses input must be a string or an array')
     }
+    // Codex CLI (openai/codex >=0.144) 会把 reasoning summary 塞回 input，
+    // 需要缓存到下一条 assistant message 的 reasoning_content，
+    // 而不是当成普通 message 处理（否则会污染 user turn）。
+    let pendingReasoning = ''
+    const flushReasoningTo = (msg: OpenAIMessage): void => {
+      if (pendingReasoning && msg.role === 'assistant') {
+        msg.reasoning_content = pendingReasoning
+      }
+      pendingReasoning = ''
+    }
     for (const item of request.input) {
       const itemType = item.type as string | undefined
       if (itemType === 'function_call_output') {
@@ -191,7 +208,7 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
         if (item.arguments === undefined) {
           throw new Error('function_call requires arguments')
         }
-        messages.push({
+        const msg: OpenAIMessage = {
           role: 'assistant',
           content: '',
           tool_calls: [{
@@ -202,18 +219,46 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
               arguments: item.arguments
             }
           }]
-        })
-      } else {
-        if (itemType !== undefined && itemType !== 'message') {
-          throw new Error(`Unsupported responses input item type: ${itemType}`)
         }
+        flushReasoningTo(msg)
+        messages.push(msg)
+      } else if (itemType === 'reasoning') {
+        // 从 summary[].text 或 content[].text 抽取推理文本，缓存到下一条 assistant
+        // 未跟上 assistant 的孤立 reasoning 在循环结束时丢弃，NEVER 泄漏进 user turn
+        const reasoningItem = item as unknown as {
+          summary?: Array<{ text?: string }>
+          content?: Array<{ text?: string }>
+        }
+        const parts: string[] = []
+        if (Array.isArray(reasoningItem.summary)) {
+          for (const s of reasoningItem.summary) {
+            if (typeof s?.text === 'string' && s.text) parts.push(s.text)
+          }
+        }
+        if (parts.length === 0 && Array.isArray(reasoningItem.content)) {
+          for (const c of reasoningItem.content) {
+            if (typeof c?.text === 'string' && c.text) parts.push(c.text)
+          }
+        }
+        const txt = parts.join('\n')
+        if (txt) {
+          pendingReasoning = pendingReasoning ? `${pendingReasoning}\n${txt}` : txt
+        }
+      } else if (itemType === undefined || itemType === 'message') {
         if (item.content === undefined) {
           throw new Error('message input item requires content')
         }
-        messages.push({
+        const msg: OpenAIMessage = {
           role: item.role === 'assistant' ? 'assistant' : item.role === 'system' ? 'system' : 'user',
           content: convertResponseInputContent(item.content)
-        })
+        }
+        flushReasoningTo(msg)
+        messages.push(msg)
+      } else {
+        // Codex CLI 未来 / hosted 类型（additional_tools / web_search_call / file_search_call
+        // / computer_use_call / mcp_call / local_shell_call 等）静默跳过，
+        // 参考 9router open-sse/translator/request/openai-responses.js。
+        continue
       }
     }
   }
@@ -226,12 +271,29 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
   if (request.top_p !== undefined) chatRequest.top_p = request.top_p
   if (request.max_output_tokens !== undefined) chatRequest.max_tokens = request.max_output_tokens
   if (request.stream !== undefined) chatRequest.stream = request.stream
-  if (request.tools !== undefined) chatRequest.tools = request.tools
+  if (request.tools !== undefined) {
+    // Codex CLI hosted tool（如 { type: "web_search" } 无 function.name）在 chat completions
+    // 语义下不可表示，直接丢弃避免下游 kiro 拒绝；参考 9router openai-responses.js line 158-176。
+    chatRequest.tools = request.tools.filter(t => {
+      const anyTool = t as unknown as { function?: { name?: string }; name?: string }
+      const name = anyTool.function?.name || anyTool.name
+      return typeof name === 'string' && name.trim() !== ''
+    })
+  }
   const toolChoice = convertResponseToolChoice(request.tool_choice)
   if (toolChoice !== undefined) chatRequest.tool_choice = toolChoice
   if (request.previous_response_id !== undefined) chatRequest.conversation_id = request.previous_response_id
   if (request.metadata !== undefined) chatRequest.metadata = request.metadata
   if (request.kiro_context !== undefined) chatRequest.kiro_context = request.kiro_context
+  // Codex CLI 顶层 body.reasoning = { effort: "low"/"medium"/"high"/"xhigh", summary: ... }
+  // 需要透传到 chat 层的 reasoning_effort，让 buildThinkingFields 可以进一步映射
+  // 到 Kiro additionalModelRequestFields（Claude 家族有效；GPT 家族由 gating 直接丢弃避免 400）。
+  if (request.reasoning && typeof request.reasoning === 'object') {
+    const r = request.reasoning as { effort?: unknown }
+    if (typeof r.effort === 'string' && r.effort.trim() !== '') {
+      chatRequest.reasoning_effort = r.effort
+    }
+  }
   return chatRequest
 }
 
@@ -241,34 +303,40 @@ function convertResponseInputContent(content: string | OpenAIResponseContentPart
   if (!Array.isArray(content)) {
     throw new Error('message content must be a string or an array')
   }
-  return content.map(part => {
+  const parts: NonNullable<OpenAIMessage['content']> = []
+  for (const part of content) {
     const partType = part.type as string
     if (partType === 'input_image') {
       if (!part.image_url) {
         throw new Error('input_image requires image_url')
       }
-      return { type: 'image_url', image_url: { url: part.image_url } }
+      parts.push({ type: 'image_url', image_url: { url: part.image_url } })
+      continue
     }
     if (partType === 'input_file') {
       if (!part.file_data) {
         throw new Error('input_file requires file_data')
       }
-      return {
+      parts.push({
         type: 'file',
         file: {
           file_data: part.file_data,
           ...(part.filename !== undefined ? { filename: part.filename } : {})
         }
+      })
+      continue
+    }
+    if (partType === 'input_text' || partType === 'output_text') {
+      if (part.text === undefined) {
+        throw new Error(`${partType} requires text`)
       }
+      parts.push({ type: 'text', text: part.text })
+      continue
     }
-    if (partType !== 'input_text' && partType !== 'output_text') {
-      throw new Error(`Unsupported responses content part type: ${partType}`)
-    }
-    if (part.text === undefined) {
-      throw new Error(`${partType} requires text`)
-    }
-    return { type: 'text', text: part.text }
-  })
+    // 未来 / 未知 part type（例 input_reasoning / annotation / refusal）静默跳过，
+    // 参考 9router 做法；NEVER 抛错阻断整个请求。
+  }
+  return parts as OpenAIMessage['content']
 }
 
 function convertResponseToolChoice(toolChoice: OpenAIResponsesRequest['tool_choice']): OpenAIChatRequest['tool_choice'] {
@@ -556,7 +624,8 @@ export function openaiToKiro(
   const additionalModelRequestFields = buildThinkingFields(
     thinkingConfig,
     request.thinking as { type: string; budget_tokens?: number },
-    request.reasoning_effort
+    request.reasoning_effort,
+    modelId
   )
 
   return buildKiroPayload(
@@ -1042,7 +1111,8 @@ export function claudeToKiro(
   const additionalModelRequestFields = buildThinkingFields(
     thinkingConfig,
     request.thinking as { type: string; budget_tokens?: number; display?: string },
-    undefined
+    undefined,
+    modelId
   )
 
   return buildKiroPayload(
