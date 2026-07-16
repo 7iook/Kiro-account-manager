@@ -304,9 +304,14 @@ class ProxyLogStore {
   add(entry: LogEntry): void {
     this.logs.push(entry)
 
-    // 超过最大数量时删除最旧的
-    if (this.logs.length > this.maxLogs) {
-      this.logs = this.logs.slice(-this.maxLogs)
+    // 超过最大数量时批量原地删除,不用 slice 拷贝整个数组。
+    // 老代码 `this.logs = this.logs.slice(-this.maxLogs)` 每次 add 都 O(N) 拷贝
+    // 50000 元素,配合 Claude Code reasoning stream 每 token 打 2-4 条 log →
+    // 主进程 event loop CPU 100% 卡死,UI 打不开(2026-07-16 用户实测复现)。
+    // 现在超阈值 5% 才 splice 一次,后续 (maxLogs * 0.05) 次 add 都不用触发删除,
+    // 均摊 O(1)。
+    if (this.logs.length > this.maxLogs + Math.floor(this.maxLogs * 0.05)) {
+      this.logs.splice(0, this.logs.length - this.maxLogs)
     }
 
     // 通知监听器（异常隔离）

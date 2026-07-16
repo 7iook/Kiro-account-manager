@@ -2225,7 +2225,12 @@ async function parseEventStream(
             if (eventType === 'reasoningContentEvent' || event.reasoningContentEvent) {
               const reasoning = event.reasoningContentEvent || event
               if (reasoning.text) {
-                proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
+                // token 级 log 只在 logStreamEvents 开启时才落 store,否则每个 token
+                // 都推 2 条 entry 会让 proxyLogStore 数组每 add 一次都 O(N) slice
+                // (N=50000),几万 token 之后主进程 event loop 完全卡死,UI 打不开。
+                if (logStreamEvents) {
+                  proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
+                }
                 await onChunk(reasoning.text, undefined, true, reasoning.signature, undefined)
                 totalOutputChars += reasoning.text.length
                 usage.reasoningTokens = (usage.reasoningTokens || 0) + Math.max(1, Math.round(reasoning.text.length * 0.4))
@@ -2237,7 +2242,9 @@ async function parseEventStream(
                 proxyLogger.info('Kiro', `Received redacted thinking content (len=${reasoning.redactedContent.length})`)
                 await onChunk('', undefined, true, undefined, reasoning.redactedContent)
               }
-              proxyLogger.debug('Kiro', 'reasoningContentEvent', JSON.stringify(reasoning).slice(0, 200))
+              if (logStreamEvents) {
+                proxyLogger.debug('Kiro', 'reasoningContentEvent', JSON.stringify(reasoning).slice(0, 200))
+              }
             }
             
             // 处理 codeReferenceEvent - 代码引用/许可证信息
