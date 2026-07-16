@@ -9,6 +9,16 @@ files:
   - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
   - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  # 严禁打入的开发/敏感产物(泄漏账户数据风险):
+  - '!.agent-workspace/**'
+  - '!.codegraph/**'
+  - '!_dev.log'
+  - '!*.log'
+  - '!test/**'
+  - '!docs/**'
+  - '!scripts/**'
+  - '!.git/**'
+  - '!.gitignore'
 asarUnpack:
   - resources/**
   - node_modules/koffi/**
