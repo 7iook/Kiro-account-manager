@@ -1339,10 +1339,9 @@ export async function callKiroApiStream(
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
 ): Promise<void> {
   const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
-  // 所有账号类型均走正常端点优先级（含 fallback），不再强制 Enterprise 走 CodeWhisperer
-  const endpoints = getSortedEndpoints(preferredEndpoint, account.region)
 
-  // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底，流式端点自动不传占位符）
+  // Enterprise 缺 profileArn 时先调 API 获取(必须在选 endpoint 之前,否则跨 region
+  // 账户按 account.region 打错端点)；BuilderId/Social 不需要
   if (!account.profileArn && isEnterprise) {
     const fetchedArn = await fetchEnterpriseProfileArn(account)
     if (fetchedArn) {
@@ -1350,6 +1349,14 @@ export async function callKiroApiStream(
       if (account.id) profileArnPersistCallback?.(account.id, fetchedArn)
     }
   }
+
+  // 跨 region 账户支持:SSO OIDC 注册的 region(account.region)不一定等于 profileArn
+  // 对应的数据面 region。用 parseRegionFromProfileArn 从 arn 里解出真实 dataPlane
+  // region 选 KiroRuntime EU/US endpoint,避免"SSO 在 US、profile 挂 EU"的账户被
+  // 路由到错端点后 400 "Improperly formed request"。
+  // Fix:6ab368b 只修了 verify/GetUsageLimits,stream 阶段仍用 account.region — 本轮补齐。
+  const dataPlaneRegion = parseRegionFromProfileArn(account.profileArn) || account.region
+  const endpoints = getSortedEndpoints(preferredEndpoint, dataPlaneRegion)
 
   let lastError: Error | null = null
 
