@@ -2572,7 +2572,7 @@ export function parseRegionFromProfileArn(arn: string | undefined | null): strin
 }
 
 /** 已知 CodeWhisperer profile 可能存在的 region 集合(用于跨 region 探测) */
-const KNOWN_CW_REGIONS: readonly string[] = ['us-east-1', 'eu-central-1']
+export const KNOWN_CW_REGIONS: readonly string[] = ['us-east-1', 'eu-central-1']
 
 /** 单次 region 尝试:200 返数组(可能空);非 200 返 null 表示这个 region 拒了 */
 async function tryListProfilesAt(

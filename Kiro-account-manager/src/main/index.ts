@@ -16,7 +16,7 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setAgentMode, type KiroProfile } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setAgentMode, KNOWN_CW_REGIONS, type KiroProfile } from './proxy/kiroApi'
 import { resolveProfileArnForVerify, buildCompleteLoginResult } from './proxy/profile-selection'
 import {
   writeKiroAuthTokenFile,
@@ -29,6 +29,7 @@ import {
   KIRO_SOCIAL_PROFILE_ARN,
   KIRO_AUTH_TOKEN_PATH
 } from './kiroAuthSync'
+import { refreshOidcTokenAcrossRegions } from './oidcRefresh'
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
@@ -213,6 +214,8 @@ interface OidcRefreshResult {
   refreshToken?: string
   expiresIn?: number
   error?: string
+  /** 成功时的 region;当传入 region 错误、通过跨 region 重试成功时,该字段带回真实 region,让上层写回 account.credentials.region 避免下次再走弯路 */
+  resolvedRegion?: string
 }
 
 // 社交登录 (GitHub/Google) 的 Token 刷新端点
@@ -669,6 +672,7 @@ function openBrowserInPrivateMode(url: string): void {
 }
 
 // IdC (BuilderId) 的 OIDC Token 刷新
+// 跨 region 自动重试 + resolvedRegion 回写详见 ./oidcRefresh.ts(pure fn,可测)
 async function refreshOidcToken(
   refreshToken: string,
   clientId: string,
@@ -676,45 +680,25 @@ async function refreshOidcToken(
   region: string = 'us-east-1',
   proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
 ): Promise<OidcRefreshResult> {
-  console.log(`[OIDC] Refreshing token with clientId: ${clientId.substring(0, 20)}...${proxyUrl ? ' [via bound proxy]' : ''}`)
+  console.log(`[OIDC] Refreshing token with clientId: ${clientId.substring(0, 20)}...${proxyUrl ? ' [via bound proxy]' : ''} primary region: ${region}`)
 
-  const url = `https://oidc.${region}.amazonaws.com/token`
+  const result = await refreshOidcTokenAcrossRegions(refreshToken, clientId, clientSecret, region, {
+    fetcher: fetchWithAppProxy,
+    regions: KNOWN_CW_REGIONS,
+    proxyUrl
+  })
 
-  const payload = {
-    clientId,
-    clientSecret,
-    refreshToken,
-    grantType: 'refresh_token'
+  if (result.success) {
+    if (result.resolvedRegion && result.resolvedRegion !== region) {
+      console.warn(`[OIDC] Refreshed via fallback region ${result.resolvedRegion}(primary=${region});上层应写回 account.credentials.region`)
+    } else {
+      console.log(`[OIDC] Token refreshed @${result.resolvedRegion}, expires in ${result.expiresIn}s`)
+    }
+  } else {
+    console.error(`[OIDC] Refresh failed across all probed regions: ${result.error}`)
   }
 
-  try {
-    const response = await fetchWithAppProxy(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    }, proxyUrl)
-    
-    if (!response.ok) {
-      const errorText = await response.text()
-      console.error(`[OIDC] Refresh failed: ${response.status} - ${errorText}`)
-      return { success: false, error: `HTTP ${response.status}: ${errorText}` }
-    }
-    
-    const data = await response.json()
-    console.log(`[OIDC] Token refreshed successfully, expires in ${data.expiresIn}s`)
-    
-    return {
-      success: true,
-      accessToken: data.accessToken,
-      refreshToken: data.refreshToken || refreshToken, // 可能不返回新的 refreshToken
-      expiresIn: data.expiresIn
-    }
-  } catch (error) {
-    console.error(`[OIDC] Refresh error:`, error)
-    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
-  }
+  return result as OidcRefreshResult
 }
 
 // 社交登录 (GitHub/Google) 的 Token 刷新
