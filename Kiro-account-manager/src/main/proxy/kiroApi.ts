@@ -2699,11 +2699,9 @@ export async function fetchEnterpriseProfiles(
   deps: FetchEnterpriseProfilesDeps = {}
 ): Promise<Array<KiroProfile>> {
   const fetcher = deps.fetcher ?? fetchWithProxy
-  const baseUrl = getCodeWhispererEndpoint(account.region)
-  const url = `${baseUrl}/ListAvailableProfiles`
   const machineId = getAccountMachineId(account.id, account.machineId)
 
-  const headers: Record<string, string> = {
+  const buildHeaders = (): Record<string, string> => ({
     'Content-Type': 'application/x-amz-json-1.0',
     'Authorization': `Bearer ${account.accessToken}`,
     'x-amz-user-agent': getKiroAmzUserAgent(machineId),
@@ -2711,52 +2709,100 @@ export async function fetchEnterpriseProfiles(
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1',
     'TokenType': getTokenTypeHeader(account)
+  })
+
+  // 跨 region 探测:同一 SSO 账户组织可能同时挂 us-east-1 + eu-central-1 两个 Kiro Profile,
+  // 老代码只用 account.region 单 region 探,第二个 region 的 profile 永远拿不到。
+  // 修法(6ab368b 提交的未修变体登记债务清理):跨 KNOWN_CW_REGIONS 并行探,合并去重。
+  // 主 region(account.region 或默认 us-east-1)优先,其他 region 补充。
+  const primaryRegion = account.region || 'us-east-1'
+  const probeRegions: string[] = [primaryRegion, ...KNOWN_CW_REGIONS.filter((r) => r !== primaryRegion)]
+
+  interface RegionResult {
+    region: string
+    isPrimary: boolean
+    ok: boolean
+    status?: number
+    errorBody?: string
+    rawProfiles: Array<{ arn?: string; profileName?: string; accountName?: string; region?: string }>
   }
 
-  const response = await fetcher(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({})
-  }, account)
+  const results = await Promise.all(
+    probeRegions.map(async (region, idx): Promise<RegionResult> => {
+      const baseUrl = getCodeWhispererEndpoint(region)
+      const url = `${baseUrl}/ListAvailableProfiles`
+      try {
+        const response = await fetcher(url, {
+          method: 'POST',
+          headers: buildHeaders(),
+          body: JSON.stringify({})
+        }, account)
 
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => '')
-    const trimmed = errBody.slice(0, 300)
-    console.error(`[KiroAPI] fetchEnterpriseProfiles failed: ${response.status}`, trimmed)
-    // 决策卡 §3:失败(4xx/5xx)→ 抛错并透传 status + backend errorMessage,不吞
-    // 不做 fetchEnterpriseProfileArn 里的 403 fallback(多 profile 登录路径必须真实拿到 profiles)
-    throw new Error(`ListAvailableProfiles HTTP ${response.status}: ${trimmed || response.statusText}`)
-  }
+        if (!response.ok) {
+          const errBody = await response.text().catch(() => '')
+          const trimmed = errBody.slice(0, 300)
+          console.warn(
+            `[KiroAPI] fetchEnterpriseProfiles @${region} failed: ${response.status} ${trimmed}`
+          )
+          return { region, isPrimary: idx === 0, ok: false, status: response.status, errorBody: trimmed, rawProfiles: [] }
+        }
 
-  const data = await response.json() as {
-    profiles?: Array<{ arn?: string; profileName?: string; accountName?: string; region?: string }>
-  }
-  const rawProfiles = Array.isArray(data.profiles) ? data.profiles : []
+        const data = await response.json() as {
+          profiles?: Array<{ arn?: string; profileName?: string; accountName?: string; region?: string }>
+        }
+        return {
+          region,
+          isPrimary: idx === 0,
+          ok: true,
+          rawProfiles: Array.isArray(data.profiles) ? data.profiles : []
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        console.warn(`[KiroAPI] fetchEnterpriseProfiles @${region} threw: ${msg}`)
+        return { region, isPrimary: idx === 0, ok: false, errorBody: msg, rawProfiles: [] }
+      }
+    })
+  )
 
-  if (rawProfiles.length === 0) {
-    console.warn('[KiroAPI] fetchEnterpriseProfiles: no profiles returned')
-    throw new Error(NO_PROFILES_AVAILABLE)
-  }
-
-  // 归一化后端 raw shape → KiroProfile(防腐层:后端字段变化不泄漏到 renderer)
-  const profiles: KiroProfile[] = rawProfiles
-    .filter((p): p is { arn: string } & Record<string, string | undefined> =>
-      typeof p?.arn === 'string' && p.arn.length > 0
+  // 主 region 失败(4xx/5xx)→ 抛错,与老单 region 行为一致
+  // "主 region 拒 = 请求本身有问题(token/权限)"不应用备用 region 掩盖
+  // 主 region 200 但空 → 允许跨 region 补充(用户跨 region 场景的核心 case)
+  const primary = results[0]
+  if (!primary.ok) {
+    console.error(
+      `[KiroAPI] fetchEnterpriseProfiles failed: ${primary.status || 'network'} ${primary.errorBody || ''}`
     )
-    .map((p) => ({
-      profileArn: p.arn,
-      profileName: p.profileName,
-      accountName: p.accountName,
-      region: p.region
-    }))
+    throw new Error(
+      `ListAvailableProfiles HTTP ${primary.status || 'ERR'}: ${primary.errorBody || 'unknown'}`
+    )
+  }
 
-  if (profiles.length === 0) {
-    // 全部 profile 都没 arn(异常但保护性)
-    console.warn('[KiroAPI] fetchEnterpriseProfiles: profiles present but none has arn')
+  // 合并所有 ok region 的 rawProfiles,按 arn 去重(保序:主 region 优先)
+  const seen = new Set<string>()
+  const merged: Array<{ arn: string; profileName?: string; accountName?: string; region?: string }> = []
+  for (const r of results) {
+    if (!r.ok) continue
+    for (const p of r.rawProfiles) {
+      if (typeof p?.arn === 'string' && p.arn.length > 0 && !seen.has(p.arn)) {
+        seen.add(p.arn)
+        merged.push({ arn: p.arn, profileName: p.profileName, accountName: p.accountName, region: p.region || r.region })
+      }
+    }
+  }
+
+  if (merged.length === 0) {
+    console.warn('[KiroAPI] fetchEnterpriseProfiles: no profiles across all known regions')
     throw new Error(NO_PROFILES_AVAILABLE)
   }
 
-  console.log(`[KiroAPI] fetchEnterpriseProfiles resolved ${profiles.length} profile(s)`)
+  const profiles: KiroProfile[] = merged.map((p) => ({
+    profileArn: p.arn,
+    profileName: p.profileName,
+    accountName: p.accountName,
+    region: p.region
+  }))
+
+  console.log(`[KiroAPI] fetchEnterpriseProfiles resolved ${profiles.length} profile(s) across [${probeRegions.join(', ')}]`)
   return profiles
 }
 
