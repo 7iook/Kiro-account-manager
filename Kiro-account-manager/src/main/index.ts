@@ -5484,7 +5484,11 @@ app.whenReady().then(async () => {
     const crypto = await import('crypto')
     const http = await import('http')
     
-    const oidcBase = `https://oidc.${region}.amazonaws.com`
+    // RegisterClient 跨 region 自动重试:AWS SSO OIDC 拒 "Invalid start url" 通常
+    // 意味着 start URL 对应的 IdC 实例不在传入 region,自动切 KNOWN_CW_REGIONS 里
+    // 其他 region 再试;成功时 oidcBase / region 都同步更新,后续 authorize URL +
+    // token exchange 也用该 region。
+    // RCA: .agent-workspace/.archive/2026-07-16/oidc-refresh-cross-region/
     const scopes = [
       'codewhisperer:completions',
       'codewhisperer:analysis',
@@ -5493,9 +5497,19 @@ app.whenReady().then(async () => {
       'codewhisperer:taskassist'
     ]
 
-    try {
-      // Step 1: 注册 OIDC 客户端 (使用 authorization_code grant type)
-      console.log('[Login] Step 1: Registering OIDC client...')
+    const isStartUrlMismatchError = (status: number, errText: string): boolean => {
+      if (status !== 400 && status !== 401) return false
+      const lower = errText.toLowerCase()
+      return (
+        lower.includes('invalid_request') ||
+        lower.includes('invalid start url') ||
+        lower.includes('invalid_client') ||
+        lower.includes('invalid_grant')
+      )
+    }
+
+    const tryRegisterAtRegion = async (r: string): Promise<{ ok: true; oidcBase: string; region: string; regRes: Response } | { ok: false; status: number; errText: string; region: string }> => {
+      const oidcBase = `https://oidc.${r}.amazonaws.com`
       const regRes = await fetchWithAppProxy(`${oidcBase}/client/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -5508,20 +5522,52 @@ app.whenReady().then(async () => {
           issuerUrl: startUrl
         })
       })
+      if (regRes.ok) return { ok: true, oidcBase, region: r, regRes }
+      const errText = await regRes.text().catch(() => '')
+      return { ok: false, status: regRes.status, errText, region: r }
+    }
 
-      if (!regRes.ok) {
-        const errText = await regRes.text()
-        console.error('[Login] IAM SSO client registration failed:', regRes.status, errText)
-        
+    try {
+      // Step 1: 注册 OIDC 客户端 (使用 authorization_code grant type)
+      console.log('[Login] Step 1: Registering OIDC client, primary region:', region)
+      const probeRegions: string[] = [region, ...KNOWN_CW_REGIONS.filter((r) => r !== region)]
+      let successCtx: { oidcBase: string; region: string; regRes: Response } | null = null
+      let lastFailure: { status: number; errText: string; region: string } | null = null
+      for (let i = 0; i < probeRegions.length; i++) {
+        const r = probeRegions[i]
+        const attempt = await tryRegisterAtRegion(r)
+        if (attempt.ok) {
+          if (i > 0) {
+            console.warn(`[Login] IAM SSO RegisterClient succeeded @${r} after primary(${region}) rejected;region 已切换到 ${r}`)
+          }
+          successCtx = attempt
+          break
+        }
+        lastFailure = attempt
+        console.error(`[Login] IAM SSO RegisterClient @${r} failed: ${attempt.status} ${attempt.errText.slice(0, 200)}`)
+        if (attempt.errText.includes('UnauthorizedException') || attempt.errText.includes('access denied')) {
+          // 授权类错误跟 region 无关,立即停 fallback
+          break
+        }
+        if (!isStartUrlMismatchError(attempt.status, attempt.errText)) {
+          break
+        }
+      }
+
+      if (!successCtx) {
+        const errText = lastFailure?.errText || 'unknown'
         if (errText.includes('UnauthorizedException') || errText.includes('access denied')) {
-          return { 
-            success: false, 
-            error: '授权失败：您的组织可能未配置 Amazon Q Developer 访问权限。请联系组织管理员在 IAM Identity Center 中启用相关权限。' 
+          return {
+            success: false,
+            error: '授权失败:您的组织可能未配置 Amazon Q Developer 访问权限。请联系组织管理员在 IAM Identity Center 中启用相关权限。'
           }
         }
-        
         return { success: false, error: `注册客户端失败: ${errText}` }
       }
+
+      const oidcBase = successCtx.oidcBase
+      region = successCtx.region  // 后续 poll / token 交换都用这个 region
+      const regRes = successCtx.regRes
 
       const regData = await regRes.json()
       const clientId = regData.clientId
