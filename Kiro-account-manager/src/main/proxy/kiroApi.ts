@@ -2822,7 +2822,8 @@ export async function fetchEnterpriseProfiles(
 
 // 获取 Kiro 官方模型列表（支持分页，与官方插件一致传递 profileArn）
 export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  // 跨 region 账户:profileArn 里的 region 才是数据面正确 region(242a117 同源修法)
+  const baseUrl = getQServiceEndpoint(parseRegionFromProfileArn(account.profileArn) || account.region)
   const machineId = getAccountMachineId(account.id, account.machineId)
   
   const headers: Record<string, string> = {
@@ -2969,7 +2970,7 @@ function getSubscriptionAmzUserAgent(machineId?: string): string {
 
 // 获取可用订阅列表
 export async function fetchAvailableSubscriptions(account: ProxyAccount): Promise<SubscriptionListResponse> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(parseRegionFromProfileArn(account.profileArn) || account.region)
   const url = `${baseUrl}/listAvailableSubscriptions`
   const machineId = getAccountMachineId(account.id, account.machineId)
   
@@ -3022,7 +3023,7 @@ export async function fetchSubscriptionToken(
   account: ProxyAccount,
   subscriptionType?: string
 ): Promise<SubscriptionTokenResponse> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(parseRegionFromProfileArn(account.profileArn) || account.region)
   const url = `${baseUrl}/CreateSubscriptionToken`
   const machineId = getAccountMachineId(account.id, account.machineId)
   
@@ -3074,7 +3075,7 @@ export async function setUserPreference(
   account: ProxyAccount,
   overageStatus: 'ENABLED' | 'DISABLED'
 ): Promise<{ success: boolean; error?: string }> {
-  const baseUrl = getQServiceEndpoint(account.region)
+  const baseUrl = getQServiceEndpoint(parseRegionFromProfileArn(account.profileArn) || account.region)
   const url = `${baseUrl}/setUserPreference`
   const machineId = getAccountMachineId(account.id, account.machineId)
 
