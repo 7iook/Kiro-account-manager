@@ -199,8 +199,8 @@ interface KiroApi {
     clientSecret: string
     region?: string
     startUrl?: string
-    authMethod?: 'IdC' | 'social' | 'external_idp'
-    provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO' | 'AzureAD' | 'ExternalIdp'
+    authMethod?: 'IdC' | 'social' | 'external_idp' | 'api_key'
+    provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO' | 'AzureAD' | 'ExternalIdp' | 'ApiKey'
     profileArn?: string
     tokenEndpoint?: string
     issuerUrl?: string
@@ -265,6 +265,17 @@ interface KiroApi {
   // 文件操作
   exportToFile: (data: string, filename: string) => Promise<boolean>
   importFromFile: () => Promise<{ content: string; format: string } | null>
+
+  // 验证网页 API Key(ksk_)并解析绑定的 profileArn
+  verifyApiKey: (params: { apiKey: string; region?: string }) => Promise<{
+    success: boolean
+    profileArn?: string
+    profileName?: string
+    status?: string
+    profileType?: string
+    region?: string
+    error?: string
+  }>
 
   // 验证凭证并获取账号信息
   verifyAccountCredentials: (credentials: {
@@ -680,6 +691,12 @@ interface KiroApi {
   // 获取反代日志数量
   proxyGetLogsCount: () => Promise<number>
 
+  // 获取会话历史（每次 启动→停止 自动归档，最新在前）
+  proxyGetSessionHistory: () => Promise<Array<{ id: string; startTime: number; endTime: number; durationMs: number; totalRequests: number; successRequests: number; failedRequests: number; credits: number; inputTokens: number; outputTokens: number }>>
+
+  // 清空会话历史
+  proxyClearSessionHistory: () => Promise<{ success: boolean }>
+
   // 更新反代服务器配置
   proxyUpdateConfig: (config: Record<string, unknown>) => Promise<{ success: boolean; config?: unknown; error?: string }>
 
@@ -1025,7 +1042,7 @@ interface KiroApi {
     account: {
       id?: string; email?: string; accessToken?: string; refreshToken?: string
       clientId?: string; clientSecret?: string; region?: string
-      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'; provider?: string
+      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp' | 'api_key'; provider?: string
       profileArn?: string; machineId?: string; expiresAt?: number; proxyUrl?: string
     }
     model?: string

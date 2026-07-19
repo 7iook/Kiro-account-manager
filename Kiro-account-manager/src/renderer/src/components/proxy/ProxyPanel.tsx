@@ -6,6 +6,7 @@ import { useAccountsStore } from '../../store/accounts'
 import { useTranslation } from '../../hooks/useTranslation'
 import { ProxyLogsDialog } from './ProxyLogsDialog'
 import { ProxyDetailedLogsDialog } from './ProxyDetailedLogsDialog'
+import { ProxySessionHistoryDialog } from './ProxySessionHistoryDialog'
 import { ModelsDialog } from './ModelsDialog'
 import { ModelMappingDialog } from './ModelMappingDialog'
 import { AccountSelectDialog } from './AccountSelectDialog'
@@ -163,6 +164,7 @@ export function ProxyPanel() {
   const [refreshSuccess, setRefreshSuccess] = useState(false)
   const [showLogsDialog, setShowLogsDialog] = useState(false)
   const [showDetailedLogsDialog, setShowDetailedLogsDialog] = useState(false)
+  const [showSessionHistoryDialog, setShowSessionHistoryDialog] = useState(false)
   const [showModelsDialog, setShowModelsDialog] = useState(false)
   const [showClientConfigDialog, setShowClientConfigDialog] = useState(false)
   const [showModelMappingDialog, setShowModelMappingDialog] = useState(false)
@@ -1384,6 +1386,10 @@ export function ProxyPanel() {
                   <Activity className="h-3 w-3 mr-1" />
                   {isEn ? 'Detailed Logs' : '详细日志'}
                 </Button>
+                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowSessionHistoryDialog(true)}>
+                  <Clock className="h-3 w-3 mr-1" />
+                  {isEn ? 'Session History' : '会话历史'}
+                </Button>
               </div>
             </div>
           </CardHeader>
@@ -1481,6 +1487,13 @@ export function ProxyPanel() {
       <ProxyDetailedLogsDialog
         open={showDetailedLogsDialog}
         onOpenChange={setShowDetailedLogsDialog}
+      />
+
+      {/* 会话历史弹窗 */}
+      <ProxySessionHistoryDialog
+        open={showSessionHistoryDialog}
+        onOpenChange={setShowSessionHistoryDialog}
+        isEn={isEn}
       />
 
       {/* 模型列表弹窗 */}

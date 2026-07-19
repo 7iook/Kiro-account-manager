@@ -386,7 +386,7 @@ export interface ProxyAccount {
   clientId?: string
   clientSecret?: string
   region?: string
-  authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
+  authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp' | 'api_key'
   provider?: string
   profileArn?: string
   // external_idp (Azure AD 等外部 IdP) 专用：刷新走微软 tokenEndpoint
@@ -670,4 +670,19 @@ export interface KiroUsageEvent {
   inputTokens?: number
   outputTokens?: number
   totalTokens?: number
+}
+
+
+// ============ 会话级用量历史（每次 启动→停止 归档一条） ============
+export interface ProxySessionRecord {
+  id: string
+  startTime: number        // 会话开始（服务启动）时间戳
+  endTime: number          // 会话结束（服务停止）时间戳
+  durationMs: number       // 会话时长（毫秒）
+  totalRequests: number
+  successRequests: number
+  failedRequests: number
+  credits: number          // 本次会话消耗的 credits
+  inputTokens: number
+  outputTokens: number
 }

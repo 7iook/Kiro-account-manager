@@ -286,6 +286,30 @@ function flushStoreWrites(): void {
   pendingStoreWrites.clear()
 }
 
+/** 会话历史保留上限（滚动） */
+const PROXY_SESSION_HISTORY_LIMIT = 200
+
+/**
+ * 把当前代理会话（本次 启动→停止）快照归档为一条历史记录。
+ * 在 proxy-stop 以及应用退出（服务仍在运行）时调用。跳过 0 请求的空会话，避免误点启停刷垃圾。
+ */
+function archiveProxySessionIfAny(): void {
+  try {
+    if (!proxyServer || !store) return
+    const rec = proxyServer.snapshotSession()
+    if (rec.totalRequests <= 0) return // 空会话不记录
+    const history = (store.get('proxySessionHistory') as import('./proxy/types').ProxySessionRecord[] | undefined) || []
+    history.push(rec)
+    const trimmed = history.length > PROXY_SESSION_HISTORY_LIMIT
+      ? history.slice(-PROXY_SESSION_HISTORY_LIMIT)
+      : history
+    store.set('proxySessionHistory', trimmed)
+    console.log(`[ProxySession] Archived session: ${rec.totalRequests} req (✓${rec.successRequests} ✗${rec.failedRequests}), ${rec.credits.toFixed(2)} credits`)
+  } catch (err) {
+    console.warn('[ProxySession] archive failed:', err instanceof Error ? err.message : err)
+  }
+}
+
 let trayMenuTimer: ReturnType<typeof setTimeout> | null = null
 
 function debouncedUpdateTrayMenu(): void {
@@ -6700,6 +6724,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('proxy-stop', async () => {
     try {
       if (proxyServer) {
+        archiveProxySessionIfAny() // 停止前先快照归档本次会话
         await proxyServer.stop()
       }
       // 更新托盘菜单状态
@@ -6759,6 +6784,18 @@ app.whenReady().then(async () => {
       store.set('proxySuccessRequests', 0)
       store.set('proxyFailedRequests', 0)
     }
+    return { success: true }
+  })
+
+  // IPC: 获取会话历史（每次 启动→停止 自动归档的记录，最新在前）
+  ipcMain.handle('proxy-get-session-history', () => {
+    const history = (store?.get('proxySessionHistory') as import('./proxy/types').ProxySessionRecord[] | undefined) || []
+    return [...history].reverse()
+  })
+
+  // IPC: 清空会话历史
+  ipcMain.handle('proxy-clear-session-history', () => {
+    if (store) store.set('proxySessionHistory', [])
     return { success: true }
   })
 
@@ -7974,6 +8011,11 @@ app.on('will-quit', async (event) => {
   
   // 停止主进程池 token 刷新调度器
   stopMainPoolTokenRefresh()
+
+  // 服务仍在运行时，退出前先归档本次会话（正常退出可救；进程崩溃无法救）
+  if (proxyServer?.isRunning()) {
+    archiveProxySessionIfAny()
+  }
 
   // 防止应用立即退出，先保存数据
   if (lastSavedData && store) {

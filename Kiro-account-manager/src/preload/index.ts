@@ -141,8 +141,8 @@ const api = {
     clientSecret: string
     region?: string
     startUrl?: string
-    authMethod?: 'IdC' | 'social' | 'external_idp'
-    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise' | 'AzureAD' | 'ExternalIdp'
+    authMethod?: 'IdC' | 'social' | 'external_idp' | 'api_key'
+    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise' | 'AzureAD' | 'ExternalIdp' | 'ApiKey'
     profileArn?: string
     tokenEndpoint?: string
     issuerUrl?: string
@@ -205,6 +205,19 @@ const api = {
   // 文件操作 - 从文件导入
   importFromFile: (): Promise<string | null> => {
     return ipcRenderer.invoke('import-from-file')
+  },
+
+  // 验证网页 API Key(ksk_)并解析绑定的 profileArn
+  verifyApiKey: (params: { apiKey: string; region?: string }): Promise<{
+    success: boolean
+    profileArn?: string
+    profileName?: string
+    status?: string
+    profileType?: string
+    region?: string
+    error?: string
+  }> => {
+    return ipcRenderer.invoke('verify-api-key', params)
   },
 
   // 验证凭证并获取账号信息
@@ -731,6 +744,16 @@ const api = {
   // 获取反代日志数量
   proxyGetLogsCount: (): Promise<number> => {
     return ipcRenderer.invoke('proxy-get-logs-count')
+  },
+
+  // 获取会话历史（每次 启动→停止 自动归档，最新在前）
+  proxyGetSessionHistory: (): Promise<Array<{ id: string; startTime: number; endTime: number; durationMs: number; totalRequests: number; successRequests: number; failedRequests: number; credits: number; inputTokens: number; outputTokens: number }>> => {
+    return ipcRenderer.invoke('proxy-get-session-history')
+  },
+
+  // 清空会话历史
+  proxyClearSessionHistory: (): Promise<{ success: boolean }> => {
+    return ipcRenderer.invoke('proxy-clear-session-history')
   },
 
   // 更新反代服务器配置
@@ -1354,7 +1377,7 @@ const api = {
     account: {
       id?: string; email?: string; accessToken?: string; refreshToken?: string
       clientId?: string; clientSecret?: string; region?: string
-      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'; provider?: string
+      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp' | 'api_key'; provider?: string
       profileArn?: string; machineId?: string; expiresAt?: number; proxyUrl?: string
     }
     model?: string

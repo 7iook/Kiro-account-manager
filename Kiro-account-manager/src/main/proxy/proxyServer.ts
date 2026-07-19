@@ -15,7 +15,8 @@ import type {
   ProxyConfig,
   ProxyStats,
   ProxyAccount,
-  TokenRefreshCallback
+  TokenRefreshCallback,
+  ProxySessionRecord
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
@@ -261,7 +262,7 @@ export class ProxyServer {
   private accountPool: AccountPool
   private config: ProxyConfig
   private stats: ProxyStats
-  private sessionStats: { totalRequests: number; successRequests: number; failedRequests: number; startTime: number }
+  private sessionStats: { totalRequests: number; successRequests: number; failedRequests: number; credits: number; inputTokens: number; outputTokens: number; startTime: number }
   private events: ProxyServerEvents
   private refreshingTokens: Map<string, Promise<boolean>> = new Map() // 在途刷新去重（并发方共享同一结果）
   private isHttps: boolean = false
@@ -360,6 +361,9 @@ export class ProxyServer {
       totalRequests: 0,
       successRequests: 0,
       failedRequests: 0,
+      credits: 0,
+      inputTokens: 0,
+      outputTokens: 0,
       startTime: 0
     }
     this.events = events
@@ -475,11 +479,14 @@ export class ProxyServer {
       this.server.listen(this.config.port, this.config.host, () => {
         proxyLogger.info('ProxyServer', `Started on ${protocol}://${this.config.host}:${this.config.port} (keepAlive=${keepAliveMs}ms)`)
         this.stats.startTime = Date.now()
-        // 重置会话统计
+        // 重置会话统计（每次 start 开启一个新会话）
         this.sessionStats = {
           totalRequests: 0,
           successRequests: 0,
           failedRequests: 0,
+          credits: 0,
+          inputTokens: 0,
+          outputTokens: 0,
           startTime: Date.now()
         }
         this.events.onStatusChange?.(true, this.config.port)
@@ -910,8 +917,27 @@ export class ProxyServer {
   }
 
   // 获取会话统计（当前服务运行期间的统计）
-  getSessionStats(): { totalRequests: number; successRequests: number; failedRequests: number; startTime: number } {
+  getSessionStats(): { totalRequests: number; successRequests: number; failedRequests: number; credits: number; inputTokens: number; outputTokens: number; startTime: number } {
     return { ...this.sessionStats }
+  }
+
+  /** 生成当前会话的完整快照（用于停止时归档为一条历史记录）。 */
+  snapshotSession(): ProxySessionRecord {
+    const s = this.sessionStats
+    const now = Date.now()
+    const start = s.startTime || now
+    return {
+      id: `sess-${start}`,
+      startTime: start,
+      endTime: now,
+      durationMs: Math.max(0, now - start),
+      totalRequests: s.totalRequests,
+      successRequests: s.successRequests,
+      failedRequests: s.failedRequests,
+      credits: s.credits,
+      inputTokens: s.inputTokens,
+      outputTokens: s.outputTokens
+    }
   }
 
   // 是否运行中
@@ -3638,6 +3664,10 @@ export class ProxyServer {
       // P2-19 错误消息脱敏
       error: log.error ? this.sanitizeErrorMessage(log.error).slice(0, 500) : undefined
     })
+    // 会话级用量累计（credits / tokens）：recordRequest 是所有成功/失败请求的统一收口点
+    this.sessionStats.credits += log.credits || 0
+    this.sessionStats.inputTokens += log.inputTokens || 0
+    this.sessionStats.outputTokens += log.outputTokens || 0
     // P2-15 可配置上限（默认 100，最多 10000）
     const limit = Math.min(10000, Math.max(20, this.config.recentRequestsLimit || 100))
     if (this.stats.recentRequests.length > limit) {
