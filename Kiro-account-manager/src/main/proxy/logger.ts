@@ -2,7 +2,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { app } from 'electron'
-import { redactString, redactValue } from '../utils/redact'
+import { normalizeAndRedactLogEntry } from '../utils/redact'
 
 export interface LogEntry {
   timestamp: string
@@ -108,11 +108,12 @@ class ProxyLogger {
 
   private isWriting = false
   private write(rawEntry: LogEntry): void {
-    // 统一脱敏：message + data 里的代理账密 / token / password 等，避免明文落盘或上屏
+    // 统一脱敏 + Error 正规化：message + data 里的代理账密 / token / password 等，避免明文落盘或上屏
+    const norm = normalizeAndRedactLogEntry(rawEntry.message, rawEntry.data)
     const entry: LogEntry = {
       ...rawEntry,
-      message: redactString(rawEntry.message),
-      data: rawEntry.data === undefined ? undefined : redactValue(rawEntry.data)
+      message: norm.message,
+      data: norm.data
     }
     const line = JSON.stringify(entry) + '\n'
 
@@ -410,7 +411,9 @@ export function interceptConsole(): void {
       const allStrings = rest.every(r => typeof r === 'string')
       data = allStrings ? (rest as string[]).join(' ') : rest
     }
-    return { timestamp: new Date().toISOString(), level, category, message, data }
+    // console 拦截路径同样经过统一脱敏 + Error 正规化，消除脱敏旁路与 Error 序列化成 {} 的问题
+    const norm = normalizeAndRedactLogEntry(message, data)
+    return { timestamp: new Date().toISOString(), level, category, message: norm.message, data: norm.data }
   }
 
   console.log = (...args: unknown[]) => {

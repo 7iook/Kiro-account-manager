@@ -16,7 +16,7 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setAgentMode, KNOWN_CW_REGIONS, type KiroProfile } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setAgentMode, KNOWN_CW_REGIONS, resolveApiKeyProfileArn, type KiroProfile } from './proxy/kiroApi'
 import { resolveProfileArnForVerify, buildCompleteLoginResult } from './proxy/profile-selection'
 import {
   writeKiroAuthTokenFile,
@@ -831,7 +831,33 @@ async function refreshExternalIdpToken(
 }
 
 // 通用 Token 刷新 - 根据 authMethod 选择刷新方式
+/**
+ * 统一刷新协调器（single-flight，按 refresh token 去重）。
+ * 主进程内的后台批量刷新 / 主动续期 / IPC 手动刷新 / 代理 403 恢复等多个入口，
+ * 之前可能并发刷新同一个 rotating refresh token——先返回的把 token 轮换掉后，
+ * 后到的请求再用已作废的旧 token 刷新 → 401 → 账户被踢下线。
+ * 这里让同一 token 的并发刷新复用同一个 Promise，彻底消除该竞态窗口。
+ */
+const inFlightRefreshByToken = new Map<string, Promise<OidcRefreshResult>>()
+
 async function refreshTokenByMethod(
+  token: string,
+  clientId: string,
+  clientSecret: string,
+  region: string = 'us-east-1',
+  authMethod?: string,
+  proxyUrl?: string,  // 账号绑定的代理 URL（可选，优先级最高）
+  externalIdp?: { tokenEndpoint?: string; scopes?: string }  // external_idp 刷新专用
+): Promise<OidcRefreshResult> {
+  const existing = inFlightRefreshByToken.get(token)
+  if (existing) return existing
+  const p = refreshTokenByMethodInner(token, clientId, clientSecret, region, authMethod, proxyUrl, externalIdp)
+    .finally(() => { inFlightRefreshByToken.delete(token) })
+  inFlightRefreshByToken.set(token, p)
+  return p
+}
+
+async function refreshTokenByMethodInner(
   token: string,
   clientId: string,
   clientSecret: string,
@@ -2035,6 +2061,35 @@ function isBannedAccountErrorMain(error?: string): boolean {
     || /\b423\b/.test(e)
 }
 
+/**
+ * 永久性凭据错误判定：这类错误表示 refresh token / client 已失效或被吊销，
+ * 本质需要重新登录/更换凭据，反复每分钟重刷只会刷屏且无意义（本次日志故障主因）。
+ * 注意：401 / fetch failed / 网络超时等是「可恢复」错误，不在此列，仍允许后续重试。
+ */
+function isPermanentCredentialError(error?: string): boolean {
+  if (!error) return false
+  const e = error.toLowerCase()
+  return e.includes('invalid_grant')
+    || e.includes('invalid_client')
+    || e.includes('invalid client secret')
+    || e.includes('invalid refresh token')
+    || e.includes('invalid token provided')
+    || e.includes('unauthorized_client')
+    || e.includes('aadsts9002313') // Azure AD: 提供的 refresh token 无效
+}
+
+/**
+ * 永久错误退避状态（主进程内存态，进程重启后重置——重启后允许再探测一次是合理的）。
+ * key = accountId；until = 在此时间戳前跳过刷新；attempts = 已尝试次数（驱动指数退避）。
+ */
+const permanentErrorBackoff = new Map<string, { until: number; attempts: number }>()
+
+/** 指数退避窗口：15min → 1h → 6h → 24h（封顶）。 */
+function permanentBackoffMs(attempts: number): number {
+  const steps = [15 * 60_000, 60 * 60_000, 6 * 60 * 60_000, 24 * 60 * 60_000]
+  return steps[Math.min(Math.max(attempts, 1) - 1, steps.length - 1)]
+}
+
 /** 刷新提前量：≥ 2× 检查间隔且不少于 10 分钟，确保 token 不会在两次 tick 之间过期。 */
 function mainTokenRefreshLeadMs(intervalMin: number): number {
   return Math.max(intervalMin * 2 * 60 * 1000, 10 * 60 * 1000)
@@ -2086,6 +2141,17 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
       const creds = acc?.credentials
       if (!creds?.refreshToken) continue
       if (isBannedAccountErrorMain(acc.lastError)) continue
+      // 永久凭据错误退避：invalid token/client/grant 等无退避每分钟重刷是日志刷屏主因。
+      // 命中后按指数退避跳过；退避到点时放行一次做探测性重试，仍失败则加倍。
+      if (isPermanentCredentialError(acc.lastError)) {
+        const bo = permanentErrorBackoff.get(id)
+        if (bo && now < bo.until) continue // 退避窗口内，跳过刷新
+        const attempts = (bo?.attempts ?? 0) + 1
+        permanentErrorBackoff.set(id, { attempts, until: now + permanentBackoffMs(attempts) })
+      } else if (permanentErrorBackoff.has(id)) {
+        // 已不再是永久错误（刷新成功或转为可恢复错误）→ 清除退避状态
+        permanentErrorBackoff.delete(id)
+      }
       const expiresAt = creds.expiresAt
       // 只刷"即将过期/已过期"的；没有 expiresAt 的跳过（无从判断）
       if (!expiresAt || expiresAt - now > leadMs) continue
@@ -2985,7 +3051,7 @@ app.whenReady().then(async () => {
       clientId?: string
       clientSecret?: string
       region?: string
-      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
+      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp' | 'api_key'
       provider?: string
       profileArn?: string
       machineId?: string
@@ -3115,6 +3181,18 @@ app.whenReady().then(async () => {
   ipcMain.handle('refresh-account-token', async (_event, account) => {
     try {
       const { refreshToken, clientId, clientSecret, region, authMethod, startUrl, provider, tokenEndpoint, scopes } = account.credentials || {}
+
+      // 网页 API Key(ksk_)账户：静态长凭证，无 refreshToken、永不过期，刷新是 no-op。
+      // 返回成功并原样带回现有 token/profileArn，避免走下面"缺少 Refresh Token"错误分支误标账号异常。
+      if (authMethod === 'api_key' || provider === 'ApiKey') {
+        return {
+          success: true,
+          accessToken: account.credentials?.accessToken,
+          refreshToken: undefined,
+          expiresAt: account.credentials?.expiresAt,
+          profileArn: account.profileArn || account.credentials?.profileArn
+        }
+      }
 
       if (!refreshToken) {
         return { success: false, error: { message: '缺少 Refresh Token' } }
@@ -4520,6 +4598,33 @@ app.whenReady().then(async () => {
     }
   })
 
+  // IPC: 验证网页 API Key(ksk_)并解析其绑定的 profileArn（用于添加账号）
+  // ksk 是静态长凭证：调 GetProfile(TokenType: API_KEY) 拿 profileArn，通过即可导入。
+  ipcMain.handle('verify-api-key', async (_event, params: { apiKey: string; region?: string }) => {
+    const apiKey = (params?.apiKey || '').trim()
+    const region = params?.region || 'us-east-1'
+    console.log('[IPC] verify-api-key called')
+    if (!apiKey.startsWith('ksk_')) {
+      return { success: false, error: 'API Key 格式错误：应以 ksk_ 开头' }
+    }
+    try {
+      const profile = await resolveApiKeyProfileArn(apiKey, region)
+      const dataPlaneRegion = parseRegionFromProfileArn(profile.profileArn) || region
+      return {
+        success: true,
+        profileArn: profile.profileArn,
+        profileName: profile.profileName,
+        status: profile.status,
+        profileType: profile.profileType,
+        region: dataPlaneRegion
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      console.error('[IPC] verify-api-key failed:', msg)
+      return { success: false, error: `API Key 校验失败：${msg}` }
+    }
+  })
+
   // IPC: 验证凭证并获取账号信息（用于添加账号）
   ipcMain.handle('verify-account-credentials', async (_event, credentials: {
     refreshToken: string
@@ -4946,7 +5051,7 @@ app.whenReady().then(async () => {
     clientSecret: string
     region?: string
     startUrl?: string
-    authMethod?: 'IdC' | 'social' | 'external_idp'
+    authMethod?: 'IdC' | 'social' | 'external_idp' | 'api_key'
     provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise' | 'AzureAD' | 'ExternalIdp'
     profileArn?: string
     tokenEndpoint?: string
@@ -5011,7 +5116,7 @@ app.whenReady().then(async () => {
         accessToken: finalAccessToken,
         refreshToken: finalRefreshToken,
         expiresAtIso,
-        authMethod,
+        authMethod: authMethod === 'api_key' ? 'IdC' : authMethod,
         provider,
         region,
         startUrl,

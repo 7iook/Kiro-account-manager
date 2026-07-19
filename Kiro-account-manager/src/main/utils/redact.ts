@@ -67,6 +67,26 @@ function isSensitiveKey(key: string): boolean {
   return SENSITIVE_KEYS.some((s) => k === s.replace(/[_-]/g, '') || k.includes(s.replace(/[_-]/g, '')))
 }
 
+/**
+ * 把 Error 实例转成可序列化对象。
+ * JS Error 的 name/message/stack 通常不可枚举，直接 JSON.stringify(err) 会得到 `{}`，
+ * 这正是日志中出现 `... failed: | {}` 的根因。此处显式提取并限长 stack。
+ */
+function normalizeError(err: Error): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    name: err.name,
+    message: err.message
+  }
+  const code = (err as { code?: unknown }).code
+  if (code !== undefined) out.code = code
+  const cause = (err as { cause?: unknown }).cause
+  if (cause !== undefined) out.cause = cause instanceof Error ? normalizeError(cause) : cause
+  if (err.stack) {
+    out.stack = err.stack.length > 1000 ? `${err.stack.slice(0, 1000)}…[truncated]` : err.stack
+  }
+  return out
+}
+
 /** 递归脱敏任意值（对象/数组/字符串）。maxDepth 防御过深结构与循环引用 */
 export function redactValue(value: unknown, maxDepth = 6, seen = new WeakSet<object>()): unknown {
   if (value == null) return value
@@ -80,6 +100,10 @@ export function redactValue(value: unknown, maxDepth = 6, seen = new WeakSet<obj
   if (typeof value === 'object') {
     if (seen.has(value as object)) return '[circular]'
     seen.add(value as object)
+    // Error 实例先正规化成普通对象，再按对象规则递归脱敏（message/stack 里可能含 token）
+    if (value instanceof Error) {
+      return redactValue(normalizeError(value), maxDepth - 1, seen)
+    }
     const out: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       if (isSensitiveKey(k)) {
@@ -91,4 +115,21 @@ export function redactValue(value: unknown, maxDepth = 6, seen = new WeakSet<obj
     return out
   }
   return value
+}
+
+
+/**
+ * 统一日志条目脱敏 + Error 正规化入口。
+ * 供 ProxyLogger.write 与 console 拦截（interceptConsole）共用，
+ * 确保两条写入 proxyLogStore 的路径都经过同一脱敏/正规化逻辑，
+ * 消除 console 拦截绕过脱敏、以及 Error 序列化成 `{}` 的问题。
+ */
+export function normalizeAndRedactLogEntry(
+  message: unknown,
+  data: unknown
+): { message: string; data: unknown } {
+  return {
+    message: redactString(String(message ?? '')),
+    data: data === undefined ? undefined : redactValue(data)
+  }
 }
