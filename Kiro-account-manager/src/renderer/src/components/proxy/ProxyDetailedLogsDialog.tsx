@@ -123,17 +123,28 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
     if (open) {
       setLoading(true)
       loadLogs().finally(() => setLoading(false))
-      
-      // 每 1.5 秒刷新一次
-      pollIntervalRef.current = setInterval(() => {
+
+      // 长时运行缓解：1500→3000ms；窗口不可见时暂停 poll（避免已最小化仍拉大 payload）
+      const tick = () => {
+        if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
         loadLogs().then(() => {
-          // 如果用户不在底部，累计新日志数
           if (!isAtBottom && logs.length > prevLogCount.current) {
             setNewLogCount(prev => prev + (logs.length - prevLogCount.current))
           }
           prevLogCount.current = logs.length
         })
-      }, 1500)
+      }
+      pollIntervalRef.current = setInterval(tick, 3000)
+      const onVis = () => { if (document.visibilityState === 'visible') loadLogs() }
+      document.addEventListener('visibilitychange', onVis)
+
+      return () => {
+        if (pollIntervalRef.current) {
+          clearInterval(pollIntervalRef.current)
+          pollIntervalRef.current = null
+        }
+        document.removeEventListener('visibilitychange', onVis)
+      }
     }
 
     return () => {

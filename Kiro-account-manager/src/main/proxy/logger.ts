@@ -239,8 +239,13 @@ class ProxyLogger {
 // 5. 应用退出时通过 flushSaveNow() 强制写盘，防止数据丢失
 class ProxyLogStore {
   private logs: LogEntry[] = []
-  // 5 万条 × 平均 200 字节 ≈ 10 MB；既能覆盖常规调试需求，又把单次写盘成本控制在可接受范围内
-  private maxLogs: number = 50000
+  // 1 万条 × 平均 500 字节 ≈ 5 MB；JSON.stringify 时长 <100ms，长时运行不会因 log stringify 把 IPC 拖到 renderer 失响。
+  private maxLogs: number = 10000
+  // 单条 log entry 的 data 字段序列化上限：防止一条巨对象(如 1.4MB payload)长期驻留 + 写盘阻塞。
+  // 超限 → 截为 preview，保留原 byte size 便于事后定位。
+  private readonly maxDataBytes: number = 4096
+  // save() safety net：万一 UI/参数改上限导致 snapshot 体积失控，写盘前再限 20MB。
+  private readonly maxSnapshotBytes: number = 20 * 1024 * 1024
   private listeners: ((entry: LogEntry) => void)[] = []
   private storePath: string = ''
 
@@ -286,8 +291,16 @@ class ProxyLogStore {
     this.writeInFlight = true
     try {
       // 拷贝引用快照（不复制数组）以保证 JSON.stringify 期间数据稳定
-      const snapshot = this.logs
-      await fs.promises.writeFile(this.storePath, JSON.stringify(snapshot), 'utf-8')
+      let snapshot = this.logs
+      let json = JSON.stringify(snapshot)
+      // Safety net：万一 UI/参数改上限导致体积失控（>20MB），二次裁剪到后 5000 条重新 stringify
+      if (json.length > this.maxSnapshotBytes) {
+        const keep = Math.min(snapshot.length, 5000)
+        snapshot = snapshot.slice(-keep)
+        this.logs = snapshot
+        json = JSON.stringify(snapshot)
+      }
+      await fs.promises.writeFile(this.storePath, json, 'utf-8')
     } catch (error) {
       console.error('[ProxyLogStore] Failed to save logs:', error)
     } finally {
@@ -303,6 +316,26 @@ class ProxyLogStore {
   private saveTimer: NodeJS.Timeout | null = null
 
   add(entry: LogEntry): void {
+    // 单条 data 字段体积上限：避免一条巨 data（如 1.4MB payload / 长 stack）长期驻留内存与阻塞写盘。
+    if (entry.data !== undefined) {
+      try {
+        const serialized = JSON.stringify(entry.data)
+        if (serialized && serialized.length > this.maxDataBytes) {
+          entry = {
+            ...entry,
+            data: {
+              __truncated: true,
+              originalBytes: serialized.length,
+              preview: serialized.slice(0, 200)
+            }
+          }
+        }
+      } catch {
+        // 循环引用等不可序列化对象：就地标为不可序列化，避免后续 save() 反复抛错
+        entry = { ...entry, data: { __unserializable: true } }
+      }
+    }
+
     this.logs.push(entry)
 
     // 超过最大数量时批量原地删除,不用 slice 拷贝整个数组。

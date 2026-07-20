@@ -52,6 +52,8 @@ export interface ProxyServerEvents {
   onCreditsUpdate?: (totalCredits: number) => void
   onTokensUpdate?: (inputTokens: number, outputTokens: number) => void
   onRequestStatsUpdate?: (totalRequests: number, successRequests: number, failedRequests: number) => void
+  // 会话内定期快照回调：服务运行中每 60s 用 snapshotSession() 触发一次，主进程写 store 作为 orphan 保底（强杀/崩溃下次启动能归档）
+  onSessionTick?: (record: ProxySessionRecord) => void
   onPoolEmpty?: () => Promise<void> // 账号池为空时触发（冷启动懒加载）
 }
 
@@ -279,6 +281,8 @@ export class ProxyServer {
   private webhookTrigger?: (event: string, payload: Record<string, unknown>) => void
   /** 定期清理 timer */
   private cleanupTimer: NodeJS.Timeout | null = null
+  /** 会话快照 tick timer（每 60s 把 in-progress session 写入 store，防强杀/崩溃丢失） */
+  private sessionSnapshotTimer: NodeJS.Timeout | null = null
 
   /**
    * 从请求中提取 session hint，用于稳定 conversationId
@@ -475,6 +479,16 @@ export class ProxyServer {
       // 让 timer 在 Node 退出时不阻塞
       this.cleanupTimer.unref?.()
 
+      // 会话快照 tick（每 60s 写 orphan snapshot 到 store，强杀/崩溃时下次启动能自动归档）
+      if (this.sessionSnapshotTimer) clearInterval(this.sessionSnapshotTimer)
+      this.sessionSnapshotTimer = setInterval(() => {
+        try {
+          const rec = this.snapshotSession()
+          if (rec.totalRequests > 0) this.events.onSessionTick?.(rec)
+        } catch { /* ignore */ }
+      }, 60_000)
+      this.sessionSnapshotTimer.unref?.()
+
       const protocol = this.isHttps ? 'https' : 'http'
       this.server.listen(this.config.port, this.config.host, () => {
         proxyLogger.info('ProxyServer', `Started on ${protocol}://${this.config.host}:${this.config.port} (keepAlive=${keepAliveMs}ms)`)
@@ -601,6 +615,7 @@ export class ProxyServer {
         this.activeRequests.clear()
         this.sockets.clear()
         if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null }
+        if (this.sessionSnapshotTimer) { clearInterval(this.sessionSnapshotTimer); this.sessionSnapshotTimer = null }
         this.events.onStatusChange?.(false, this.config.port)
         resolve()
       }

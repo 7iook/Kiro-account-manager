@@ -288,6 +288,8 @@ function flushStoreWrites(): void {
 
 /** 会话历史保留上限（滚动） */
 const PROXY_SESSION_HISTORY_LIMIT = 200
+/** orphan snapshot 在 store 的 key（强杀/崩溃下次启动时归档） */
+const PROXY_ORPHAN_SESSION_KEY = 'proxyOrphanSessionSnapshot'
 
 /**
  * 把当前代理会话（本次 启动→停止）快照归档为一条历史记录。
@@ -304,9 +306,39 @@ function archiveProxySessionIfAny(): void {
       ? history.slice(-PROXY_SESSION_HISTORY_LIMIT)
       : history
     store.set('proxySessionHistory', trimmed)
+    // 正常归档后清 orphan，避免下次启动重复归档
+    store.set(PROXY_ORPHAN_SESSION_KEY, undefined)
     console.log(`[ProxySession] Archived session: ${rec.totalRequests} req (✓${rec.successRequests} ✗${rec.failedRequests}), ${rec.credits.toFixed(2)} credits`)
   } catch (err) {
     console.warn('[ProxySession] archive failed:', err instanceof Error ? err.message : err)
+  }
+}
+
+/**
+ * 启动时回收上一次 orphan session（上次强杀/崩溃/关机没来得及正常归档时留下的）。
+ * endTime 是最后一次 60s tick 时间点，最多丢 <60s 的请求计数（已知杂噪，可接受）。
+ * 必须在 store 就绪之后、任何新会话开始写 orphan 之前调用。
+ */
+async function restoreOrphanProxySessionIfAny(): Promise<void> {
+  try {
+    if (!store) { await initStore() }
+    if (!store) return
+    const orphan = store.get(PROXY_ORPHAN_SESSION_KEY) as import('./proxy/types').ProxySessionRecord | undefined
+    if (!orphan || typeof orphan !== 'object') return
+    if (!orphan.totalRequests || orphan.totalRequests <= 0) {
+      store.set(PROXY_ORPHAN_SESSION_KEY, undefined)
+      return
+    }
+    const history = (store.get('proxySessionHistory') as import('./proxy/types').ProxySessionRecord[] | undefined) || []
+    history.push(orphan)
+    const trimmed = history.length > PROXY_SESSION_HISTORY_LIMIT
+      ? history.slice(-PROXY_SESSION_HISTORY_LIMIT)
+      : history
+    store.set('proxySessionHistory', trimmed)
+    store.set(PROXY_ORPHAN_SESSION_KEY, undefined)
+    console.log(`[ProxySession] Restored orphan session (${orphan.totalRequests} req, ${orphan.credits.toFixed(2)} credits) from previous unclean shutdown`)
+  } catch (err) {
+    console.warn('[ProxySession] restore orphan failed:', err instanceof Error ? err.message : err)
   }
 }
 
@@ -481,6 +513,12 @@ function initProxyServer(): ProxyServer {
         debouncedStoreSet('proxyFailedRequests', failedRequests)
         // 更新托盘菜单（也防抖，避免频繁重建菜单）
         debouncedUpdateTrayMenu()
+      },
+      // 会话快照 tick：服务运行中每 60s 写 orphan snapshot 到 store
+      // 强杀/崩溃/关机时 — 下次启动 restoreOrphanProxySessionIfAny 会归档它
+      onSessionTick: (rec) => {
+        if (!store) return
+        try { store.set(PROXY_ORPHAN_SESSION_KEY, rec) } catch { /* ignore */ }
       },
       // 账号池为空时懒加载 - 从 store 读取账号数据同步到 pool
       onPoolEmpty: async () => {
@@ -2664,6 +2702,10 @@ app.whenReady().then(async () => {
   // 初始化日志系统（尽早拦截，确保所有 console 输出都进入日志存储）
   proxyLogStore.initialize(app.getPath('userData'))
   interceptConsole()
+
+  // 回收上次 orphan session（强杀/崩溃/关机未及时正常归档时留下的）
+  // 必须在 initProxyServer/proxyServer.start 之前，避免新会话的 60s tick 盖掉上一次的 orphan
+  await restoreOrphanProxySessionIfAny()
 
   // 启动 Kiro IDE token 文件监听（反向同步：IDE 自己 refresh 后把新 token 同步回反代 store）
   // 见 syncIdeTokenChangeToStore 注释

@@ -87,9 +87,17 @@ export function LogsPage() {
   useEffect(() => {
     setIsLoading(true)
     fetchLogs().finally(() => setIsLoading(false))
-    pollRef.current = setInterval(fetchLogs, 1500)
+    // 长时运行缓解：poll 1500→3000ms，且窗口不可见时暂停；变可见时立即拉一次
+    const tick = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+      fetchLogs()
+    }
+    pollRef.current = setInterval(tick, 3000)
+    const onVis = () => { if (document.visibilityState === 'visible') fetchLogs() }
+    document.addEventListener('visibilitychange', onVis)
     return () => {
       if (pollRef.current) clearInterval(pollRef.current)
+      document.removeEventListener('visibilitychange', onVis)
     }
   }, [fetchLogs])
 
