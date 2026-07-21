@@ -39,6 +39,9 @@ interface SessionStats {
   totalRequests: number
   successRequests: number
   failedRequests: number
+  credits: number
+  inputTokens: number
+  outputTokens: number
   startTime: number
 }
 
@@ -1286,6 +1289,47 @@ export function ProxyPanel() {
             </CardContent>
           </Card>
         </div>
+      )}
+
+      {/* 本次会话消耗汇总条(自启动服务起实时累计,每请求完成即刷新) */}
+      {isRunning && sessionStats && (
+        <Card className="hover-lift border-primary/30 bg-gradient-to-r from-primary/[0.07] via-amber-500/[0.05] to-transparent">
+          <CardContent className="py-3">
+            <div className="flex items-center flex-wrap gap-x-8 gap-y-2 tabular-nums">
+              <div className="flex items-center gap-1.5 text-xs font-medium text-primary">
+                <Zap className="h-3.5 w-3.5" />
+                {isEn ? 'This Session' : '本次会话消耗'}
+              </div>
+              <div className="flex items-baseline gap-1.5">
+                <span className="text-xs text-muted-foreground">{isEn ? 'Credits' : '额度'}</span>
+                <span className="text-lg font-bold text-amber-500">{(sessionStats.credits || 0).toFixed(2)}</span>
+              </div>
+              <div className="flex items-baseline gap-1.5">
+                <span className="text-xs text-muted-foreground">{isEn ? 'Tokens (in/out)' : 'Tokens (输入/输出)'}</span>
+                <span className="text-sm font-bold">
+                  <span className="text-blue-500" title={(sessionStats.inputTokens || 0).toLocaleString()}>{compactNumber(sessionStats.inputTokens || 0)}</span>
+                  <span className="text-muted-foreground mx-0.5">/</span>
+                  <span className="text-purple-500" title={(sessionStats.outputTokens || 0).toLocaleString()}>{compactNumber(sessionStats.outputTokens || 0)}</span>
+                </span>
+              </div>
+              <div className="flex items-baseline gap-1.5">
+                <span className="text-xs text-muted-foreground">{isEn ? 'Requests' : '请求'}</span>
+                <span className="text-sm font-bold">
+                  <span className="text-foreground">{(sessionStats.totalRequests || 0).toLocaleString()}</span>
+                  <span className="text-muted-foreground mx-1">(</span>
+                  <span className="text-success">{sessionStats.successRequests || 0}</span>
+                  <span className="text-muted-foreground mx-0.5">/</span>
+                  <span className="text-destructive">{sessionStats.failedRequests || 0}</span>
+                  <span className="text-muted-foreground">)</span>
+                </span>
+              </div>
+              <div className="flex items-baseline gap-1.5">
+                <span className="text-xs text-muted-foreground">{isEn ? 'Uptime' : '运行'}</span>
+                <span className="text-sm font-bold text-primary whitespace-nowrap">{formatUptime(uptime)}</span>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
       )}
 
       {/* API 端点说明 */}

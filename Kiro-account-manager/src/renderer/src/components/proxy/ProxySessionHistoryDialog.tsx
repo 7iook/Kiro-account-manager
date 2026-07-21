@@ -83,6 +83,8 @@ export function ProxySessionHistoryDialog({ open, onOpenChange, isEn }: ProxySes
 
   const totalCredits = sessions.reduce((sum, s) => sum + s.credits, 0)
   const totalReq = sessions.reduce((sum, s) => sum + s.totalRequests, 0)
+  const totalIn = sessions.reduce((sum, s) => sum + s.inputTokens, 0)
+  const totalOut = sessions.reduce((sum, s) => sum + s.outputTokens, 0)
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -113,10 +115,11 @@ export function ProxySessionHistoryDialog({ open, onOpenChange, isEn }: ProxySes
               </button>
             </div>
           </div>
-          <div className="flex items-center gap-4 mt-1 text-xs text-muted-foreground">
+          <div className="flex items-center gap-4 mt-1 text-xs text-muted-foreground tabular-nums">
             <span>{isEn ? 'Total sessions' : '会话总数'}: <span className="text-foreground font-medium">{sessions.length}</span></span>
             <span>{isEn ? 'Total requests' : '总请求'}: <span className="text-foreground font-medium">{totalReq.toLocaleString()}</span></span>
-            <span>{isEn ? 'Total credits' : '总额度'}: <span className="text-foreground font-medium">{totalCredits.toFixed(2)}</span></span>
+            <span>{isEn ? 'Total credits' : '总额度'}: <span className="text-amber-500 font-medium">{totalCredits.toFixed(2)}</span></span>
+            <span>{isEn ? 'Total tokens' : '总 Tokens'}: <span className="text-foreground font-medium">{(totalIn + totalOut).toLocaleString()}</span></span>
           </div>
         </CardHeader>
 
@@ -127,7 +130,7 @@ export function ProxySessionHistoryDialog({ open, onOpenChange, isEn }: ProxySes
             </div>
           ) : (
             <div className="text-xs">
-              <div className="grid gap-2 py-2 px-2 font-medium text-muted-foreground border-b sticky top-0 bg-background/80 backdrop-blur" style={{ gridTemplateColumns: '1.6fr 1.6fr 0.8fr 0.7fr 0.6fr 0.6fr 0.8fr 1fr' }}>
+              <div className="grid gap-2 py-2 px-2 font-medium text-muted-foreground border-b sticky top-0 bg-background/80 backdrop-blur" style={{ gridTemplateColumns: '1.5fr 1.5fr 0.7fr 0.6fr 0.55fr 0.55fr 0.85fr 0.9fr 0.8fr' }}>
                 <span>{isEn ? 'Start' : '开始'}</span>
                 <span>{isEn ? 'End' : '结束'}</span>
                 <span className="text-right">{isEn ? 'Duration' : '时长'}</span>
@@ -135,18 +138,20 @@ export function ProxySessionHistoryDialog({ open, onOpenChange, isEn }: ProxySes
                 <span className="text-right text-success">{isEn ? 'OK' : '成功'}</span>
                 <span className="text-right text-destructive">{isEn ? 'Fail' : '失败'}</span>
                 <span className="text-right">{isEn ? 'Credits' : '额度'}</span>
-                <span className="text-right">Tokens (in/out)</span>
+                <span className="text-right">{isEn ? 'Input' : '输入'}</span>
+                <span className="text-right">{isEn ? 'Output' : '输出'}</span>
               </div>
               {sessions.map((s) => (
-                <div key={s.id} className="grid gap-2 py-1.5 px-2 rounded hover:bg-muted/50 items-center font-mono" style={{ gridTemplateColumns: '1.6fr 1.6fr 0.8fr 0.7fr 0.6fr 0.6fr 0.8fr 1fr' }}>
+                <div key={s.id} className="grid gap-2 py-1.5 px-2 rounded hover:bg-muted/50 items-center font-mono tabular-nums" style={{ gridTemplateColumns: '1.5fr 1.5fr 0.7fr 0.6fr 0.55fr 0.55fr 0.85fr 0.9fr 0.8fr' }}>
                   <span className="text-muted-foreground whitespace-nowrap">{fmtTime(s.startTime)}</span>
                   <span className="text-muted-foreground whitespace-nowrap">{fmtTime(s.endTime)}</span>
                   <span className="text-right">{fmtDuration(s.durationMs)}</span>
                   <span className="text-right">{s.totalRequests.toLocaleString()}</span>
                   <span className="text-right text-success">{s.successRequests.toLocaleString()}</span>
                   <span className="text-right text-destructive">{s.failedRequests.toLocaleString()}</span>
-                  <span className="text-right">{s.credits.toFixed(2)}</span>
-                  <span className="text-right text-muted-foreground">{s.inputTokens.toLocaleString()}/{s.outputTokens.toLocaleString()}</span>
+                  <span className="text-right text-amber-500">{s.credits.toFixed(2)}</span>
+                  <span className="text-right text-muted-foreground">{s.inputTokens.toLocaleString()}</span>
+                  <span className="text-right text-muted-foreground">{s.outputTokens.toLocaleString()}</span>
                 </div>
               ))}
             </div>
