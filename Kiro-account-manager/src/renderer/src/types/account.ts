@@ -2,7 +2,7 @@
 // 多账号管理器类型定义
 // ============================================
 
-export type IdpType = 'Google' | 'Github' | 'BuilderId' | 'Enterprise' | 'AWSIdC' | 'Internal' | 'IAM_SSO' | 'AzureAD' | 'ExternalIdp'
+export type IdpType = 'Google' | 'Github' | 'BuilderId' | 'Enterprise' | 'AWSIdC' | 'Internal' | 'IAM_SSO' | 'AzureAD' | 'ExternalIdp' | 'ApiKey'
 
 export type SubscriptionType = 'Free' | 'Pro' | 'Pro_Plus' | 'Enterprise' | 'Teams'
 
@@ -20,8 +20,8 @@ export interface AccountCredentials {
   region?: string        // AWS 区域，默认 us-east-1
   startUrl?: string      // SSO Start URL（Enterprise 账户专用）
   expiresAt: number      // 时间戳
-  authMethod?: 'IdC' | 'social' | 'external_idp'  // 认证方式：IdC / social / external_idp (Azure AD 等外部 IdP)
-  provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO' | 'AzureAD' | 'ExternalIdp'  // 身份提供商
+  authMethod?: 'IdC' | 'social' | 'external_idp' | 'api_key'  // 认证方式：IdC / social / external_idp (Azure AD) / api_key (网页 ksk_ 静态密钥)
+  provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO' | 'AzureAD' | 'ExternalIdp' | 'ApiKey'  // 身份提供商
   profileArn?: string    // Enterprise/external_idp 真实 profileArn（从 ListAvailableProfiles 获取或导入文件自带）
   // ===== external_idp (微软 Azure AD 等外部 IdP) 专用字段 =====
   tokenEndpoint?: string // 微软 OAuth2 token 端点（external_idp 刷新走这里，不走 AWS OIDC）

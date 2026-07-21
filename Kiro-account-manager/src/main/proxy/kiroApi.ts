@@ -171,6 +171,18 @@ function getKiroManagementHost(region?: string): string {
 
 const TOKEN_TYPE_SSO_OIDC = 'SSO_OIDC'
 const TOKEN_TYPE_EXTERNAL_IDP = 'EXTERNAL_IDP'
+const TOKEN_TYPE_API_KEY = 'API_KEY'
+
+// ============ 诊断日志开关(端点路由 / region / 400 排查用)============
+// 默认关闭以免生产噪音;开发排查跨 region / 端点路由问题时打开。
+// 开启方式:① 环境变量 KIRO_API_DEBUG=1 启动;② 运行时调 setKiroApiDebug(true)(IPC/设置可接)。
+let kiroApiDebugEnabled = process.env.KIRO_API_DEBUG === '1'
+export function setKiroApiDebug(enabled: boolean): void {
+  kiroApiDebugEnabled = enabled
+}
+export function isKiroApiDebug(): boolean {
+  return kiroApiDebugEnabled
+}
 
 /**
  * 根据账户类型返回 TokenType header 值(2026-07 迁移后)
@@ -179,6 +191,11 @@ const TOKEN_TYPE_EXTERNAL_IDP = 'EXTERNAL_IDP'
  * 抓包证据:官方 Kiro IDE 1.0.116 stream + management API 请求全带 TokenType: SSO_OIDC
  */
 function getTokenTypeHeader(account: ProxyAccount): string {
+  // 网页 API Key(ksk_)账户：所有 Kiro 调用（GetProfile / ListAvailableModels / generateAssistantResponse）
+  // 必须带 TokenType: API_KEY（抓包证据：kiro-cli headless 模式 UA=AmazonQ-For-CLI, tokentype=API_KEY 贯穿全程）
+  if (account.authMethod === 'api_key' || account.provider === 'ApiKey') {
+    return TOKEN_TYPE_API_KEY
+  }
   if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
     return TOKEN_TYPE_EXTERNAL_IDP
   }
@@ -253,6 +270,13 @@ function getKiroAmzUserAgent(machineId?: string): string {
   return `aws-sdk-js/${AWS_SDK_VERSION} ${suffix}`
 }
 
+// 网页 API Key(ksk_)专用 UA —— kiro-cli headless 抓包实测证据(2026-07)：
+// runtime.*.kiro.dev(V2 host)对 TokenType=API_KEY 的授权校验会看 UA，
+// 用 KiroIDE UA 会返 403 "User is not authorized to make this call"；
+// 必须用 AmazonQ-For-CLI UA 才通过（authz 关键，非 misleading）。
+const KIRO_CLI_USER_AGENT = 'aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/windows lang/rust/1.92.0 md/appVersion-2.12.1 app/AmazonQ-For-CLI'
+const KIRO_CLI_AMZ_USER_AGENT = 'aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/windows lang/rust/1.92.0 m/F app/AmazonQ-For-CLI'
+
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const KIRO_CLI_OS = OS_PLATFORM === 'win32' ? 'windows' : OS_PLATFORM === 'macos' ? 'macos' : 'linux'
 void KIRO_CLI_OS // reserved for future kiro-cli UA
@@ -291,6 +315,11 @@ function resolveProfileArn(account: ProxyAccount): string | undefined {
   if (account.profileArn && !isPlaceholderProfileArn(account.profileArn)) {
     return account.profileArn
   }
+  // API Key(ksk_)账户：profileArn 必须是导入时 GetProfile 解析出的真实值（绑定到该 ksk），
+  // 没有时绝不能回退到 social/builder 占位 ARN（会 403 Invalid token），返 undefined 让上游自愈重拉。
+  if (account.authMethod === 'api_key' || account.provider === 'ApiKey') {
+    return account.profileArn && !isPlaceholderProfileArn(account.profileArn) ? account.profileArn : undefined
+  }
   if (account.provider === 'Enterprise' || account.authMethod === 'external_idp') {
     return getEnterpriseFallbackArn(account.region)
   }
@@ -302,6 +331,73 @@ function resolveProfileArn(account: ProxyAccount): string | undefined {
 
 // 兼容 SDK 部分调用仍想知道社交 ARN 的场景（极少；保留 export 不破坏外部 import）
 export { KIRO_SOCIAL_PROFILE_ARN }
+
+/** 网页 API Key(ksk_)GetProfile 解析结果 */
+export interface ApiKeyProfile {
+  profileArn: string
+  profileName?: string
+  status?: string
+  profileType?: string
+}
+
+/**
+ * 用网页 API Key(ksk_)调 GetProfile 解析其绑定的 profileArn。
+ * 精确 wire 格式（2026-07 抓 kiro-cli headless 实测，200 验证通过）：
+ *   POST https://management.{region}.kiro.dev/   (aws-json RPC 根路径)
+ *   Headers: Content-Type: application/x-amz-json-1.0
+ *            X-Amz-Target: AmazonCodeWhispererService.GetProfile
+ *            TokenType: API_KEY   （关键！区别于 SSO_OIDC，服务据此做 key→profile 查找）
+ *            Authorization: Bearer ksk_...
+ *            x-amzn-codewhisperer-optout: false
+ *   Body: {}
+ *   Resp: { "profile": { "arn": "arn:aws:codewhisperer:...:profile/xxx", "profileName", "status", "profileType" } }
+ * ksk 无 refreshToken/expiry，profileArn 在导入时解析一次并持久化到账户，运行时不再重取。
+ */
+export async function resolveApiKeyProfileArn(
+  apiKey: string,
+  region = 'us-east-1'
+): Promise<ApiKeyProfile> {
+  const account: ProxyAccount = {
+    id: 'apikey-probe',
+    accessToken: apiKey,
+    authMethod: 'api_key',
+    provider: 'ApiKey',
+    region
+  }
+  const url = `${getKiroManagementHost(region)}/`
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${apiKey}`,
+    'Content-Type': 'application/x-amz-json-1.0',
+    'X-Amz-Target': 'AmazonCodeWhispererService.GetProfile',
+    'TokenType': TOKEN_TYPE_API_KEY,
+    'x-amzn-codewhisperer-optout': 'false',
+    'User-Agent': getKiroUserAgent(),
+    'x-amz-user-agent': getKiroAmzUserAgent(),
+    'amz-sdk-invocation-id': uuidv4(),
+    'amz-sdk-request': 'attempt=1; max=1'
+  }
+  const response = await fetchWithProxy(url, { method: 'POST', headers, body: '{}' }, account)
+  const text = await response.text().catch(() => '')
+  if (!response.ok) {
+    throw new Error(`GetProfile 失败: HTTP ${response.status} ${text.slice(0, 300)}`)
+  }
+  let data: { profile?: { arn?: string; profileName?: string; status?: string; profileType?: string } }
+  try {
+    data = JSON.parse(text)
+  } catch {
+    throw new Error(`GetProfile 返回非 JSON: ${text.slice(0, 200)}`)
+  }
+  const arn = data.profile?.arn
+  if (!arn) {
+    throw new Error(`GetProfile 响应缺少 profile.arn: ${text.slice(0, 200)}`)
+  }
+  return {
+    profileArn: arn,
+    profileName: data.profile?.profileName,
+    status: data.profile?.status,
+    profileType: data.profile?.profileType
+  }
+}
 
 // Agentic 模式系统提示 - 防止大文件写入超时
 const AGENTIC_SYSTEM_PROMPT = `# CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)
@@ -473,6 +569,13 @@ function applyPayloadOrigin(payload: KiroPayload, origin: string): void {
   for (const message of payload.conversationState.history ?? []) {
     if (message.userInputMessage) message.userInputMessage.origin = origin
   }
+}
+
+// 网页 API Key(ksk_)账户：kiro-cli headless 抓包证据——generate 请求 origin 必须是 KIRO_CLI
+// （用 AI_EDITOR 会被 V2 host 拒 403 not authorized）；其它账户用端点自带 origin。
+function resolveEffectiveOrigin(account: ProxyAccount, endpointOrigin: string): string {
+  if (account.authMethod === 'api_key' || account.provider === 'ApiKey') return 'KIRO_CLI'
+  return endpointOrigin
 }
 
 // 检测是否为 Agentic 模式请求
@@ -1274,6 +1377,16 @@ function getAuthHeaders(account: ProxyAccount, endpoint: typeof KIRO_ENDPOINTS[0
     'X-Amz-Target': endpoint.amzTarget
   }
 
+  // 网页 API Key(ksk_)账户：V2 host 对 API_KEY 授权校验 UA，必须用 AmazonQ-For-CLI UA（否则 403）；
+  // 且 stream target 用 V1 命名 AmazonCodeWhispererStreamingService.*（KiroRuntimeService.* 会 403 not authorized）。
+  if (account.authMethod === 'api_key' || account.provider === 'ApiKey') {
+    headers['user-agent'] = KIRO_CLI_USER_AGENT
+    headers['x-amz-user-agent'] = KIRO_CLI_AMZ_USER_AGENT
+    if (headers['X-Amz-Target']?.startsWith('KiroRuntimeService.')) {
+      headers['X-Amz-Target'] = headers['X-Amz-Target'].replace('KiroRuntimeService.', 'AmazonCodeWhispererStreamingService.')
+    }
+  }
+
   return headers
 }
 
@@ -1355,8 +1468,17 @@ export async function callKiroApiStream(
   // region 选 KiroRuntime EU/US endpoint,避免"SSO 在 US、profile 挂 EU"的账户被
   // 路由到错端点后 400 "Improperly formed request"。
   // Fix:6ab368b 只修了 verify/GetUsageLimits,stream 阶段仍用 account.region — 本轮补齐。
-  const dataPlaneRegion = parseRegionFromProfileArn(account.profileArn) || account.region
+  const parsedArnRegion = parseRegionFromProfileArn(account.profileArn)
+  const dataPlaneRegion = parsedArnRegion || account.region
   const endpoints = getSortedEndpoints(preferredEndpoint, dataPlaneRegion)
+
+  // [DIAG] 端点路由诊断(排查"切到 US2 后间歇性 400":暴露是哪个账户/arn/region 被路由到哪个端点)
+  if (kiroApiDebugEnabled) {
+    console.log(`[KiroAPI][DIAG] Route plan | account=${account.email || account.id || 'unknown'} provider=${account.provider ?? '?'} authMethod=${account.authMethod ?? '?'}`)
+    console.log(`[KiroAPI][DIAG]   account.region=${account.region ?? 'undef'} | parsedArnRegion=${parsedArnRegion ?? 'null'} | dataPlaneRegion(used)=${dataPlaneRegion ?? 'undef'}`)
+    console.log(`[KiroAPI][DIAG]   profileArn=${account.profileArn ?? 'undef'}`)
+    console.log(`[KiroAPI][DIAG]   preferredEndpoint=${preferredEndpoint ?? 'none'} | endpoint plan=[${endpoints.map(e => e.name).join(' > ')}]`)
+  }
 
   let lastError: Error | null = null
 
@@ -1375,7 +1497,7 @@ export async function callKiroApiStream(
         applyPayloadModelId(requestPayload, await resolveCodeWhispererModelId(account, requestedModelId, signal))
       }
 
-      applyPayloadOrigin(requestPayload, endpoint.origin)
+      applyPayloadOrigin(requestPayload, resolveEffectiveOrigin(account, endpoint.origin))
 
       // AmazonQCLI 端点不支持 agentContinuationId/agentTaskType
       if (endpoint.name === 'AmazonQCLI') {
@@ -1397,6 +1519,11 @@ export async function callKiroApiStream(
       console.log(`[KiroAPI]   - History tool uses/results: ${historyToolUseCount}/${historyToolResultCount}`)
       console.log(`[KiroAPI]   - Model ID: ${currentUserInput?.modelId || 'default'}`)
       console.log(`[KiroAPI]   - Has profileArn: ${requestPayload.profileArn !== undefined}`)
+      if (kiroApiDebugEnabled) {
+        console.log(`[KiroAPI][DIAG]   - endpoint.url=${endpoint.url}`)
+        console.log(`[KiroAPI][DIAG]   - resolvedProfileArn=${resolvedArn ?? 'undef'}`)
+        console.log(`[KiroAPI][DIAG]   - TokenType=${headers['TokenType'] ?? 'n/a'} | effectiveOrigin=${resolveEffectiveOrigin(account, endpoint.origin)}`)
+      }
       console.log(`[KiroAPI]   - Agent mode: ${headers['x-amzn-kiro-agent-mode']}`)
       console.log(`[KiroAPI]   - Payload size: ${payloadStr.length} bytes`)
       if (requestPayload.additionalModelRequestFields && Object.keys(requestPayload.additionalModelRequestFields).length > 0) {
@@ -1449,6 +1576,12 @@ export async function callKiroApiStream(
         throwIfAborted(signal)
         const body = await response.text()
         throwIfAborted(signal)
+        // [DIAG] 记录失败端点完整上下文,便于定位跨端点/region/账户切换后的 400
+        if (kiroApiDebugEnabled) {
+          console.error(`[KiroAPI][DIAG] Non-OK ${response.status} from ${endpoint.name} (${endpoint.url}) | account=${account.email || account.id || '?'}`)
+          console.error(`[KiroAPI][DIAG]   dataPlaneRegion=${dataPlaneRegion} account.region=${account.region} resolvedArn=${resolvedArn ?? 'undef'} TokenType=${headers['TokenType'] ?? 'n/a'}`)
+          console.error(`[KiroAPI][DIAG]   body: ${body}`)
+        }
         throw new Error(`API error ${response.status}: ${body}`)
       }
 
@@ -1496,7 +1629,7 @@ export async function callKiroApiStream(
           if (endpoint.name === 'CodeWhisperer') {
             applyPayloadModelId(retryPayload, await resolveCodeWhispererModelId(account, getPayloadModelId(retryPayload), signal))
           }
-          applyPayloadOrigin(retryPayload, endpoint.origin)
+          applyPayloadOrigin(retryPayload, resolveEffectiveOrigin(account, endpoint.origin))
           const retryStr = JSON.stringify(retryPayload)
           const retryHeaders = getAuthHeaders(account, endpoint)
           const retryAgent = getNetworkAgent(account)

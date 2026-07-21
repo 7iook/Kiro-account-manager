@@ -1378,6 +1378,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     if (!account) return false
 
+    // 网页 API Key(ksk_)账户无 token 刷新概念(静态长凭证)：委托到 checkAccountStatus 刷新额度。
+    if (account.credentials.authMethod === 'api_key' || account.credentials.provider === 'ApiKey') {
+      await get().checkAccountStatus(id)
+      return true
+    }
+
     updateAccountStatus(id, 'refreshing')
 
     try {
@@ -1510,6 +1516,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     if (!account) return
 
+    // 网页 API Key(ksk_)账户：静态凭证无 token 刷新,但 getUsageLimits(TokenType: API_KEY)可拉真实额度/订阅/邮箱。
+    // 走正常路径 —— 主进程 check-account-status 对 api_key 已有专属分支(仅额度,不刷 token,不误标封禁)。
+
     // 设置刷新状态，提供视觉反馈
     updateAccountStatus(id, 'refreshing')
 
@@ -1631,7 +1640,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     for (const id of ids) {
       const account = accounts.get(id)
       if (!account?.credentials.accessToken) continue
-      
+
       accountsToCheck.push({
         id,
         email: account.email,
@@ -1710,7 +1719,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         Internal: 0,
         IAM_SSO: 0,
         AzureAD: 0,
-        ExternalIdp: 0
+        ExternalIdp: 0,
+        ApiKey: 0
       },
       activeCount: 0,
       expiringSoonCount: 0,

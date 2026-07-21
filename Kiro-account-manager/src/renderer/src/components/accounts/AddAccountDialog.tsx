@@ -63,11 +63,11 @@ interface VerifiedData {
   expiresAt?: number
 }
 
-type ImportMode = 'oidc' | 'sso' | 'login'
+type ImportMode = 'oidc' | 'sso' | 'login' | 'apikey'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso' | 'externalidp'
 
 export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): React.ReactNode {
-  const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab } = useAccountsStore()
+  const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab, checkAccountStatus } = useAccountsStore()
 
   // 检查账户是否已存在
   //   主键: userId (强前提, 相同即重复)
@@ -105,6 +105,12 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const [region, setRegion] = useState('us-east-1')
   const [authMethod, setAuthMethod] = useState<'IdC' | 'social'>('IdC')
   const [provider, setProvider] = useState('BuilderId')  // 'BuilderId', 'Enterprise', 'Github', 'Google'
+
+  // 网页 API Key(ksk_)导入
+  const [apiKeyInput, setApiKeyInput] = useState('')
+  const [apiKeyRegion, setApiKeyRegion] = useState('us-east-1')
+  const [apiKeyImporting, setApiKeyImporting] = useState(false)
+  const [apiKeyResult, setApiKeyResult] = useState<{ total: number; success: number; failed: number; errors: string[] } | null>(null)
 
   // SSO Token 导入
   const [ssoToken, setSsoToken] = useState('')
@@ -1321,6 +1327,107 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     }
   }
 
+  // 网页 API Key(ksk_)导入：每行一个,逐行调 verify-api-key 走 GetProfile 拿 profileArn，通过才导入。
+  // ksk 是静态长凭证：无 refreshToken/expiry，profileArn 导入时解析并持久化。
+  // 导入后立即触发 checkAccountStatus（getUsageLimits + TokenType: API_KEY）拉真实额度/订阅/邮箱。
+  const handleApiKeyImport = async () => {
+    // 每行一个 ksk_；支持单个或批量。逐行校验(GetProfile) → 导入 → 后台触发额度刷新。
+    const rawLines = apiKeyInput
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0)
+    // 去重
+    const keys = Array.from(new Set(rawLines))
+    if (keys.length === 0) {
+      setError(isEn ? 'Please paste the API Key (ksk_...)' : '请粘贴 API Key（ksk_ 开头，每行一个）')
+      return
+    }
+    setError(null)
+    setApiKeyResult(null)
+    setApiKeyImporting(true)
+    const errors: string[] = []
+    const newIds: string[] = []
+    let success = 0
+    try {
+      for (const key of keys) {
+        const short = `${key.slice(0, 8)}…${key.slice(-4)}`
+        if (!key.startsWith('ksk_')) {
+          errors.push(`${short}: ${isEn ? 'must start with ksk_' : '格式错误(应以 ksk_ 开头)'}`)
+          continue
+        }
+        try {
+          const result = await window.api.verifyApiKey({ apiKey: key, region: apiKeyRegion })
+          if (!result.success || !result.profileArn) {
+            errors.push(`${short}: ${result.error || (isEn ? 'verification failed' : '校验失败')}`)
+            continue
+          }
+          const dataRegion = result.region || apiKeyRegion
+          // profileArn 尾段作为稳定 userId；无 email，用 profileName 或 key 尾 6 位做展示名
+          const arnTail = result.profileArn.split('/').pop() || result.profileArn.slice(-12)
+          const displayName = result.profileName || `API Key ${key.slice(-6)}`
+          if (isAccountExists('', arnTail, 'ApiKey', result.profileArn)) {
+            errors.push(`${short}: ${isEn ? 'already exists' : '账户已存在'}`)
+            continue
+          }
+          const now = Date.now()
+          const newId = addAccount({
+            email: '',
+            userId: arnTail,
+            nickname: displayName,
+            idp: 'ApiKey',
+            groupId: selectedGroupId,
+            profileArn: result.profileArn,
+            credentials: {
+              accessToken: key,
+              csrfToken: '',
+              refreshToken: '',
+              region: dataRegion,
+              // ksk 永不过期：设一个很远的到期时间，避免自动刷新/过期判定误触发
+              expiresAt: now + 100 * 365 * 24 * 3600 * 1000,
+              authMethod: 'api_key',
+              provider: 'ApiKey',
+              profileArn: result.profileArn
+            },
+            subscription: {
+              type: 'Pro' as SubscriptionType,
+              title: result.profileType ? `API Key · ${result.profileType}` : 'API Key'
+            },
+            // 额度占位；导入后立即触发 checkAccountStatus 拉真实额度/订阅/邮箱
+            usage: {
+              current: 0,
+              limit: 0,
+              percentUsed: 0,
+              lastUpdated: now
+            },
+            tags: [],
+            status: 'active',
+            lastUsedAt: now
+          })
+          newIds.push(newId)
+          success++
+        } catch (e) {
+          errors.push(`${short}: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      }
+
+      // 后台触发额度刷新（getUsageLimits + TokenType: API_KEY），账户列表会随各自返回而更新
+      newIds.forEach((id) => {
+        void checkAccountStatus(id)
+      })
+
+      if (keys.length === 1 && success === 1) {
+        // 单个成功：直接关闭
+        resetForm()
+        onClose()
+        return
+      }
+      setApiKeyResult({ total: keys.length, success, failed: keys.length - success, errors })
+      if (success > 0) setApiKeyInput('')
+    } finally {
+      setApiKeyImporting(false)
+    }
+  }
+
   const resetForm = () => {
     setImportMode('login')
     setRefreshToken('')
@@ -1330,6 +1437,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setAuthMethod('IdC')
     setProvider('BuilderId')
     setSsoToken('')
+    setApiKeyInput('')
+    setApiKeyRegion('us-east-1')
+    setApiKeyResult(null)
+    setApiKeyImporting(false)
     setVerifiedData(null)
     setError(null)
     // 清理登录状态
@@ -1383,7 +1494,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             </div>
           )}
           {/* 导入模式切换 */}
-          <div className="grid grid-cols-3 gap-1 p-1 bg-muted/50 rounded-xl border">
+          <div className="grid grid-cols-4 gap-1 p-1 bg-muted/50 rounded-xl border">
             <button
               className={`py-2 px-3 text-sm rounded-lg transition-all duration-200 font-medium ${
                 importMode === 'login' 
@@ -1417,7 +1528,69 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             >
               SSO Token
             </button>
+            <button
+              className={`py-2 px-3 text-sm rounded-lg transition-all duration-200 font-medium ${
+                importMode === 'apikey'
+                  ? 'bg-background text-foreground shadow-sm ring-1 ring-black/5'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
+              }`}
+              onClick={() => { setImportMode('apikey'); setError(null) }}
+              disabled={!!verifiedData || isLoggingIn}
+            >
+              API Key
+            </button>
           </div>
+
+          {/* 网页 API Key(ksk_)模式 */}
+          {importMode === 'apikey' && !verifiedData && (
+            <div className="space-y-4">
+              <div className="p-3 rounded-lg bg-primary/[0.06] border border-primary/15 text-xs text-muted-foreground leading-relaxed">
+                {isEn
+                  ? 'Paste API Keys generated at app.kiro.dev (Account → API Keys, starts with ksk_), one per line for batch import. Static long-lived credentials (no token refresh, never expire). Usage/subscription/email are fetched via GetUsageLimits and refresh with the account\'s Refresh button.'
+                  : '粘贴在 app.kiro.dev 生成的 API Key（账户页 → API Keys，ksk_ 开头）。每行一个可批量导入。它是静态长期凭证（无需刷新 token、不过期）。额度/订阅/邮箱通过 GetUsageLimits 获取，点账户"刷新"即刷新额度。'}
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">{isEn ? 'API Key(s) — one per line' : 'API Key（每行一个）'}</label>
+                <textarea
+                  className="w-full min-h-[120px] px-3 py-2 text-sm rounded-lg border bg-background resize-y font-mono"
+                  placeholder={'ksk_...\nksk_...\nksk_...'}
+                  value={apiKeyInput}
+                  onChange={(e) => { setApiKeyInput(e.target.value); setApiKeyResult(null) }}
+                  disabled={apiKeyImporting}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">{isEn ? 'Region' : '区域'}</label>
+                <Select
+                  className="w-full"
+                  value={apiKeyRegion}
+                  onChange={(v) => setApiKeyRegion(v)}
+                  options={[
+                    { value: 'us-east-1', label: 'us-east-1' },
+                    { value: 'eu-central-1', label: 'eu-central-1' }
+                  ]}
+                />
+              </div>
+              {error && <p className="text-sm text-destructive">{error}</p>}
+              {apiKeyResult && (
+                <div className={`p-3 rounded-lg text-sm ${apiKeyResult.failed > 0 ? 'bg-warning/10 border border-warning/30' : 'bg-success/10 border border-success/30'}`}>
+                  <p className={`font-medium ${apiKeyResult.failed > 0 ? 'text-warning' : 'text-success'}`}>
+                    {isEn ? `Imported ${apiKeyResult.success}/${apiKeyResult.total}` : `导入结果: 成功 ${apiKeyResult.success}/${apiKeyResult.total}`}
+                  </p>
+                  {apiKeyResult.errors.length > 0 && (
+                    <ul className="mt-1.5 space-y-0.5 text-xs text-muted-foreground max-h-32 overflow-auto">
+                      {apiKeyResult.errors.map((err, i) => (
+                        <li key={i} className="font-mono">{err}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+              <Button className="w-full" onClick={handleApiKeyImport} disabled={apiKeyImporting || !apiKeyInput.trim()}>
+                {apiKeyImporting ? (isEn ? 'Verifying...' : '校验中...') : (isEn ? 'Verify & Import' : '校验并导入')}
+              </Button>
+            </div>
+          )}
 
           {/* 登录模式 */}
           {importMode === 'login' && !verifiedData && (

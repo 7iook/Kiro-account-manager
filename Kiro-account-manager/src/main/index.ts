@@ -16,7 +16,7 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setAgentMode, KNOWN_CW_REGIONS, resolveApiKeyProfileArn, type KiroProfile } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setAgentMode, KNOWN_CW_REGIONS, resolveApiKeyProfileArn, isKiroApiDebug, type KiroProfile } from './proxy/kiroApi'
 import { resolveProfileArnForVerify, buildCompleteLoginResult } from './proxy/profile-selection'
 import {
   writeKiroAuthTokenFile,
@@ -1325,8 +1325,12 @@ async function fetchRestApi(
   // TokenType 分发(2026-07 迁移铁律 · 与 kiroApi.fetchEnterpriseProfileArn 保持一致):
   // - external_idp (Azure AD) → 'EXTERNAL_IDP' 走外部 IdP 校验路径
   // - 其他(IdC/BuilderId/Social) → 'SSO_OIDC' 走 AWS SSO OIDC 校验路径
+  // - api_key (网页 ksk_) → 'API_KEY' 走 key→profile 查找路径
+  //   实测(2026-07-21):getUsageLimits?profileArn=... + TokenType: API_KEY 返 200 完整额度(currentUsage/usageLimit/subscriptionInfo/userInfo)。
+  //   注:之前"额度对 API_KEY 返 403"的判断把不存在的 CBOR GetUsage RPC(400 UnknownOperation)与可用的 REST getUsageLimits 混淆了。
   // 后端在 2026-07 迁移后开始严格校验 TokenType header,缺 header 被当 legacy 拒 403 "Invalid token"
-  headers['TokenType'] = authMethod === 'external_idp' ? 'EXTERNAL_IDP' : 'SSO_OIDC'
+  headers['TokenType'] =
+    authMethod === 'external_idp' ? 'EXTERNAL_IDP' : authMethod === 'api_key' ? 'API_KEY' : 'SSO_OIDC'
   const url = `${baseUrl}${path}`
   if (agent) {
     return await undiciFetch(url, {
@@ -1374,10 +1378,25 @@ async function getUsageLimitsRest(
     params.set('profileArn', profileArn)
   }
   const path = `/getUsageLimits?${params.toString()}`
-  
-  // 根据 SSO 区域选择主端点
-  const primaryBase = getRestApiBase(ssoRegion)
-  const fallbackBase = getFallbackRestApiBase(ssoRegion)
+
+  // 跨 region 账户修复:host 必须按 profileArn 的真实数据面 region 选,而非 account.region(ssoRegion)。
+  // 与 stream 路径(kiroApi.callKiroApiStream 的 dataPlaneRegion)保持一致的 SSOT。
+  // Bug 现场:account.region=us-east-2 但 profile 在 eu-central-1 → 用 ssoRegion 选 us 主机 403 →
+  //          回退 q.us-east-1 → 400 "Improperly formed request"(间歇性,每次用量刷新都触发)。
+  // 此处覆盖所有走 getUsageAndLimits → getUsageLimitsRest 的调用方(check-status/批量/verify/订阅)。
+  // ⚠️ 仅对"真实" profileArn 生效:社交固定 ARN(KIRO_SOCIAL_PROFILE_ARN)与 BuilderId 占位 ARN
+  //    恒为 us-east-1,不代表账户真实 region,必须排除,否则 EU 社交/BuilderId 账户被误路由到 us 而 403。
+  const isFixedOrPlaceholderArn =
+    !!profileArn && (isPlaceholderProfileArn(profileArn) || profileArn === KIRO_SOCIAL_PROFILE_ARN)
+  const arnRegion = isFixedOrPlaceholderArn ? undefined : parseRegionFromProfileArn(profileArn)
+  const effectiveRegion = arnRegion || ssoRegion
+  if (effectiveRegion !== ssoRegion && isKiroApiDebug()) {
+    console.log(`[Kiro REST API] GetUsageLimits [${logTag}] region override: ssoRegion=${ssoRegion} → dataPlaneRegion=${effectiveRegion} (from profileArn)`)
+  }
+
+  // 根据数据面 region 选择主端点
+  const primaryBase = getRestApiBase(effectiveRegion)
+  const fallbackBase = getFallbackRestApiBase(effectiveRegion)
   
   let response = await fetchRestApi(primaryBase, path, accessToken, machineId, authMethod)
 
@@ -3814,6 +3833,22 @@ app.whenReady().then(async () => {
 
       // 获取账户绑定的设备 ID
       const accountMachineId = account?.machineId as string | undefined
+
+      // 网页 API Key(ksk_)账户：静态长凭证,无 token 刷新概念。
+      // getUserInfo(CBOR/控制面)对 API_KEY 返 403 噪音,故跳过;仅走 getUsageLimits(REST + TokenType: API_KEY)
+      // 拉取额度/订阅/邮箱(实测 2026-07-21 返 200 完整数据)。userInfo 由 getUsageLimits 响应内的 userInfo 提供。
+      if (authMethod === 'api_key' || provider === 'ApiKey') {
+        const usageResult = await getUsageAndLimits(
+          accessToken,
+          idp,
+          account?.profileArn,
+          accountMachineId,
+          region,
+          account?.email,
+          authMethod
+        )
+        return parseUsageResponse(usageResult, undefined, undefined)
+      }
 
       // 第一次尝试：使用当前 accessToken
       try {

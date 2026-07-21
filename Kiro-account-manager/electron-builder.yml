@@ -12,8 +12,13 @@ files:
   # 严禁打入的开发/敏感产物(泄漏账户数据风险):
   - '!.agent-workspace/**'
   - '!.codegraph/**'
+  - '!.ace-tool/**'
   - '!_dev.log'
   - '!*.log'
+  - '!build-win.log'
+  - '!*.backup'
+  - '!app_config*.json'
+  - '!*.tsbuildinfo'
   - '!test/**'
   - '!docs/**'
   - '!scripts/**'
