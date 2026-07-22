@@ -715,7 +715,7 @@ interface KiroApi {
   proxyRemoveAccount: (accountId: string) => Promise<{ success: boolean; accountCount?: number; error?: string }>
 
   // 同步账号到反代池（批量更新）
-  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string; tokenEndpoint?: string; issuerUrl?: string; scopes?: string }>) => Promise<{ success: boolean; accountCount?: number; error?: string }>
+  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string; tokenEndpoint?: string; issuerUrl?: string; scopes?: string; groupId?: string; weight?: number }>) => Promise<{ success: boolean; accountCount?: number; error?: string }>
 
   // 获取反代池账号列表
   proxyGetAccounts: () => Promise<{ accounts: unknown[]; availableCount: number }>
@@ -725,6 +725,12 @@ interface KiroApi {
 
   // 手动解除账号封禁标记
   proxyClearAccountSuspended: (accountId: string) => Promise<{ success: boolean; error?: string }>
+
+  // v1.7.6 能力路由 · 手动触发全池能力同步(冷启动/加账号后/手动刷新)
+  proxySyncCapabilities: () => Promise<{ success: boolean; total?: number; ok?: number; failed?: number; error?: string }>
+
+  // v1.7.6 查询能力同步进行中状态
+  proxyCapabilitySyncStatus: () => Promise<{ inflight: boolean }>
 
   // 刷新模型缓存
   proxyRefreshModels: () => Promise<{ success: boolean; error?: string }>

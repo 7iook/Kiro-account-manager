@@ -827,6 +827,16 @@ const api = {
     return ipcRenderer.invoke('proxy-clear-account-suspended', accountId)
   },
 
+  // v1.7.6 能力路由 · 手动触发全池能力同步
+  proxySyncCapabilities: (): Promise<{ success: boolean; total?: number; ok?: number; failed?: number; error?: string }> => {
+    return ipcRenderer.invoke('proxy-sync-capabilities')
+  },
+
+  // v1.7.6 查询能力同步进行中状态
+  proxyCapabilitySyncStatus: (): Promise<{ inflight: boolean }> => {
+    return ipcRenderer.invoke('proxy-capability-sync-status')
+  },
+
   // 刷新模型缓存
   proxyRefreshModels: (): Promise<{ success: boolean; error?: string }> => {
     return ipcRenderer.invoke('proxy-refresh-models')

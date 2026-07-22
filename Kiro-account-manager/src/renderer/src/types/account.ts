@@ -134,6 +134,9 @@ export interface Account {
   createdAt: number
   lastUsedAt: number
   lastCheckedAt?: number // 上次状态检查时间
+
+  // v1.7.6 SWRR 权重(整数,0-1000,默认 100)。0 = 临时下线不参与轮询
+  weight?: number
 }
 
 /**

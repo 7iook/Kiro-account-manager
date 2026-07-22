@@ -1,6 +1,7 @@
 // 多账号智能轮询管理器
 // 参考 Kiro Gateway 的 Circuit Breaker + Sticky + 指数退避 + 概率重试机制
 import type { ProxyAccount, AccountStats } from './types'
+import { SmoothWeightedRoundRobin } from '../utils/smoothWeightedRoundRobin'
 
 // 错误类型分类（决定 failover 策略）
 export enum ErrorType {
@@ -43,7 +44,7 @@ const DEFAULT_CONFIG: AccountPoolConfig = {
   probabilisticRetryChance: 0.1 // 10% 概率重试
 }
 
-export type AccountSelectionStrategy = 'round-robin' | 'sticky'
+export type AccountSelectionStrategy = 'round-robin' | 'sticky' | 'weighted'
 
 export class AccountPool {
   private accounts: Map<string, ProxyAccount> = new Map()
@@ -52,7 +53,13 @@ export class AccountPool {
   private config: AccountPoolConfig
   // 默认 round-robin: 每次成功后指针前进 (满足负载均衡期望)
   // sticky: 一个账号成功就粘住 (保留 prompt cache 命中)
+  // weighted: SWRR 加权轮询 (按 account.weight 字段按比例分流)
   private strategy: AccountSelectionStrategy = 'round-robin'
+  // SWRR instance (仅 strategy='weighted' 使用，持久化累积 credit)
+  private swrr: SmoothWeightedRoundRobin<ProxyAccount> = new SmoothWeightedRoundRobin({
+    getId: (a) => a.id,
+    getWeight: (a) => (typeof a.weight === 'number' ? a.weight : 100)
+  })
 
   constructor(config: Partial<AccountPoolConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config }
@@ -102,6 +109,7 @@ export class AccountPool {
   removeAccount(accountId: string): void {
     this.accounts.delete(accountId)
     this.accountStats.delete(accountId)
+    this.swrr.forget(accountId)
     console.log(`[AccountPool] Removed account: ${accountId}`)
   }
 
@@ -494,12 +502,14 @@ export class AccountPool {
       })
     }
     this.currentIndex = 0
+    this.swrr.reset()
   }
 
   // 清空所有账号
   clear(): void {
     this.accounts.clear()
     this.accountStats.clear()
+    this.swrr.reset()
     this.currentIndex = 0
   }
 
@@ -518,5 +528,105 @@ export class AccountPool {
       }
     }
     return count
+  }
+
+  // ============ v1.7.6 新增: 权重 SWRR + 三态能力状态机 ============
+
+  /**
+   * SWRR 加权挑选:从给定候选中按 weight 字段(默认 100)分配
+   * 与 round-robin/sticky 平行的第三种策略,不改动 currentIndex
+   * @returns 挑中的账号;候选空 或 全 0 权重 返回 null
+   */
+  pickWeighted(candidates: readonly ProxyAccount[]): ProxyAccount | null {
+    return this.swrr.pick(candidates)
+  }
+
+  /**
+   * 按 modelId 前置过滤账号池,返回三类:
+   *   candidates: 已确认支持该 model 的账号(可直接路由)
+   *   unknownAccounts: 未同步 或 无该 model 记录的账号(未知态,配合 probe-once 使用)
+   *   unsupportedCount: 已明确 unsupported 的账号数(仅用于日志/统计)
+   *
+   * @param allowedIds 可选白名单(API Key 绑定 / group filter);为空表示不限制
+   */
+  filterByModel(modelId: string, allowedIds?: Set<string>): {
+    candidates: ProxyAccount[]
+    unknownAccounts: ProxyAccount[]
+    unsupportedCount: number
+  } {
+    const candidates: ProxyAccount[] = []
+    const unknownAccounts: ProxyAccount[] = []
+    let unsupportedCount = 0
+
+    for (const account of this.accounts.values()) {
+      if (allowedIds && !allowedIds.has(account.id)) continue
+      // 用户手工强制排除
+      if (account.excludedModels && account.excludedModels.includes(modelId)) {
+        unsupportedCount++
+        continue
+      }
+      const cap = account.modelCapabilities?.[modelId]
+      if (cap === 'confirmed') {
+        candidates.push(account)
+      } else if (cap === 'unsupported') {
+        unsupportedCount++
+      } else {
+        unknownAccounts.push(account)
+      }
+    }
+    return { candidates, unknownAccounts, unsupportedCount }
+  }
+
+  /**
+   * 应用 ListAvailableModels 同步结果.
+   * - status='ok': 把 models 里出现的每个 modelId 标 'confirmed';**不主动写 unsupported**
+   *   (API 短暂漂移 / 服务端分批 rollout 都会让某次同步少返回某些 model, 不能据此判 unsupported)
+   * - status='failed': 只更新 lastListModelsStatus,能力标记保持原值不变
+   */
+  applyModelListResult(accountId: string, models: string[], status: 'ok' | 'failed'): void {
+    const account = this.accounts.get(accountId)
+    if (!account) return // 账号已删除, 静默丢弃
+
+    const now = Date.now()
+    if (status === 'failed') {
+      this.accounts.set(accountId, {
+        ...account,
+        lastListModelsAt: now,
+        lastListModelsStatus: 'failed'
+      })
+      return
+    }
+    // status = 'ok': 合并 confirmed(不删除任何已有 unsupported 标记, 除非 models 里显式包含它 → 覆盖为 confirmed)
+    const caps: Record<string, 'confirmed' | 'unsupported'> = { ...(account.modelCapabilities || {}) }
+    for (const m of models) {
+      caps[m] = 'confirmed'
+    }
+    this.accounts.set(accountId, {
+      ...account,
+      modelCapabilities: caps,
+      lastListModelsAt: now,
+      lastListModelsStatus: 'ok'
+    })
+  }
+
+  /** Runtime 反哺:stream 成功后升级 confirmed */
+  markModelConfirmed(accountId: string, modelId: string): void {
+    const account = this.accounts.get(accountId)
+    if (!account) return
+    const caps = { ...(account.modelCapabilities || {}) }
+    if (caps[modelId] === 'confirmed') return // 幂等
+    caps[modelId] = 'confirmed'
+    this.accounts.set(accountId, { ...account, modelCapabilities: caps })
+  }
+
+  /** Runtime 反哺:stream 返 "unsupported model" 时降级 */
+  markModelUnsupported(accountId: string, modelId: string): void {
+    const account = this.accounts.get(accountId)
+    if (!account) return
+    const caps = { ...(account.modelCapabilities || {}) }
+    if (caps[modelId] === 'unsupported') return
+    caps[modelId] = 'unsupported'
+    this.accounts.set(accountId, { ...account, modelCapabilities: caps })
+    console.log(`[AccountPool] Account ${account.email || accountId} marked UNSUPPORTED for ${modelId}`)
   }
 }

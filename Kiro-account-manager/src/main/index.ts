@@ -16,7 +16,7 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setAgentMode, KNOWN_CW_REGIONS, resolveApiKeyProfileArn, isKiroApiDebug, type KiroProfile } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setTokenRefreshCallbackForModelFetch, setAccountModelSyncCallback, setAgentMode, KNOWN_SSO_OIDC_REGIONS, resolveApiKeyProfileArn, isKiroApiDebug, type KiroProfile } from './proxy/kiroApi'
 import { resolveProfileArnForVerify, buildCompleteLoginResult } from './proxy/profile-selection'
 import {
   writeKiroAuthTokenFile,
@@ -599,6 +599,53 @@ function initProxyServer(): ProxyServer {
     }
   })
 
+  // v1.7.6 fetchKiroModels 403 自愈: token 刷新回调
+  // fetchKiroModels 拿到 403 时先调这个回调尝试刷 token,而不是直接落 catalog(§附录 A Bug 4)
+  setTokenRefreshCallbackForModelFetch(async (account) => {
+    if (!account.refreshToken) return { ok: false }
+    try {
+      console.log(`[ModelFetchRefresh] Refreshing token for ${account.email || account.id}`)
+      const result = await refreshTokenByMethod(
+        account.refreshToken,
+        account.clientId || '',
+        account.clientSecret || '',
+        account.region || 'us-east-1',
+        account.authMethod,
+        account.proxyUrl,
+        { tokenEndpoint: account.tokenEndpoint, scopes: account.scopes }
+      )
+      if (result.success && result.accessToken) {
+        // 同步回写账号池(与 onTokenRefresh 类似,但由 model fetch 触发)
+        const expiresAt = Date.now() + (result.expiresIn || 3600) * 1000
+        proxyServer?.getAccountPool().updateAccount(account.id, {
+          accessToken: result.accessToken,
+          refreshToken: result.refreshToken || account.refreshToken,
+          expiresAt
+        })
+        mainWindow?.webContents.send('proxy-account-update', {
+          id: account.id,
+          accessToken: result.accessToken,
+          refreshToken: result.refreshToken,
+          expiresAt
+        })
+        return { ok: true, accessToken: result.accessToken, refreshToken: result.refreshToken, expiresAt }
+      }
+      return { ok: false }
+    } catch (e) {
+      console.warn('[ModelFetchRefresh] threw:', e instanceof Error ? e.message : e)
+      return { ok: false }
+    }
+  })
+
+  // v1.7.6 fetchKiroModels 结束后能力反哺回调 —— 把 modelId 列表灌进 accountPool.modelCapabilities
+  setAccountModelSyncCallback((accountId, models, status) => {
+    try {
+      proxyServer?.getAccountPool().applyModelListResult(accountId, models, status)
+    } catch (e) {
+      console.warn('[AccountModelSync] applyModelListResult failed:', e instanceof Error ? e.message : e)
+    }
+  })
+
   // 恢复保存的累计 credits
   if (savedTotalCredits > 0) {
     proxyServer.setTotalCredits(savedTotalCredits)
@@ -746,7 +793,9 @@ async function refreshOidcToken(
 
   const result = await refreshOidcTokenAcrossRegions(refreshToken, clientId, clientSecret, region, {
     fetcher: fetchWithAppProxy,
-    regions: KNOWN_CW_REGIONS,
+    // SSO OIDC 在每个 AWS region 有独立实例(含 us-east-2 等),不受 CW 数据面二选一限制。
+    // 要 CW 数据面 region 请用 KNOWN_CW_DATA_REGIONS;这里确定属 SSO 用途。
+    regions: KNOWN_SSO_OIDC_REGIONS,
     proxyUrl
   })
 
@@ -2529,7 +2578,10 @@ function createWindow(): void {
                 tokenEndpoint: acc.credentials?.tokenEndpoint,
                 issuerUrl: acc.credentials?.issuerUrl,
                 scopes: acc.credentials?.scopes,
-                proxyUrl: buildProxyUrl(acc.id)
+                proxyUrl: buildProxyUrl(acc.id),
+                // v1.7.6 SWRR 权重(缺省 100)
+                weight: typeof acc.weight === 'number' ? acc.weight : 100,
+                groupId: acc.groupId
               }
             })
           if (proxyAccounts.length > 0) {
@@ -5691,7 +5743,7 @@ app.whenReady().then(async () => {
     const http = await import('http')
     
     // RegisterClient 跨 region 自动重试:AWS SSO OIDC 拒 "Invalid start url" 通常
-    // 意味着 start URL 对应的 IdC 实例不在传入 region,自动切 KNOWN_CW_REGIONS 里
+    // 意味着 start URL 对应的 IdC 实例不在传入 region,自动切 KNOWN_SSO_OIDC_REGIONS 里
     // 其他 region 再试;成功时 oidcBase / region 都同步更新,后续 authorize URL +
     // token exchange 也用该 region。
     // RCA: .agent-workspace/.archive/2026-07-16/oidc-refresh-cross-region/
@@ -5736,7 +5788,9 @@ app.whenReady().then(async () => {
     try {
       // Step 1: 注册 OIDC 客户端 (使用 authorization_code grant type)
       console.log('[Login] Step 1: Registering OIDC client, primary region:', region)
-      const probeRegions: string[] = [region, ...KNOWN_CW_REGIONS.filter((r) => r !== region)]
+      // SSO OIDC RegisterClient 也需跨 region 探测:startUrl 对应的 IdC 实例可能在任何 AWS region
+      // (包括 us-east-2),早期用 KNOWN_CW_DATA_REGIONS 只能探 us-east-1 / eu-central-1 两个,会遗漏
+      const probeRegions: string[] = [region, ...KNOWN_SSO_OIDC_REGIONS.filter((r) => r !== region)]
       let successCtx: { oidcBase: string; region: string; regRes: Response } | null = null
       let lastFailure: { status: number; errText: string; region: string } | null = null
       for (let i = 0; i < probeRegions.length; i++) {
@@ -7412,6 +7466,28 @@ app.whenReady().then(async () => {
       console.error('[ProxyServer] Reset pool failed:', error)
       return { success: false, error: error instanceof Error ? error.message : 'Failed to reset pool' }
     }
+  })
+
+  // IPC: v1.7.6 能力路由 · 手动触发全池能力同步(冷启动 / 加账号后 / 手动刷新)
+  // 前端在打开 enableModelCapabilityRouting 或点"立即同步"按钮时调用
+  // 幂等:多次同时调用会共用同一 in-flight Promise
+  ipcMain.handle('proxy-sync-capabilities', async () => {
+    try {
+      if (!proxyServer) {
+        return { success: false, error: 'Proxy server not running' }
+      }
+      const result = await proxyServer.syncCapabilities()
+      return { success: true, ...result }
+    } catch (error) {
+      console.error('[ProxyServer] Manual capability sync failed:', error)
+      return { success: false, error: error instanceof Error ? error.message : 'sync failed' }
+    }
+  })
+
+  // IPC: 查询能力同步是否在进行中(供 UI 显示 loading 状态)
+  ipcMain.handle('proxy-capability-sync-status', () => {
+    if (!proxyServer) return { inflight: false }
+    return { inflight: proxyServer.isCapabilityBootstrapInflight() }
   })
 
   // IPC: 手动解除账号封禁标记（用户确认账号已恢复后调用）

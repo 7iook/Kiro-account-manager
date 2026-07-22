@@ -416,6 +416,17 @@ export interface ProxyAccount {
   suspendedAt?: number       // 封禁时间戳
   suspendReason?: string     // 封禁原因 (如 'TEMPORARILY_SUSPENDED')
   suspendMessage?: string    // 封禁完整错误消息 (含联系链接)
+  // ============ v1.7.6 新增: 权重 + 三态能力 ============
+  /** 权重(整数,≥ 0,默认 100)。SWRR 加权轮询使用。0 = 临时下线(不参与选负但保留在池) */
+  weight?: number
+  /** per-model 能力标记。key = kiro modelId, value = 'confirmed'|'unsupported'。key 不存在 = unknown */
+  modelCapabilities?: Record<string, 'confirmed' | 'unsupported'>
+  /** ListAvailableModels 最后一次同步时间戳 (ms) */
+  lastListModelsAt?: number
+  /** 上次同步结果: 'ok' | 'failed' (用于陈旧警告) */
+  lastListModelsStatus?: 'ok' | 'failed'
+  /** 用户手工强制排除的 model(即便 API 报告支持),用于过滤 API 假信号 */
+  excludedModels?: string[]
 }
 
 // API Key 格式类型
@@ -525,7 +536,8 @@ export interface ProxyConfig {
   // 多账号选择策略 (仅 enableMultiAccount=true 时生效)
   // - round-robin: 每次请求成功后切到下一个账号 (默认, 负载均衡)
   // - sticky: 一个账号成功就粘住, 直到失败才切换 (保留 prompt cache, 牺牲均衡)
-  accountSelectionStrategy?: 'round-robin' | 'sticky'
+  // - weighted: SWRR 加权轮询 (按账号 weight 字段按比例分流,箭紧行业同款算法)
+  accountSelectionStrategy?: 'round-robin' | 'sticky' | 'weighted'
   // 多账号轮询范围 (仅 enableMultiAccount=true 时生效)
   // - 'all': 使用所有 active 账号（默认）
   // - 'groups': 仅使用 multiAccountGroupIds 选中分组的账号；可包含特殊值 '__ungrouped__' 表示未分组账号
@@ -573,6 +585,17 @@ export interface ProxyConfig {
   agentMode?: 'vibe' | 'spec'
   /** 工作区路径：用于读取 .kiro/steering/*.md 规则文件注入到 system prompt */
   workspacePath?: string
+
+  // ============ v1.7.6 新增: 能力路由 ============
+  /** 能力路由总开关(默认 false,升级零行为变化) */
+  enableModelCapabilityRouting?: boolean
+  /** 能力未知时策略:
+   * - strict: 直接 400 "no account confirmed to support X"
+   * - probe-once: 从 unknown 中挑一个试探,成功升 confirmed / 失败降 unsupported
+   * 默认 'strict' */
+  capabilityUnknownPolicy?: 'strict' | 'probe-once'
+  /** 能力同步周期(ms,默认 3600000 = 1h)。fetchKiroModels 后台同步间隔 */
+  modelCapabilitySyncIntervalMs?: number
 }
 
 export interface TlsConfig {

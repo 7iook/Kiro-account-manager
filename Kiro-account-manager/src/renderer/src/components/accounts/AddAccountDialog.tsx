@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { Button, Card, CardContent, CardHeader, CardTitle, Input, Label, Select } from '../ui'
+import { Button, Card, CardContent, CardHeader, CardTitle, Input, Label, Select, AwsRegionSelect } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { SubscriptionType } from '@/types/account'
@@ -1828,56 +1828,14 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                       </div>
                       <div className="space-y-2">
                         <Label htmlFor="ssoRegion" className="text-sm font-medium">{isEn ? 'SSO Region' : 'SSO 区域'}</Label>
-                        <div className="flex gap-2">
-                          <select
-                            id="ssoRegion"
-                            value={['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-central-1', 'eu-north-1', 'eu-south-1', 'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3', 'ap-southeast-1', 'ap-southeast-2', 'ap-south-1', 'ap-east-1', 'ca-central-1', 'sa-east-1', 'me-south-1', 'af-south-1'].includes(region) ? region : 'custom'}
-                            onChange={(e) => {
-                              if (e.target.value !== 'custom') setRegion(e.target.value)
-                            }}
-                            className="flex-1 h-10 px-3 rounded-md border border-foreground/15 bg-[var(--glass-bg)] backdrop-blur-md text-sm shadow-sm transition-all hover:border-foreground/25 focus:outline-none focus:border-primary/50 focus:ring-2 focus:ring-primary/30"
-                          >
-                            <optgroup label="US">
-                              <option value="us-east-1">us-east-1 (N. Virginia)</option>
-                              <option value="us-east-2">us-east-2 (Ohio)</option>
-                              <option value="us-west-1">us-west-1 (N. California)</option>
-                              <option value="us-west-2">us-west-2 (Oregon)</option>
-                            </optgroup>
-                            <optgroup label="Europe">
-                              <option value="eu-west-1">eu-west-1 (Ireland)</option>
-                              <option value="eu-west-2">eu-west-2 (London)</option>
-                              <option value="eu-west-3">eu-west-3 (Paris)</option>
-                              <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
-                              <option value="eu-north-1">eu-north-1 (Stockholm)</option>
-                              <option value="eu-south-1">eu-south-1 (Milan)</option>
-                            </optgroup>
-                            <optgroup label="Asia Pacific">
-                              <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
-                              <option value="ap-northeast-2">ap-northeast-2 (Seoul)</option>
-                              <option value="ap-northeast-3">ap-northeast-3 (Osaka)</option>
-                              <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
-                              <option value="ap-southeast-2">ap-southeast-2 (Sydney)</option>
-                              <option value="ap-south-1">ap-south-1 (Mumbai)</option>
-                              <option value="ap-east-1">ap-east-1 (Hong Kong)</option>
-                            </optgroup>
-                            <optgroup label="Other">
-                              <option value="ca-central-1">ca-central-1 (Canada)</option>
-                              <option value="sa-east-1">sa-east-1 (São Paulo)</option>
-                              <option value="me-south-1">me-south-1 (Bahrain)</option>
-                              <option value="af-south-1">af-south-1 (Cape Town)</option>
-                            </optgroup>
-                            <optgroup label={isEn ? 'Custom' : '自定义'}>
-                              <option value="custom">{isEn ? '-- Custom Input --' : '-- 自定义输入 --'}</option>
-                            </optgroup>
-                          </select>
-                          <input
-                            type="text"
-                            value={region}
-                            onChange={(e) => setRegion(e.target.value)}
-                            placeholder={isEn ? 'e.g., cn-north-1' : '例如: cn-north-1'}
-                            className="w-32 h-10 px-3 rounded-md border border-foreground/15 bg-[var(--glass-bg)] backdrop-blur-md text-sm shadow-sm transition-all hover:border-foreground/25 focus:outline-none focus:border-primary/50 focus:ring-2 focus:ring-primary/30"
-                          />
-                        </div>
+                        <AwsRegionSelect
+                          value={region}
+                          onChange={setRegion}
+                          id="ssoRegion"
+                          className="rounded-md border-foreground/15 bg-[var(--glass-bg)] backdrop-blur-md shadow-sm transition-all hover:border-foreground/25 focus:border-primary/50 focus:ring-2 focus:ring-primary/30"
+                          customInputWidth="w-32"
+                          customInputClassName="rounded-md border-foreground/15 bg-[var(--glass-bg)] backdrop-blur-md shadow-sm transition-all hover:border-foreground/25 focus:border-primary/50 focus:ring-2 focus:ring-primary/30"
+                        />
                       </div>
                       <Button 
                         className="w-full"
@@ -2051,55 +2009,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
                 <div className="space-y-2">
                   <label className="text-sm font-medium">AWS Region</label>
-                  <div className="flex gap-2">
-                    <select
-                      className="flex-1 h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-                      value={['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-central-1', 'eu-north-1', 'eu-south-1', 'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3', 'ap-southeast-1', 'ap-southeast-2', 'ap-south-1', 'ap-east-1', 'ca-central-1', 'sa-east-1', 'me-south-1', 'af-south-1'].includes(region) ? region : 'custom'}
-                      onChange={(e) => {
-                        if (e.target.value !== 'custom') setRegion(e.target.value)
-                      }}
-                    >
-                      <optgroup label="US">
-                        <option value="us-east-1">us-east-1 (N. Virginia)</option>
-                        <option value="us-east-2">us-east-2 (Ohio)</option>
-                        <option value="us-west-1">us-west-1 (N. California)</option>
-                        <option value="us-west-2">us-west-2 (Oregon)</option>
-                      </optgroup>
-                      <optgroup label="Europe">
-                        <option value="eu-west-1">eu-west-1 (Ireland)</option>
-                        <option value="eu-west-2">eu-west-2 (London)</option>
-                        <option value="eu-west-3">eu-west-3 (Paris)</option>
-                        <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
-                        <option value="eu-north-1">eu-north-1 (Stockholm)</option>
-                        <option value="eu-south-1">eu-south-1 (Milan)</option>
-                      </optgroup>
-                      <optgroup label="Asia Pacific">
-                        <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
-                        <option value="ap-northeast-2">ap-northeast-2 (Seoul)</option>
-                        <option value="ap-northeast-3">ap-northeast-3 (Osaka)</option>
-                        <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
-                        <option value="ap-southeast-2">ap-southeast-2 (Sydney)</option>
-                        <option value="ap-south-1">ap-south-1 (Mumbai)</option>
-                        <option value="ap-east-1">ap-east-1 (Hong Kong)</option>
-                      </optgroup>
-                      <optgroup label="Other">
-                        <option value="ca-central-1">ca-central-1 (Canada)</option>
-                        <option value="sa-east-1">sa-east-1 (São Paulo)</option>
-                        <option value="me-south-1">me-south-1 (Bahrain)</option>
-                        <option value="af-south-1">af-south-1 (Cape Town)</option>
-                      </optgroup>
-                      <optgroup label={isEn ? 'Custom' : '自定义'}>
-                        <option value="custom">{isEn ? '-- Custom --' : '-- 自定义 --'}</option>
-                      </optgroup>
-                    </select>
-                    <input
-                      type="text"
-                      value={region}
-                      onChange={(e) => setRegion(e.target.value)}
-                      placeholder={isEn ? 'e.g., cn-north-1' : '例如: cn-north-1'}
-                      className="w-28 h-10 px-2 text-sm rounded-xl border border-input bg-background/50"
-                    />
-                  </div>
+                  <AwsRegionSelect value={region} onChange={setRegion} />
                 </div>
               </div>
 
@@ -2289,55 +2199,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
                         <div className="space-y-2">
                           <label className="text-sm font-medium">AWS Region</label>
-                          <div className="flex gap-2">
-                            <select
-                              className="flex-1 h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-                              value={['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-central-1', 'eu-north-1', 'eu-south-1', 'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3', 'ap-southeast-1', 'ap-southeast-2', 'ap-south-1', 'ap-east-1', 'ca-central-1', 'sa-east-1', 'me-south-1', 'af-south-1'].includes(region) ? region : 'custom'}
-                              onChange={(e) => {
-                                if (e.target.value !== 'custom') setRegion(e.target.value)
-                              }}
-                            >
-                              <optgroup label="US">
-                                <option value="us-east-1">us-east-1 (N. Virginia)</option>
-                                <option value="us-east-2">us-east-2 (Ohio)</option>
-                                <option value="us-west-1">us-west-1 (N. California)</option>
-                                <option value="us-west-2">us-west-2 (Oregon)</option>
-                              </optgroup>
-                              <optgroup label="Europe">
-                                <option value="eu-west-1">eu-west-1 (Ireland)</option>
-                                <option value="eu-west-2">eu-west-2 (London)</option>
-                                <option value="eu-west-3">eu-west-3 (Paris)</option>
-                                <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
-                                <option value="eu-north-1">eu-north-1 (Stockholm)</option>
-                                <option value="eu-south-1">eu-south-1 (Milan)</option>
-                              </optgroup>
-                              <optgroup label="Asia Pacific">
-                                <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
-                                <option value="ap-northeast-2">ap-northeast-2 (Seoul)</option>
-                                <option value="ap-northeast-3">ap-northeast-3 (Osaka)</option>
-                                <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
-                                <option value="ap-southeast-2">ap-southeast-2 (Sydney)</option>
-                                <option value="ap-south-1">ap-south-1 (Mumbai)</option>
-                                <option value="ap-east-1">ap-east-1 (Hong Kong)</option>
-                              </optgroup>
-                              <optgroup label="Other">
-                                <option value="ca-central-1">ca-central-1 (Canada)</option>
-                                <option value="sa-east-1">sa-east-1 (São Paulo)</option>
-                                <option value="me-south-1">me-south-1 (Bahrain)</option>
-                                <option value="af-south-1">af-south-1 (Cape Town)</option>
-                              </optgroup>
-                              <optgroup label={isEn ? 'Custom' : '自定义'}>
-                                <option value="custom">{isEn ? '-- Custom --' : '-- 自定义 --'}</option>
-                              </optgroup>
-                            </select>
-                            <input
-                              type="text"
-                              value={region}
-                              onChange={(e) => setRegion(e.target.value)}
-                              placeholder={isEn ? 'e.g., cn-north-1' : '例如: cn-north-1'}
-                              className="w-28 h-10 px-2 text-sm rounded-xl border border-input bg-background/50"
-                            />
-                          </div>
+                          <AwsRegionSelect value={region} onChange={setRegion} />
                         </div>
                       </>
                     )}

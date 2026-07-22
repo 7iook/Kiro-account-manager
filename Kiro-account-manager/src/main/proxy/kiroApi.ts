@@ -43,6 +43,21 @@ export function setProfileArnPersistCallback(cb: ProfileArnPersistCallback | und
   profileArnPersistCallback = cb
 }
 
+// v1.7.6 fetchKiroModels 自愈闭环:
+// 1) token 刷新回调 —— 403 时先尝试 refresh(可用 refreshToken 的账号),避免 catalog fallback 误吞刷 token 就能解决的问题
+type ModelFetchTokenRefreshCallback = (account: ProxyAccount) => Promise<{ ok: boolean; accessToken?: string; refreshToken?: string; expiresAt?: number }>
+let modelFetchTokenRefreshCallback: ModelFetchTokenRefreshCallback | undefined
+export function setTokenRefreshCallbackForModelFetch(cb: ModelFetchTokenRefreshCallback | undefined): void {
+  modelFetchTokenRefreshCallback = cb
+}
+
+// 2) 模型同步结果回调 —— fetchKiroModels 结束后无论成功失败都通知,让 accountPool 更新 modelCapabilities 三态标记
+type AccountModelSyncCallback = (accountId: string, models: string[], status: 'ok' | 'failed') => void
+let accountModelSyncCallback: AccountModelSyncCallback | undefined
+export function setAccountModelSyncCallback(cb: AccountModelSyncCallback | undefined): void {
+  accountModelSyncCallback = cb
+}
+
 export function setLogStreamEvents(enabled: boolean): void {
   logStreamEvents = enabled
 }
@@ -2642,50 +2657,50 @@ export interface KiroModel {
   availableOrigins?: string[] | null
 }
 
-// ============ 跨账户共享模型 catalog(2026-07 迁移) ============
+// ============ 跨账户共享模型 catalog(仅 UI 展示兜底,禁止用于能力路由) ============
 //
-// 背景:AWS 端 IdC provisioning 限制导致某些账户(如 eu-central-1 IdC)accessToken
-// 无法通过 management.us-east-1.kiro.dev 的 controlplane 校验(403 Invalid token),
-// 即使换任何 profileArn 也一样;而同一账户的 stream API(runtime.*.kiro.dev)则完全通过。
+// **用途(唯一合法):** 账户凭据/权限故障时保障 GET /v1/models 不空白,UI 至少能显示"曾经拉到过的完整模型清单".
+// **与 region 无关**、**与账户能力路由无关**.
 //
-// 策略:任何账户 fetchKiroModels 成功 → 写入此模块级缓存;
-//        后续失败账户 → 读缓存,让用户至少能看到“KAC 里已知的完整模型清单”。
-// NEVER 硬编码模型清单(过时/不真实/无 rate multiplier/context window 等元数据)。
+// 🚫 **禁止**用于账户能力路由决策: 跨账户 catalog 会把 A 账户支持的模型错误当成 B 账户的能力信号,
+// 导致 gpt-5.6 请求路由到 eu profile 的账户 → stream 端 unsupported → 用户明确禁止的错误码兜底路径.
+// 能力路由请使用 ProxyAccount.modelCapabilities 三态标记(confirmed/unsupported/unknown).
+// 详见 .agent-workspace/.archive/2026-07-22/account-weighted-capability-routing/decision-card.md 附录 A Bug 3.
 //
-// 实测(2026-07-12):us 账户 GET /ListAvailableModels 返 15 个真实模型
-// (含 claude-sonnet-5/opus-4.8/rate multiplier/context window 完整元数据);
-// eu 账户 403,回落此共享 catalog 显示同样 15 个,反代 stream 依然可用。
+// 架构闸门(test/main/architecture/no_shared_catalog_in_routing.test.ts)硬拒 accountPool.ts / proxyServer.ts
+// 的路由代码引用本 catalog(handleModels 白名单例外,那里合法拼接 UI 模型清单).
 //
-// TTL 30 min:模型 catalog 变化频率低于单账户缓存的 5 min,给用户提供更稳定 UI。
-// 详见 .agent-workspace/.archive/2026-07-12/kiro-endpoint-migration/*-rca.md
+// TTL 30 min:模型 catalog 变化频率低于单账户缓存的 5 min,给用户提供更稳定 UI.
+// 详见 .agent-workspace/.archive/2026-07-12/kiro-endpoint-migration/*-rca.md(2026-07 迁移原始 RCA)
 
-interface SharedModelCatalog {
+interface SharedModelCatalogForUI {
   models: KiroModel[]
   timestamp: number
   sourceEmail?: string  // 来源账户,用于日志和潜在的 UI 提示
 }
 const SHARED_MODEL_CATALOG_TTL_MS = 30 * 60 * 1000
-let sharedModelCatalog: SharedModelCatalog | null = null
+let sharedModelCatalogForUI: SharedModelCatalogForUI | null = null
 
-function getSharedModelCatalog(): SharedModelCatalog | null {
-  if (!sharedModelCatalog) return null
-  if (Date.now() - sharedModelCatalog.timestamp > SHARED_MODEL_CATALOG_TTL_MS) return null
-  return sharedModelCatalog
+function getSharedModelCatalogForUI(): SharedModelCatalogForUI | null {
+  if (!sharedModelCatalogForUI) return null
+  if (Date.now() - sharedModelCatalogForUI.timestamp > SHARED_MODEL_CATALOG_TTL_MS) return null
+  return sharedModelCatalogForUI
 }
 
-function setSharedModelCatalog(models: KiroModel[], account: ProxyAccount): void {
+function setSharedModelCatalogForUI(models: KiroModel[], account: ProxyAccount): void {
   if (!models || models.length === 0) return
-  sharedModelCatalog = {
+  sharedModelCatalogForUI = {
     models: models.map(m => ({ ...m })),
     timestamp: Date.now(),
     sourceEmail: account.email
   }
-  console.log(`[KiroAPI] Shared model catalog updated: ${models.length} models from ${account.email || account.id.slice(0, 8)}`)
+  console.log(`[KiroAPI] Shared model catalog (UI-only) updated: ${models.length} models from ${account.email || account.id.slice(0, 8)}`)
 }
 
-/** 外部可读(供其它模块如 UI 层使用),返回当前共享 catalog 的 clone 或 null */
+/** 外部可读(供 UI 层使用),返回当前共享 catalog 的 clone 或 null.
+ * ⚠ **禁止用于账户能力路由决策**,只允许 UI 展示层(如 GET /v1/models handleModels)合并使用. */
 export function getSharedModelCatalogSnapshot(): KiroModel[] | null {
-  const shared = getSharedModelCatalog()
+  const shared = getSharedModelCatalogForUI()
   return shared ? shared.models.map(m => ({ ...m })) : null
 }
 
@@ -2718,8 +2733,48 @@ export function parseRegionFromProfileArn(arn: string | undefined | null): strin
   return undefined
 }
 
-/** 已知 CodeWhisperer profile 可能存在的 region 集合(用于跨 region 探测) */
-export const KNOWN_CW_REGIONS: readonly string[] = ['us-east-1', 'eu-central-1']
+/**
+ * 已知 CodeWhisperer 数据面 profile 可能存在的 region 集合。
+ *
+ * ⚠️ **仅用于数据面 API**(CodeWhisperer profile / ListAvailableProfiles /
+ * ListAvailableModels / streaming endpoints)—— CW 数据面官方 rollout 只在
+ * us-east-1 (N. Virginia) 和 eu-central-1 (Frankfurt) 两个 region。
+ *
+ * ❌ **禁止**用于 SSO OIDC token refresh / RegisterClient —— AWS IAM Identity
+ * Center 在每个 AWS region 有独立 OIDC 实例(如 us-east-2),不受此二选一
+ * 限制。SSO OIDC 场景请用 {@link KNOWN_SSO_OIDC_REGIONS}。
+ *
+ * 混用历史证据:.agent-workspace/.archive/2026-07-22/account-weighted-capability-routing/
+ * (sso=us-east-2 账户 token 过期后 refresh 跨 region fallback 探不到 us-east-2 → 永久失活)
+ */
+export const KNOWN_CW_DATA_REGIONS: readonly string[] = ['us-east-1', 'eu-central-1']
+
+/**
+ * AWS IAM Identity Center / SSO OIDC 已知 region 全集(全 AWS 商用 region)。
+ *
+ * ✅ **用于**:`oidc.{region}.amazonaws.com/token` 刷 token / `client/register`
+ *              等 SSO OIDC 端点,以及本项目 IAM SSO Authorization Code flow
+ *              主 region 拒绝时的跨 region fallback 探测。
+ *
+ * 与 `src/renderer/src/lib/awsRegions.ts`(前端 UI SSOT)保持 21-region 同步。
+ * 新增 AWS region 时两处一起改。
+ */
+export const KNOWN_SSO_OIDC_REGIONS: readonly string[] = [
+  'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2',
+  'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-central-1',
+  'eu-north-1', 'eu-south-1',
+  'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3',
+  'ap-southeast-1', 'ap-southeast-2', 'ap-south-1', 'ap-east-1',
+  'ca-central-1', 'sa-east-1', 'me-south-1', 'af-south-1'
+]
+
+/**
+ * @deprecated 语义歧义,请显式选用:
+ *   - 数据面 API(CW profile / models / stream) → {@link KNOWN_CW_DATA_REGIONS}
+ *   - SSO OIDC(token refresh / client register) → {@link KNOWN_SSO_OIDC_REGIONS}
+ * 保留 alias 仅为兼容早期外部 import;新代码禁止使用。
+ */
+export const KNOWN_CW_REGIONS: readonly string[] = KNOWN_CW_DATA_REGIONS
 
 /** 单次 region 尝试:200 返数组(可能空);非 200 返 null 表示这个 region 拒了 */
 async function tryListProfilesAt(
@@ -2771,9 +2826,9 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
   // 获取该账号类型对应的备用 ARN(403 时兜底,避免每次请求都重复尝试)
   const fallbackArn = resolveProfileArn(account)
 
-  // 探测顺序:account.region 优先,其他已知 CW region 兜底(去重)
+  // 探测顺序:account.region 优先,其他已知 CW 数据面 region 兜底(去重)
   const primaryRegion = account.region || 'us-east-1'
-  const probeRegions = [primaryRegion, ...KNOWN_CW_REGIONS.filter(r => r !== primaryRegion)]
+  const probeRegions = [primaryRegion, ...KNOWN_CW_DATA_REGIONS.filter(r => r !== primaryRegion)]
   console.log(`[KiroAPI] fetchEnterpriseProfileArn probe order: [${probeRegions.join(', ')}]`)
 
   let lastAccessDenied = false
@@ -2860,10 +2915,11 @@ export async function fetchEnterpriseProfiles(
 
   // 跨 region 探测:同一 SSO 账户组织可能同时挂 us-east-1 + eu-central-1 两个 Kiro Profile,
   // 老代码只用 account.region 单 region 探,第二个 region 的 profile 永远拿不到。
-  // 修法(6ab368b 提交的未修变体登记债务清理):跨 KNOWN_CW_REGIONS 并行探,合并去重。
+  // 修法(6ab368b 提交的未修变体登记债务清理):跨 KNOWN_CW_DATA_REGIONS 并行探,合并去重。
   // 主 region(account.region 或默认 us-east-1)优先,其他 region 补充。
+  // 注:数据面 CW profile region 严格二选一,不与 SSO OIDC region 集合混用(见常量定义 JSDoc)。
   const primaryRegion = account.region || 'us-east-1'
-  const probeRegions: string[] = [primaryRegion, ...KNOWN_CW_REGIONS.filter((r) => r !== primaryRegion)]
+  const probeRegions: string[] = [primaryRegion, ...KNOWN_CW_DATA_REGIONS.filter((r) => r !== primaryRegion)]
 
   interface RegionResult {
     region: string
@@ -2990,6 +3046,12 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
     }
   }
 
+  // ============ v1.7.6 fetchKiroModels 自愈闭环(§附录 A Bug 4) ============
+  // 403 → 先尝试 token refresh → 再尝试 Enterprise profileArn 自愈 → 最后才落 catalog(仅 UI 兜底)
+  // 顺序不允许调换:catalog 是最弱兜底,先自愈能救回来的账号
+  let attemptedRefresh = false
+  let attemptedArnHeal = false
+
   try {
     do {
       const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
@@ -3000,6 +3062,9 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
       //   - Enterprise → 真实 ARN（上方已自愈获取）
       if (arnForModels) params.set('profileArn', arnForModels)
       if (nextToken) params.set('nextToken', nextToken)
+
+      // 每次请求都用最新 accessToken (自愈刷新可能改了)
+      headers['Authorization'] = `Bearer ${account.accessToken}`
 
       const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
       // 诊断日志:临时打印请求上下文(修 eu-central-1 刷模型问题用,验证通过后可移除)
@@ -3028,12 +3093,52 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
           errBody: errBody.slice(0, 500),
           responseHeaders: Object.fromEntries(response.headers.entries())
         })
-        // 2026-07 迁移:单账户失败(如 eu IdC provisioning 限制)→ 读跨账户共享 catalog
-        // (由其它成功账户填充,例如同一 KAC 里的 us 账户)
+
+        // ============ v1.7.6 403 自愈闭环(顺序 = token refresh → arn heal → catalog) ============
+        if (response.status === 403 && allModels.length === 0) {
+          // 1) Token 刷新: 有 refreshToken 且未试过 → 刷新 + 重试(不 break, 继续 do-while)
+          if (!attemptedRefresh && account.refreshToken && modelFetchTokenRefreshCallback) {
+            attemptedRefresh = true
+            console.warn('[KiroAPI] 403 detected, attempting token refresh before catalog fallback')
+            try {
+              const refreshResult = await modelFetchTokenRefreshCallback(account)
+              if (refreshResult.ok && refreshResult.accessToken) {
+                account.accessToken = refreshResult.accessToken
+                if (refreshResult.refreshToken) account.refreshToken = refreshResult.refreshToken
+                if (refreshResult.expiresAt) account.expiresAt = refreshResult.expiresAt
+                console.log('[KiroAPI] Token refreshed, retrying ListAvailableModels')
+                continue // 重试当前迭代
+              }
+              console.warn('[KiroAPI] Token refresh failed, moving to ARN heal')
+            } catch (e) {
+              console.warn('[KiroAPI] Token refresh threw:', e instanceof Error ? e.message : e)
+            }
+          }
+          // 2) profileArn 自愈: Enterprise 账号 arn 可能失效 → 重新 fetch
+          if (!attemptedArnHeal && isEnterprise) {
+            attemptedArnHeal = true
+            console.warn('[KiroAPI] Attempting Enterprise profileArn heal')
+            try {
+              const fetchedArn = await fetchEnterpriseProfileArn(account)
+              if (fetchedArn && fetchedArn !== account.profileArn) {
+                account.profileArn = fetchedArn
+                if (account.id) profileArnPersistCallback?.(account.id, fetchedArn)
+                console.log(`[KiroAPI] profileArn healed to ${fetchedArn}, retrying`)
+                continue // 重试当前迭代
+              }
+              console.warn('[KiroAPI] profileArn heal returned same/empty ARN')
+            } catch (e) {
+              console.warn('[KiroAPI] fetchEnterpriseProfileArn threw:', e instanceof Error ? e.message : e)
+            }
+          }
+        }
+
+        // 3) 自愈都失败(或非 403) → catalog 兜底(仅 UI),同时通知能力路由该账号同步失败
         if (allModels.length === 0) {
-          const shared = getSharedModelCatalog()
+          accountModelSyncCallback?.(account.id, [], 'failed')
+          const shared = getSharedModelCatalogForUI()
           if (shared) {
-            console.warn(`[KiroAPI] Fetch failed, using shared catalog (${shared.models.length} models from ${shared.sourceEmail})`)
+            console.warn(`[KiroAPI] Fetch failed after self-heal attempts, using shared catalog for UI (${shared.models.length} models from ${shared.sourceEmail}). NOTE: 此数据仅用于 UI 展示,能力路由不采信.`)
             return shared.models.map(m => ({ ...m }))
           }
           console.warn('[KiroAPI] Fetch failed and no shared catalog available; returning empty list (UI 将提示先用其它账户刷一次)')
@@ -3046,9 +3151,11 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
       nextToken = data.nextToken
     } while (nextToken)
 
-    // 2026-07 迁移:成功 fetch → 写入跨账户共享 catalog(供其它 fetch 失败的账户读取)
+    // 2026-07 迁移:成功 fetch → 写入跨账户共享 catalog(仅 UI 兜底,能力路由不采信)
     if (allModels.length > 0) {
-      setSharedModelCatalog(allModels, account)
+      setSharedModelCatalogForUI(allModels, account)
+      // v1.7.6 能力反哺:成功返回 → 通知 accountPool 更新 modelCapabilities
+      accountModelSyncCallback?.(account.id, allModels.map(m => m.modelId), 'ok')
     }
     return allModels
   } catch (error) {
@@ -3056,9 +3163,10 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
     console.error('[KiroAPI] ListAvailableModels error:', error)
     // 2026-07 迁移:网络错误/host 不可达时 → 读跨账户共享 catalog
     if (allModels.length === 0) {
-      const shared = getSharedModelCatalog()
+      accountModelSyncCallback?.(account.id, [], 'failed')
+      const shared = getSharedModelCatalogForUI()
       if (shared) {
-        console.warn(`[KiroAPI] Network error, using shared catalog (${shared.models.length} models from ${shared.sourceEmail})`)
+        console.warn(`[KiroAPI] Network error, using shared catalog for UI (${shared.models.length} models from ${shared.sourceEmail}). NOTE: 此数据仅用于 UI 展示,能力路由不采信.`)
         return shared.models.map(m => ({ ...m }))
       }
     }

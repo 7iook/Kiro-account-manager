@@ -19,6 +19,7 @@ import type {
   ProxySessionRecord
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
+import { SmoothWeightedRoundRobin } from '../utils/smoothWeightedRoundRobin'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
@@ -267,6 +268,8 @@ export class ProxyServer {
   private sessionStats: { totalRequests: number; successRequests: number; failedRequests: number; credits: number; inputTokens: number; outputTokens: number; startTime: number }
   private events: ProxyServerEvents
   private refreshingTokens: Map<string, Promise<boolean>> = new Map() // 在途刷新去重（并发方共享同一结果）
+  /** v1.7.6 probe-once: 单账户 × 单模型的探测锁,key=`${accountId}:${modelId}`,防并发爆量 */
+  private modelProbeInflight: Map<string, number> = new Map()
   private isHttps: boolean = false
   private isStopping: boolean = false
   private activeRequests: Set<AbortController> = new Set()
@@ -283,6 +286,8 @@ export class ProxyServer {
   private cleanupTimer: NodeJS.Timeout | null = null
   /** 会话快照 tick timer（每 60s 把 in-progress session 写入 store，防强杀/崩溃丢失） */
   private sessionSnapshotTimer: NodeJS.Timeout | null = null
+  /** modelMapping loadbalance 的 SWRR instance,每 rule 一个,持久到 this 保持累积状态 */
+  private modelMappingSwrr: Map<string, SmoothWeightedRoundRobin<{ id: string; target: string; weight: number }>> = new Map()
 
   /**
    * 从请求中提取 session hint，用于稳定 conversationId
@@ -504,6 +509,14 @@ export class ProxyServer {
           startTime: Date.now()
         }
         this.events.onStatusChange?.(true, this.config.port)
+        // v1.7.6 能力路由 cold-start bootstrap: 反代启动 + 能力路由开关打开 → fire-and-forget 全池同步
+        // 不 await, 让 start() resolve 后 UI 立即可用; 同步完成前请求走 filterByModel 会看到 unknown,
+        // strict 政策 400 提示同步中, probe-once 政策会试探. 决策卡 §5 承诺兑现
+        if (this.config.enableModelCapabilityRouting && this.accountPool.size > 0) {
+          this.syncCapabilities().catch((e) => {
+            proxyLogger.warn('ProxyServer', `Bootstrap capability sync failed: ${e instanceof Error ? e.message : e}`)
+          })
+        }
         resolve()
       })
 
@@ -652,10 +665,20 @@ export class ProxyServer {
       proxyLogger.warn('ProxyServer', `Config change requires restart: ${restartTriggerFields.filter(k => k in config).join(', ')}`)
     }
     this.appendAuditLog('config_changed', { fields: Object.keys(config), needsRestart: willRestart })
+    // v1.7.6 检测能力路由开关 off→on,fire-and-forget 触发一次全池同步
+    // 用户从 UI 打开开关不需要重启反代即可让能力信息就位;strict 从 400 变可路由需要这一步
+    const enableWasOff = !this.config.enableModelCapabilityRouting
+    const enableNowOn = config.enableModelCapabilityRouting === true
     this.config = { ...this.config, ...config }
     // 同步账号选择策略到 accountPool
     if (config.accountSelectionStrategy !== undefined) {
       this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
+    }
+    if (enableWasOff && enableNowOn && this.isRunning() && this.accountPool.size > 0) {
+      proxyLogger.info('ProxyServer', 'Capability routing turned ON → kick off bootstrap sync')
+      this.syncCapabilities().catch((e) => {
+        proxyLogger.warn('ProxyServer', `Bootstrap capability sync failed: ${e instanceof Error ? e.message : e}`)
+      })
     }
   }
 
@@ -860,6 +883,66 @@ export class ProxyServer {
   getAccountPool(): AccountPool {
     return this.accountPool
   }
+
+  // v1.7.6 能力路由 cold-start bootstrap
+  // 并发对池内所有账号跑 fetchKiroModels,把 modelCapabilities 一次性填满
+  // 触发时机:①反代 start() 后 (若 enableModelCapabilityRouting) ②updateConfig 检测到开关 off→on
+  //           ③IPC proxy-sync-capabilities 前端手动/自动调用
+  // 决策卡 §5 承诺"首次触发全池后台同步";此方法是它的实现
+  //
+  // 返回 { total, ok, failed } · fire-and-forget 时不 await 结果
+  // 每账号超时 20s (fetchKiroModels 内部已有 signal 支持,但没暴露 timeout);
+  // 并发上限 5 (避免同时炸 20+ 请求触发风控)
+  private capabilityBootstrapInflight: Promise<{ total: number; ok: number; failed: number }> | null = null
+
+  async syncCapabilities(): Promise<{ total: number; ok: number; failed: number }> {
+    // 全局幂等锁:多个入口同时触发时复用同一 Promise
+    if (this.capabilityBootstrapInflight) {
+      return this.capabilityBootstrapInflight
+    }
+    const run = async (): Promise<{ total: number; ok: number; failed: number }> => {
+      const accounts = this.accountPool.getAllAccounts()
+      if (accounts.length === 0) return { total: 0, ok: 0, failed: 0 }
+      proxyLogger.info('ProxyServer', `Capability bootstrap: syncing ${accounts.length} accounts...`)
+
+      let ok = 0
+      let failed = 0
+      const CONCURRENCY = 5
+      // 简单的分批并发,避免同时挤爆
+      for (let i = 0; i < accounts.length; i += CONCURRENCY) {
+        const batch = accounts.slice(i, i + CONCURRENCY)
+        const results = await Promise.allSettled(
+          batch.map(async (acc) => {
+            try {
+              // fetchKiroModels 内部会调 accountModelSyncCallback → applyModelListResult
+              // 也会走 403 自愈闭环 (refresh → arn heal → catalog UI fallback)
+              await fetchKiroModels(acc)
+              return true
+            } catch (e) {
+              proxyLogger.warn('ProxyServer', `Capability sync failed for ${acc.email || acc.id.slice(0, 8)}: ${e instanceof Error ? e.message : e}`)
+              return false
+            }
+          })
+        )
+        for (const r of results) {
+          if (r.status === 'fulfilled' && r.value) ok++
+          else failed++
+        }
+      }
+      proxyLogger.info('ProxyServer', `Capability bootstrap done: ${ok}/${accounts.length} synced, ${failed} failed`)
+      return { total: accounts.length, ok, failed }
+    }
+    this.capabilityBootstrapInflight = run().finally(() => {
+      this.capabilityBootstrapInflight = null
+    })
+    return this.capabilityBootstrapInflight
+  }
+
+  /** 是否有能力同步任务在跑(供 UI 显示进度用) */
+  isCapabilityBootstrapInflight(): boolean {
+    return this.capabilityBootstrapInflight !== null
+  }
+
 
   // 设置初始累计 credits（用于从持久化存储恢复）
   setTotalCredits(credits: number): void {
@@ -1246,24 +1329,76 @@ export class ProxyServer {
     return new Set(bindings)
   }
 
+  // ============ v1.7.6 能力路由: probe-once 锁 + unsupported 错误检测 ============
+  private static readonly MODEL_PROBE_LOCK_TTL_MS = 30_000
+
+  /**
+   * probe-once: 从 unknown 账号中挑一个权重最高、且不在锁定期的账号去试探.
+   * 返回 null = 全部在锁定中,本次请求应拒绝.
+   * 挑中账号会加 30s 锁,防止 N 个并发同时挑同一账号打爆额度.
+   */
+  private probeOnceForModel(unknowns: readonly ProxyAccount[], modelId: string): ProxyAccount | null {
+    const now = Date.now()
+    // 清理过期锁(懒清理,不用定时器)
+    for (const [k, expireAt] of this.modelProbeInflight) {
+      if (expireAt < now) this.modelProbeInflight.delete(k)
+    }
+    let picked: ProxyAccount | null = null
+    let maxW = -1
+    for (const acc of unknowns) {
+      const key = `${acc.id}:${modelId}`
+      if (this.modelProbeInflight.has(key)) continue // 在锁中,跳过
+      const w = acc.weight ?? 100
+      if (w > maxW) {
+        maxW = w
+        picked = acc
+      }
+    }
+    if (picked) {
+      this.modelProbeInflight.set(`${picked.id}:${modelId}`, now + ProxyServer.MODEL_PROBE_LOCK_TTL_MS)
+    }
+    return picked
+  }
+
+  /**
+   * 从错误消息中识别"当前模型该账号不支持"的信号.
+   * 命中 → 会调用 accountPool.markModelUnsupported 降级,并切下一账号.
+   * NEVER 误伤:严格匹配 Kiro 后端具体错误串,不用宽松包含.
+   */
+  private detectUnsupportedModelError(errMsg: string): boolean {
+    if (!errMsg) return false
+    const lower = errMsg.toLowerCase()
+    return (
+      lower.includes('unsupported model') ||
+      lower.includes('does not have access to model') ||
+      lower.includes('model not available') ||
+      lower.includes('modelunavailableexception') ||
+      lower.includes('model does not exist') ||
+      lower.includes('invalid model')
+    )
+  }
+
   // 获取可用账号（包含 Token 刷新检查）
   // P1-8 sessionHint：相同会话尽量复用同一账号（命中 prompt cache + 防风控）
   // P2-21 apiKeyId：用于过滤 API Key 允许使用的账号子集
-  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string): Promise<ProxyAccount | null> {
+  // v1.7.6 modelId：启用 enableModelCapabilityRouting 时,按 per-account modelCapabilities 前置过滤
+  //         详见 .agent-workspace/.archive/2026-07-22/account-weighted-capability-routing/decision-card.md §3.3
+  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string, modelId?: string): Promise<ProxyAccount | null> {
     const allowedIds = this.getAllowedAccountIds(apiKeyId)
     const groupMode = this.config.multiAccountSelectionMode === 'groups'
     const allowedGroupIds = groupMode ? new Set(this.config.multiAccountGroupIds || []) : null
-    const isAllowed = (acc: ProxyAccount | null): boolean => {
+
+    // baseline: 白名单 + 分组过滤(不含 capability)
+    const isAllowedBaseline = (acc: ProxyAccount | null): boolean => {
       if (!acc) return true
-      // API Key 白名单（apiKeyAccountBindings）
       if (allowedIds && !allowedIds.has(acc.id)) return false
-      // 分组过滤（双保险：即便前端忘了重新同步账号池，这里也能拦住非选中分组的账号）
       if (groupMode && allowedGroupIds) {
         const gid = acc.groupId || '__ungrouped__'
         if (!allowedGroupIds.has(gid)) return false
       }
       return true
     }
+
     this.throwIfAborted(signal)
     // 如果 pool 为空，触发懒加载回调尝试同步账号（冷启动场景）
     if (this.accountPool.size === 0 && this.events.onPoolEmpty) {
@@ -1272,7 +1407,47 @@ export class ProxyServer {
     }
     this.throwIfAborted(signal)
 
-    // P1-8 会话粘性：优先复用已绑定的账号（同时受 API Key 绑定过滤）
+    // ============ v1.7.6 能力路由前置过滤(§3.3) ============
+    // 只在多账号模式 + 开关开 + 有 modelId 时生效;向后兼容:任一条件不满足 → capabilityAllowedIds=null(不过滤)
+    let capabilityAllowedIds: Set<string> | null = null
+    if (this.config.enableMultiAccount && this.config.enableModelCapabilityRouting && modelId) {
+      // 计算 baseline 允许的账号 id(白名单 + 分组交集)供 filterByModel 使用
+      const baseAllowed = new Set<string>()
+      for (const a of this.accountPool.getAllAccounts()) {
+        if (isAllowedBaseline(a)) baseAllowed.add(a.id)
+      }
+      const filterResult = this.accountPool.filterByModel(modelId, baseAllowed)
+      let candidates = filterResult.candidates
+      if (candidates.length === 0) {
+        if (filterResult.unknownAccounts.length === 0) {
+          console.warn(`[ProxyServer] no_account_supports_model: modelId=${modelId}, unsupported=${filterResult.unsupportedCount}`)
+          return null
+        }
+        const policy = this.config.capabilityUnknownPolicy || 'strict'
+        if (policy === 'strict') {
+          console.warn(`[ProxyServer] no_account_confirmed_to_support_model (strict): modelId=${modelId}, unknown=${filterResult.unknownAccounts.length}`)
+          return null
+        }
+        // probe-once: 从 unknown 中挑一个权重最高且不在探测锁的账号
+        const probed = this.probeOnceForModel(filterResult.unknownAccounts, modelId)
+        if (!probed) {
+          console.warn(`[ProxyServer] probe-once: all unknown accounts already in-flight for ${modelId}, refusing`)
+          return null
+        }
+        console.log(`[ProxyServer] probe-once: trying account ${probed.email || probed.id.slice(0, 8)} for ${modelId}`)
+        candidates = [probed]
+      }
+      capabilityAllowedIds = new Set(candidates.map(c => c.id))
+    }
+
+    // 综合过滤:白名单 + 分组 + capability
+    const isAllowed = (acc: ProxyAccount | null): boolean => {
+      if (!isAllowedBaseline(acc)) return false
+      if (capabilityAllowedIds && acc && !capabilityAllowedIds.has(acc.id)) return false
+      return true
+    }
+
+    // P1-8 会话粘性：优先复用已绑定的账号（同时受 API Key 绑定过滤 + capability 过滤）
     if (this.config.sessionAffinityEnabled && sessionHint) {
       const sticky = this.pickAccountWithAffinity(sessionHint)
       if (sticky && isAllowed(sticky)) {
@@ -1292,20 +1467,31 @@ export class ProxyServer {
     let account: ProxyAccount | null
 
     if (this.config.enableMultiAccount) {
-      account = this.accountPool.getNextAccount()
-      if (account && !isAllowed(account)) {
-        // 尝试找一个允许的账号（白名单 + 分组都已合并进 isAllowed）
+      const strategy = this.config.accountSelectionStrategy || 'round-robin'
+
+      if (strategy === 'weighted') {
+        // v1.7.6 SWRR: 从 pool 里筛出符合 isAllowed 的候选,按 weight 挑
+        const candidates = this.accountPool.getAllAccounts().filter(a => isAllowed(a))
+        account = this.accountPool.pickWeighted(candidates)
+        if (!account) {
+          const status = this.accountPool.getQuotaStatus()
+          if (status.exhausted > 0 && status.available === 0) {
+            console.log(`[ProxyServer] All accounts quota exhausted (${status.exhausted}/${status.total}), no available accounts`)
+          }
+        }
+      } else {
+        // round-robin / sticky: 复用现有 currentIndex 指针,通过 exclude 剔除不允许账号
         const allAccounts = this.accountPool.getAllAccounts()
         const exclude = new Set<string>()
         for (const a of allAccounts) {
           if (!isAllowed(a)) exclude.add(a.id)
         }
         account = this.accountPool.getNextAccount(exclude)
-      }
-      if (!account) {
-        const status = this.accountPool.getQuotaStatus()
-        if (status.exhausted > 0 && status.available === 0) {
-          console.log(`[ProxyServer] All accounts quota exhausted (${status.exhausted}/${status.total}), no available accounts`)
+        if (!account) {
+          const status = this.accountPool.getQuotaStatus()
+          if (status.exhausted > 0 && status.available === 0) {
+            console.log(`[ProxyServer] All accounts quota exhausted (${status.exhausted}/${status.total}), no available accounts`)
+          }
         }
       }
     } else {
@@ -1389,11 +1575,14 @@ export class ProxyServer {
   }
 
   // 带重试的 API 调用
+  // v1.7.6 modelId: 传入时启用 runtime 能力反哺 —— 成功 → markModelConfirmed,
+  //                 unsupported 错误 → markModelUnsupported 并切下一账号(§3.3)
   private async callWithRetry<T>(
     account: ProxyAccount,
     apiCall: (acc: ProxyAccount, endpointIndex: number) => Promise<T>,
     _path: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    modelId?: string
   ): Promise<{ result: T; account: ProxyAccount }> {
     const maxRetries = this.config.maxRetries || 3
     const retryDelay = this.config.retryDelayMs || 1000
@@ -1417,6 +1606,10 @@ export class ProxyServer {
       this.throwIfAborted(signal)
       try {
         const result = await apiCall(currentAccount, endpointIndex)
+        // v1.7.6 能力反哺: stream 成功即证明当前账号支持该模型
+        if (modelId) {
+          this.accountPool.markModelConfirmed(currentAccount.id, modelId)
+        }
         return { result, account: currentAccount }
       } catch (error) {
         if (this.isAbortError(error, signal)) throw error
@@ -1424,6 +1617,19 @@ export class ProxyServer {
         const errMsg = lastError.message || ''
 
         console.log(`[ProxyServer] API call failed (attempt ${attempt + 1}/${maxRetries}): ${errMsg}`)
+
+        // v1.7.6 能力反哺: unsupported model 错误 → 降级并切下一账号(优先于其它错误分支,防误判为 quota/auth)
+        if (modelId && this.detectUnsupportedModelError(errMsg)) {
+          this.accountPool.markModelUnsupported(currentAccount.id, modelId)
+          console.warn(`[ProxyServer] Account ${currentAccount.email || currentAccount.id.slice(0, 8)} does NOT support ${modelId}, switching`)
+          const nextAccount = switchToNextAccount()
+          if (nextAccount && !triedIds.has(nextAccount.id)) {
+            currentAccount = nextAccount
+            triedIds.add(nextAccount.id)
+            continue
+          }
+          break // 无可切换,抛给客户端
+        }
 
         // 优先检测账号被长期封禁（不是 token 问题，刷新也没用）
         // 特征：HTTP 403 + reason: "TEMPORARILY_SUSPENDED" 或 AccountSuspendedException / 423
@@ -1801,19 +2007,24 @@ export class ProxyServer {
       let targetModel: string
 
       if (rule.type === 'loadbalance' && validTargets.length > 1) {
-        // 负载均衡：根据权重随机选择
+        // 负载均衡: SWRR (Smooth Weighted Round-Robin, nginx 同款算法)
+        // 相比 Math.random 加权随机:短窗口方差极小,长期比例严格贴合权重
         const weights = rule.weights || validTargets.map(() => 1)
-        const totalWeight = weights.reduce((a, b) => a + b, 0)
-        let random = Math.random() * totalWeight
-        let selectedIndex = 0
-        for (let i = 0; i < weights.length; i++) {
-          random -= weights[i]
-          if (random <= 0) {
-            selectedIndex = i
-            break
-          }
+        let swrr = this.modelMappingSwrr.get(rule.id)
+        if (!swrr) {
+          swrr = new SmoothWeightedRoundRobin({
+            getId: (x) => x.id,
+            getWeight: (x) => x.weight
+          })
+          this.modelMappingSwrr.set(rule.id, swrr)
         }
-        targetModel = validTargets[selectedIndex]
+        const cands = validTargets.map((t, i) => ({
+          id: `${rule.id}::${i}::${t}`,
+          target: t,
+          weight: Math.max(0, weights[i] ?? 1)
+        }))
+        const picked = swrr.pick(cands)
+        targetModel = picked ? picked.target : validTargets[0]
       } else {
         // replace 或 alias：直接使用第一个目标
         targetModel = validTargets[0]
@@ -2278,7 +2489,8 @@ export class ProxyServer {
     const startTime = Date.now()
     this.recordNewRequest()
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal)
+    // v1.7.6 传入 modelId 让能力路由生效(gemini 端点也参与,§4.8 sweep)
+    const account = await this.getAvailableAccount(signal, undefined, matchedApiKey?.id, openaiRequest.model)
     this.throwIfAborted(signal)
     if (!account) {
       this.sendError(res, 503, 'No available accounts')
@@ -2561,7 +2773,7 @@ export class ProxyServer {
 
     // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHintChat, matchedApiKey?.id)
+    const account = await this.getAvailableAccount(signal, affinityHintChat, matchedApiKey?.id, request.model)
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
@@ -2620,7 +2832,8 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/chat/completions',
-          signal
+          signal,
+          request.model
         )
         const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
@@ -2681,7 +2894,7 @@ export class ProxyServer {
     }
 
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHintResp, matchedApiKey?.id)
+    const account = await this.getAvailableAccount(signal, affinityHintResp, matchedApiKey?.id, chatRequest.model)
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
@@ -2714,7 +2927,8 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/responses',
-          signal
+          signal,
+          chatRequest.model
         )
         const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
         this.throwIfResponseClosed(res, signal)
@@ -2766,7 +2980,8 @@ export class ProxyServer {
           return callKiroApi(acc, retryPayload, signal)
         },
         '/v1/responses',
-        signal
+        signal,
+        chatRequest.model
       )
       const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
       this.throwIfResponseClosed(res, signal)
@@ -2985,7 +3200,7 @@ export class ProxyServer {
 
     // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id)
+    const account = await this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, request.model)
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
@@ -3059,7 +3274,8 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/messages',
-          signal
+          signal,
+          request.model
         )
         const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 

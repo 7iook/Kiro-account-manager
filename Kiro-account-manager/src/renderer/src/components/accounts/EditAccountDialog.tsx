@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { X, Loader2, RefreshCw, Download, CheckCircle, Copy, Check } from 'lucide-react'
-import { Button, Card, CardContent, CardHeader, CardTitle } from '../ui'
+import { Button, Card, CardContent, CardHeader, CardTitle, AwsRegionSelect } from '../ui'
 import { useAccountsStore } from '@/store'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account, SubscriptionType } from '@/types/account'
@@ -25,6 +25,9 @@ export function EditAccountDialog({
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [region, setRegion] = useState('us-east-1')
+
+  // v1.7.6 权重(SWRR 加权轮询;默认 100;0 = 临时下线)
+  const [weight, setWeight] = useState<number>(100)
 
   // 可编辑字段
   const [nickname, setNickname] = useState('')
@@ -72,6 +75,8 @@ export function EditAccountDialog({
       setClientSecret(account.credentials.clientSecret || '')
       setRegion(account.credentials.region || 'us-east-1')
       setNickname(account.nickname || '')
+      // v1.7.6 加载权重(缺省 100)
+      setWeight(typeof account.weight === 'number' ? account.weight : 100)
       
       // 设置当前账号信息
       setAccountInfo({
@@ -177,6 +182,8 @@ export function EditAccountDialog({
       email: accountInfo.email,
       userId: accountInfo.userId,
       nickname: nickname || undefined,
+      // v1.7.6 SWRR 权重
+      weight,
       credentials: {
         ...account.credentials,
         accessToken: accountInfo.accessToken,
@@ -378,18 +385,32 @@ export function EditAccountDialog({
 
                   <div className="space-y-2">
                     <label className="text-sm font-medium">AWS Region</label>
-                    <select
-                      value={region}
-                      onChange={(e) => setRegion(e.target.value)}
-                      className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-                    >
-                      <option value="us-east-1">us-east-1 (N. Virginia)</option>
-                      <option value="us-west-2">us-west-2 (Oregon)</option>
-                      <option value="eu-west-1">eu-west-1 (Ireland)</option>
-                    </select>
+                    <AwsRegionSelect value={region} onChange={setRegion} />
                   </div>
                 </>
               )}
+
+              {/* v1.7.6 SWRR 权重(所有账户通用,包括 social) */}
+              <div className="space-y-2">
+                <label className="text-sm font-medium">
+                  Weight <span className="text-xs text-muted-foreground font-normal">(0-1000, default 100)</span>
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  max={1000}
+                  step={10}
+                  value={weight}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10)
+                    setWeight(Number.isFinite(v) ? Math.max(0, Math.min(1000, v)) : 100)
+                  }}
+                  className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 font-mono"
+                />
+                <p className="text-xs text-muted-foreground">
+                  SWRR weighted round-robin share. 0 = temporarily offline (kept in pool, skipped in selection).
+                </p>
+              </div>
 
               <Button 
                 type="button" 

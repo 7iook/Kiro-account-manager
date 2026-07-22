@@ -83,7 +83,10 @@ interface ProxyConfig {
   enableTokenBufferReserve?: boolean
   tokenBufferReserve?: number
   autoSwitchOnQuotaExhausted?: boolean
-  accountSelectionStrategy?: 'round-robin' | 'sticky'
+  accountSelectionStrategy?: 'round-robin' | 'sticky' | 'weighted'
+  // v1.7.6 模型能力路由(§3.3)
+  enableModelCapabilityRouting?: boolean
+  capabilityUnknownPolicy?: 'strict' | 'probe-once'
   // 多账号轮询范围（与 main/proxy/types.ts 保持一致）
   multiAccountSelectionMode?: 'all' | 'groups'
   multiAccountGroupIds?: string[]
@@ -146,6 +149,8 @@ export function ProxyPanel() {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
   const [isRunning, setIsRunning] = useState(false)
+  // v1.7.6 能力路由 bootstrap 同步进行中状态(供 UI loading 显示 + 幂等按钮禁用)
+  const [capabilitySyncInflight, setCapabilitySyncInflight] = useState(false)
   const [config, setConfig] = useState<ProxyConfig>({
     enabled: false,
     port: 5580,
@@ -305,7 +310,9 @@ export function ProxyPanel() {
           issuerUrl: acc.credentials?.issuerUrl,
           scopes: acc.credentials?.scopes,
           // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险），即便前端忘了重同步也安全
-          groupId: acc.groupId
+          groupId: acc.groupId,
+          // v1.7.6 SWRR 权重(缺省 100)
+          weight: typeof acc.weight === 'number' ? acc.weight : 100
         }))
 
       const result = await window.api.proxySyncAccounts(proxyAccounts)
@@ -743,15 +750,15 @@ export function ProxyPanel() {
             </div>
             {/* 开启多账号轮询时显示策略选择 */}
             {config.enableMultiAccount && (
-              <div className="col-span-2 flex items-center gap-2">
+              <div className="col-span-2 flex items-center gap-2 flex-wrap">
                 <Label className="text-sm shrink-0">
                   {isEn ? 'Strategy' : '选择策略'}:
                 </Label>
                 <div className="flex gap-1 bg-muted/30 rounded-lg p-0.5">
-                  {(['round-robin', 'sticky'] as const).map(strategy => {
+                  {(['round-robin', 'sticky', 'weighted'] as const).map(strategy => {
                     const active = (config.accountSelectionStrategy || 'round-robin') === strategy
-                    const labelEn = strategy === 'round-robin' ? 'Round-Robin' : 'Sticky'
-                    const labelZh = strategy === 'round-robin' ? '轮询' : '粘滞'
+                    const labelEn = strategy === 'round-robin' ? 'Round-Robin' : strategy === 'sticky' ? 'Sticky' : 'Weighted (SWRR)'
+                    const labelZh = strategy === 'round-robin' ? '轮询' : strategy === 'sticky' ? '粘滞' : '加权 (SWRR)'
                     return (
                       <button
                         key={strategy}
@@ -773,9 +780,102 @@ export function ProxyPanel() {
                   })}
                 </div>
                 <span className="text-xs text-muted-foreground">
-                  {(config.accountSelectionStrategy || 'round-robin') === 'round-robin'
-                    ? (isEn ? 'Each request rotates to next account (load balanced)' : '每次请求轮询到下一个账号（负载均衡）')
-                    : (isEn ? 'Stay on success account until failure (preserves prompt cache)' : '成功后粘住该账号直到失败（保留 prompt cache）')}
+                  {(() => {
+                    const s = config.accountSelectionStrategy || 'round-robin'
+                    if (s === 'round-robin') return isEn ? 'Each request rotates to next account (load balanced)' : '每次请求轮询到下一个账号（负载均衡）'
+                    if (s === 'sticky') return isEn ? 'Stay on success account until failure (preserves prompt cache)' : '成功后粘住该账号直到失败（保留 prompt cache）'
+                    return isEn ? 'Weighted share by account weight field (SWRR, e.g. 80/20)' : '按账号 weight 字段按比例分流（SWRR,例 80/20）'
+                  })()}
+                </span>
+              </div>
+            )}
+            {/* v1.7.6 模型能力路由: 开关 + 未知策略 + 立即同步 */}
+            {config.enableMultiAccount && (
+              <div className="col-span-2 flex items-center gap-4 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <Switch
+                    id="enableModelCapabilityRouting"
+                    checked={!!config.enableModelCapabilityRouting}
+                    onCheckedChange={async (checked) => {
+                      setConfig(prev => ({ ...prev, enableModelCapabilityRouting: checked }))
+                      await window.api.proxyUpdateConfig({ enableModelCapabilityRouting: checked } as Partial<ProxyConfig>)
+                      // 开关 off→on 且反代运行中 · 立即触发全池能力同步(冷启动 bootstrap 兜底)
+                      // 后端 updateConfig 也会检测到 off→on 自动 kick,这里前端多打一发确保 UI 立即看到进度
+                      if (checked && isRunning) {
+                        setCapabilitySyncInflight(true)
+                        try {
+                          const res = await window.api.proxySyncCapabilities()
+                          if (res.success) {
+                            console.log(`[UI] Capability sync done: ${res.ok}/${res.total} synced, ${res.failed} failed`)
+                          }
+                        } finally {
+                          setCapabilitySyncInflight(false)
+                        }
+                      }
+                    }}
+                  />
+                  <Label htmlFor="enableModelCapabilityRouting" className="text-sm cursor-pointer">
+                    {isEn ? 'Model Capability Routing' : '模型能力路由'}
+                  </Label>
+                </div>
+                {config.enableModelCapabilityRouting && (
+                  <div className="flex items-center gap-2">
+                    <Label className="text-sm shrink-0">
+                      {isEn ? 'Unknown Policy' : '未知策略'}:
+                    </Label>
+                    <div className="flex gap-1 bg-muted/30 rounded-lg p-0.5">
+                      {(['strict', 'probe-once'] as const).map(policy => {
+                        const active = (config.capabilityUnknownPolicy || 'strict') === policy
+                        const labelEn = policy === 'strict' ? 'Strict' : 'Probe Once'
+                        const labelZh = policy === 'strict' ? '严格' : '试探一次'
+                        return (
+                          <button
+                            key={policy}
+                            type="button"
+                            className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                              active
+                                ? 'bg-primary text-primary-foreground shadow-sm'
+                                : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                            }`}
+                            onClick={() => {
+                              setConfig(prev => ({ ...prev, capabilityUnknownPolicy: policy }))
+                              window.api.proxyUpdateConfig({ capabilityUnknownPolicy: policy } as Partial<ProxyConfig>)
+                            }}
+                          >
+                            {isEn ? labelEn : labelZh}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+                {config.enableModelCapabilityRouting && isRunning && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={capabilitySyncInflight}
+                    onClick={async () => {
+                      setCapabilitySyncInflight(true)
+                      try {
+                        const res = await window.api.proxySyncCapabilities()
+                        if (res.success) {
+                          console.log(`[UI] Manual capability sync: ${res.ok}/${res.total} synced, ${res.failed} failed`)
+                        }
+                      } finally {
+                        setCapabilitySyncInflight(false)
+                      }
+                    }}
+                  >
+                    {capabilitySyncInflight
+                      ? (isEn ? 'Syncing...' : '同步中...')
+                      : (isEn ? 'Sync Capabilities Now' : '立即同步能力')}
+                  </Button>
+                )}
+                <span className="text-xs text-muted-foreground">
+                  {isEn
+                    ? 'Pre-filter accounts by ListAvailableModels capability (§decision-card §3.3)'
+                    : '按 ListAvailableModels 能力信号前置过滤账号'}
                 </span>
               </div>
             )}

@@ -3,8 +3,14 @@
  *
  * 用户传入的 region 可能与 refresh_token 实际注册的 IdC 实例 region 不匹配
  * (例如手动填 OIDC 凭证时选错 UI 下拉),AWS SSO OIDC endpoint 会拒 400
- * "Invalid token provided" / "invalid_request"。这里跨 KNOWN_CW_REGIONS 自动
+ * "Invalid token provided" / "invalid_request"。这里跨 KNOWN_SSO_OIDC_REGIONS 自动
  * 重试;成功时 resolvedRegion 带回真实 region 让上层写回 account.region。
+ *
+ * ⚠ 历史补证(2026-07-22):早期代码把 KNOWN_CW_REGIONS(仅 2 个 CW 数据面 region)
+ * 混用到这里,导致 sso=us-east-2 账户跨 region fallback 探不到 → token 过期后
+ * 永久失活。修法拆两个常量:KNOWN_CW_DATA_REGIONS 仅数据面,KNOWN_SSO_OIDC_REGIONS
+ * 含全 21 个商用 region(SSO OIDC 在每个 AWS region 有独立实例)。
+ * 见 .agent-workspace/.archive/2026-07-22/account-weighted-capability-routing/
  *
  * 参见 RCA: .agent-workspace/.archive/2026-07-16/oidc-refresh-cross-region/
  */
@@ -91,7 +97,7 @@ export interface RefreshOidcTokenAcrossRegionsOptions {
 }
 
 /**
- * 跨 KNOWN_CW_REGIONS 顺序探测,主 region 优先,只在 region-mismatch 错误时才走
+ * 跨 KNOWN_SSO_OIDC_REGIONS 顺序探测,主 region 优先,只在 region-mismatch 错误时才走
  * fallback,保持网络/5xx 立即失败的语义。
  */
 export async function refreshOidcTokenAcrossRegions(
