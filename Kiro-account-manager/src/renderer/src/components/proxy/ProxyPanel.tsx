@@ -1003,10 +1003,10 @@ export function ProxyPanel() {
                           <button
                             key={mode}
                             type="button"
-                            disabled={isRunning}
+                            title={isRunning ? (isEn ? 'Hot-swap enabled: pool re-syncs immediately' : '热切换已启用:池成员立即重同步') : undefined}
                             className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
                               active ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
-                            } disabled:opacity-50 disabled:cursor-not-allowed`}
+                            }`}
                             onClick={() => {
                               setConfig(prev => ({ ...prev, multiAccountSelectionMode: mode }))
                               window.api.proxyUpdateConfig({ multiAccountSelectionMode: mode })
@@ -1032,13 +1032,13 @@ export function ProxyPanel() {
                       {/* 未分组特殊 chip */}
                       <button
                         type="button"
-                        disabled={isRunning}
+                        title={isRunning ? (isEn ? 'Hot-swap: pool re-syncs immediately' : '热切换:池成员立即重同步') : undefined}
                         onClick={() => toggleGid('__ungrouped__')}
                         className={`flex items-center gap-1 px-2 h-7 rounded-md text-xs font-medium border transition-all ${
                           selectedGids.has('__ungrouped__')
                             ? 'bg-muted text-foreground border-muted-foreground/30'
                             : 'bg-background text-muted-foreground border-border hover:text-foreground hover:border-primary/40'
-                        } disabled:opacity-50 disabled:cursor-not-allowed`}
+                        }`}
                       >
                         {selectedGids.has('__ungrouped__') && <Check className="h-3 w-3" />}
                         <span>{isEn ? 'Ungrouped' : '未分组'}</span>
@@ -1052,11 +1052,11 @@ export function ProxyPanel() {
                           <button
                             key={group.id}
                             type="button"
-                            disabled={isRunning}
+                            title={isRunning ? (isEn ? 'Hot-swap: pool re-syncs immediately' : '热切换:池成员立即重同步') : undefined}
                             onClick={() => toggleGid(group.id)}
                             className={`flex items-center gap-1 px-2 h-7 rounded-md text-xs font-medium border transition-all ${
                               isSel ? 'text-foreground' : 'bg-background text-muted-foreground border-border hover:text-foreground hover:border-primary/40'
-                            } disabled:opacity-50 disabled:cursor-not-allowed`}
+                            }`}
                             style={isSel ? {
                               backgroundColor: (group.color || '#888') + '22',
                               borderColor: (group.color || '#888') + '66'
