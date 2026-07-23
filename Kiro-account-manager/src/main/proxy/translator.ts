@@ -433,11 +433,11 @@ export function openaiToKiro(
     }
   }
 
-  // 注入时间戳
-  const timestamp = new Date().toISOString()
-  systemPrompt = `[Context: Current time is ${timestamp}]\n\n${systemPrompt}`
-
   // 注入执行导向指令（防止 AI 在探索过程中丢失目标）
+  // 注:前面不再拼 timestamp(每次变化会杀死 prompt cache 命中)。
+  // Claude Code / OpenCode 客户端自己会在 system prompt 中注入日期上下文,
+  // 反代作为透明层不应重复注入。
+  // 参考 Anthropic 官方 prompt caching 文档:any byte change in prefix invalidates cache.
   const executionDirective = `
 <execution_discipline>
 当用户要求执行特定任务时，你必须遵循以下纪律：
@@ -919,11 +919,11 @@ export function claudeToKiro(
     }).join('\n')
   }
 
-  // 注入时间戳
-  const timestamp = new Date().toISOString()
-  systemPrompt = `[Context: Current time is ${timestamp}]\n\n${systemPrompt}`
-
   // 注入执行导向指令（防止 AI 在探索过程中丢失目标）
+  // 注:前面不再拼 timestamp(每次变化会杀死 prompt cache 命中)。
+  // Claude Code / OpenCode 客户端自己会在 system prompt 中注入日期上下文,
+  // 反代作为透明层不应重复注入。
+  // 参考 Anthropic 官方 prompt caching 文档:any byte change in prefix invalidates cache.
   const executionDirective = `
 <execution_discipline>
 当用户要求执行特定任务时，你必须遵循以下纪律：

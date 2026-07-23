@@ -85,6 +85,8 @@
 ## Update Log
 
 - 2026-07-23 落盘骨架 · pending 读 ProxyPanel 现有 sync IPC 逻辑后补最终 UI 定位
+- 2026-07-23 实施完成(SUB executor):accountPool.setActiveAccount + 2 IPC + preload + store action + ProxyPanel 单账号 hot switch wire · 11/11 单测 pass
+- 2026-07-23 补齐 §5F 第 3 点(commit a69ce05):移除 ProxyPanel 3 处 `disabled={isRunning}` 阀门(scope toggle × 2 + ungrouped chip + user group chip),放开多账号轮询范围运行时编辑。既有 toggleGid / scope onClick 已经调 `syncAccounts({mode, groupIds})` 全量 replace,后端 pool.clear + addAccount 循环支持热更新。按钮加 title 提示"热切换:池成员立即重同步"。**决策卡遗留未做项全部关闭。** typecheck:web ✓
 - 2026-07-23T16:47 executor 完成实施(E-055 三收口全套)
   - **改** `src/main/proxy/accountPool.ts`:新增 `setActiveAccount(accountId): boolean` · `this.currentIndex = idx + this.swrr.reset()` · 不存在返回 false
   - **改** `src/main/index.ts` 紧挨 `account-set-proxy-binding` 后新增 2 handle:

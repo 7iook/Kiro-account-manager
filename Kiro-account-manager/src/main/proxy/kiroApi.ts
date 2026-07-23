@@ -638,31 +638,26 @@ export function isThinkingEnabled(headers?: Record<string, string>): boolean {
   return betaHeader.toLowerCase().includes('thinking')
 }
 
-// 注入系统提示
+// 注入系统提示（thinking / agentic）
+// 注：不再在前面拼 timestamp（每次变化会杀死 prompt cache 命中）。参考 Anthropic 官方文档：
+// prefix 任何 byte 变化都将 invalidate cache。客户端会自己注入时间上下文，反代不重复。
 export function injectSystemPrompts(
   content: string,
   isAgentic: boolean,
   thinkingEnabled: boolean
 ): string {
   let result = content
-  
-  // 注入时间戳
-  const timestamp = new Date().toISOString()
-  const timestampPrompt = `Current time: ${timestamp}`
-  
+
   // 注入 Thinking 模式（必须在最前面）
   if (thinkingEnabled) {
     result = THINKING_MODE_PROMPT + '\n\n' + result
   }
-  
+
   // 注入 Agentic 模式提示
   if (isAgentic) {
     result = result + '\n\n' + AGENTIC_SYSTEM_PROMPT
   }
-  
-  // 注入时间戳
-  result = timestampPrompt + '\n\n' + result
-  
+
   return result
 }
 
@@ -1084,23 +1079,38 @@ function sanitizeConversation(messages: KiroHistoryMessage[]): KiroHistoryMessag
 // 按 token 估算成对裁剪 history 最旧消息 (避免后端 CONTENT_LENGTH_EXCEEDS_THRESHOLD)
 // 切点保证不破坏 toolUse↔toolResult 配对：assistant(toolUse) 必须连同后续 user(toolResult) 一起裁
 // 裁剪后用 ensureStartsWithUserMessage 兜底重新规范化
+//
+// 保护 system prompt Human/AI 注入对(translator.ts 在 history 头部注入):
+//   history[0] = { userInputMessage: { content: <systemPrompt> } }
+//   history[1] = { assistantResponseMessage: { content: 'I will follow these instructions.' } }
+// 若检测到此 marker,startIdx=2,裁剪只发生在其后,保证 system 指令不丢。
 function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed: number; finalTokens: number; iterations: number } {
   let history = payload.conversationState.history
   if (!history || history.length === 0) {
     return { trimmed: 0, finalTokens: estimatePayloadTokens(payload), iterations: 0 }
   }
 
+  // 检测 system prompt Human/AI 注入对(translator.ts openaiToKiro/claudeToKiro 都注入的固定 marker)
+  // 保护:裁剪时永远跳过前 2 条,不裁 system 指令 pair
+  const SYSTEM_MARKER = 'I will follow these instructions.'
+  const hasSystemPair =
+    history.length >= 2 &&
+    isUserInputMessage(history[0]) &&
+    isAssistantResponseMessage(history[1]) &&
+    history[1].assistantResponseMessage?.content === SYSTEM_MARKER
+  const startIdx = hasSystemPair ? 2 : 0
+
   let totalTrimmed = 0
   let iterations = 0
   let currentTokens = estimatePayloadTokens(payload)
   const MAX_ITERATIONS = 100 // 防止极端情况死循环
 
-  while (currentTokens > maxTokens && history.length >= 4 && iterations < MAX_ITERATIONS) {
+  while (currentTokens > maxTokens && (history.length - startIdx) >= 4 && iterations < MAX_ITERATIONS) {
     iterations++
-    // 计算安全切点：从 index 0 开始至少裁掉 1 组 (user+assistant)，并连带 toolUse/toolResult 配对
+    // 从 startIdx(跳过 system pair)开始至少裁掉 1 组 (user+assistant),并连带 toolUse/toolResult 配对
     let cutAt = 0
-    while (cutAt < history.length - 2) {
-      const msg = history[cutAt]
+    while (cutAt < (history.length - startIdx - 2)) {
+      const msg = history[startIdx + cutAt]
       // assistant(toolUse) → 下一条 user(toolResult) 必须一起裁，避免配对断裂
       if (isAssistantResponseMessage(msg) && hasToolUses(msg)) {
         cutAt += 2
@@ -1112,10 +1122,11 @@ function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed
 
     if (cutAt === 0) break // 无法继续裁剪
 
-    history = history.slice(cutAt)
+    // 保留 [0..startIdx](system pair),裁掉 [startIdx..startIdx+cutAt](最旧的对话)
+    history = [...history.slice(0, startIdx), ...history.slice(startIdx + cutAt)]
     totalTrimmed += cutAt
 
-    // 裁剪后 history 可能以 assistant 起头 → 补 HELLO 重新规范
+    // 裁剪后 history 可能以 assistant 起头(仅 startIdx=0 场景) → 补 HELLO 重新规范
     history = ensureStartsWithUserMessage(history)
     payload.conversationState.history = history
     currentTokens = estimatePayloadTokens(payload)
@@ -1577,9 +1588,16 @@ export async function callKiroApiStream(
       
       const agent = getNetworkAgent(account)
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
+      // [Perf] 分段打点 — 每请求 1 行,量 TTFB(fetch 发出 → response 返回)
+      // TTFB = TCP/TLS 连接 + 网络 RTT + Kiro 后端模型 first-byte(启动/thinking)
+      // 之前只有端到端 responseTime,无法分辨「网络+服务端慢」vs「反代自身慢」
+      const tFetchStart = Date.now()
       let response = agent
         ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
         : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
+      const ttfb = Date.now() - tFetchStart
+      const usingProxy = agent ? 'proxy' : 'direct'
+      console.log(`[Perf] ep=${endpoint.name} region=${dataPlaneRegion || '?'} TTFB=${ttfb}ms status=${response.status} pay=${payloadStr.length}B via=${usingProxy} acc=${account.email || account.id?.slice(0, 8) || '?'}`)
 
       if (response.status === 429) {
         // 429 = Kiro 后端概率式限流(不是真 QPS 上限,窗口随机开关)。
