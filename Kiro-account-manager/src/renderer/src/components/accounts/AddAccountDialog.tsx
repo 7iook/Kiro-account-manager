@@ -111,6 +111,11 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const [apiKeyRegion, setApiKeyRegion] = useState('us-east-1')
   const [apiKeyImporting, setApiKeyImporting] = useState(false)
   const [apiKeyResult, setApiKeyResult] = useState<{ total: number; success: number; failed: number; errors: string[] } | null>(null)
+  // v1.7.7 导入前真实 API 探测(GetProfile + 真实 stream 请求) · 用于判定 ksk_ 是否被 Kiro 后端封禁
+  // 只看 GetProfile / 额度刷新不够 —— 有些账号 GetProfile 能过但推理会 403 TEMPORARILY_SUSPENDED
+  const [apiKeyProbing, setApiKeyProbing] = useState(false)
+  type ProbeStatus = 'alive' | 'suspended' | 'unauthorized' | 'quota_exhausted' | 'invalid' | 'error'
+  const [apiKeyProbeResult, setApiKeyProbeResult] = useState<Array<{ key: string; status: ProbeStatus; message?: string; latencyMs?: number; credits?: number }> | null>(null)
 
   // SSO Token 导入
   const [ssoToken, setSsoToken] = useState('')
@@ -1330,6 +1335,78 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   // 网页 API Key(ksk_)导入：每行一个,逐行调 verify-api-key 走 GetProfile 拿 profileArn，通过才导入。
   // ksk 是静态长凭证：无 refreshToken/expiry，profileArn 导入时解析并持久化。
   // 导入后立即触发 checkAccountStatus（getUsageLimits + TokenType: API_KEY）拉真实额度/订阅/邮箱。
+  // v1.7.7 导入前真实 API 探测:先 GetProfile 拿 profileArn,再发一次真实 stream 请求
+  //   —— 有些账号 GetProfile / GetUsageLimits 能过但推理会 403 TEMPORARILY_SUSPENDED,
+  //      只有真实调 SendMessageStreaming 才能揭示 Kiro 后端风控封禁。
+  //   用户诉求(2026-07-24):导入前先测活,避免死号进池。
+  const handleApiKeyProbe = async () => {
+    const rawLines = apiKeyInput.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0)
+    const keys = Array.from(new Set(rawLines))
+    if (keys.length === 0) {
+      setError(isEn ? 'Please paste the API Key (ksk_...)' : '请粘贴 API Key(ksk_ 开头,每行一个)')
+      return
+    }
+    setError('')
+    setApiKeyProbeResult(null)
+    setApiKeyProbing(true)
+    const results: Array<{ key: string; status: ProbeStatus; message?: string; latencyMs?: number; credits?: number }> = []
+    try {
+      for (const key of keys) {
+        const label = key.length > 16 ? `${key.slice(0, 12)}...${key.slice(-4)}` : key
+        if (!key.startsWith('ksk_')) {
+          results.push({ key: label, status: 'invalid', message: isEn ? 'must start with ksk_' : '格式错误(应以 ksk_ 开头)' })
+          continue
+        }
+        const t0 = Date.now()
+        try {
+          // Step 1: GetProfile 校验 · 拿 profileArn
+          const verify = await window.api.verifyApiKey({ apiKey: key, region: apiKeyRegion })
+          if (!verify.success) {
+            const msg = verify.error || 'verify failed'
+            const isSuspend = /TEMPORARILY_SUSPENDED|AccountSuspended|423 Locked|suspended/i.test(msg)
+            const isAuth = /401|Unauthorized|Invalid.*token/i.test(msg)
+            results.push({ key: label, status: isSuspend ? 'suspended' : isAuth ? 'unauthorized' : 'invalid', message: msg.slice(0, 200) })
+            continue
+          }
+          // Step 2: 真实推理请求(model 用最便宜的 haiku · 单字回复)
+          const probe = await window.api.diagnoseAccountLiveness({
+            account: {
+              accessToken: key,
+              authMethod: 'api_key',
+              provider: 'ApiKey',
+              profileArn: verify.profileArn,
+              region: verify.region || apiKeyRegion
+            },
+            model: 'claude-haiku-4.5',
+            message: 'hi',
+            timeoutMs: 30000
+          })
+          const ms = Date.now() - t0
+          if (probe.success) {
+            results.push({ key: label, status: 'alive', latencyMs: probe.latencyMs ?? ms, credits: probe.usage?.credits })
+          } else {
+            const err = probe.error || 'unknown'
+            const isSuspend = /TEMPORARILY_SUSPENDED|AccountSuspended|423 Locked|suspended/i.test(err)
+            const isQuota = /402|429|quota|Throttling|rate limit|limit exceeded/i.test(err)
+            const isAuth = /401|Unauthorized|Invalid.*token/i.test(err)
+            results.push({
+              key: label,
+              status: isSuspend ? 'suspended' : isQuota ? 'quota_exhausted' : isAuth ? 'unauthorized' : 'error',
+              message: err.slice(0, 200),
+              latencyMs: ms
+            })
+          }
+        } catch (e) {
+          results.push({ key: label, status: 'error', message: e instanceof Error ? e.message.slice(0, 200) : String(e) })
+        }
+        // 逐行更新 UI 让用户看到进度
+        setApiKeyProbeResult([...results])
+      }
+    } finally {
+      setApiKeyProbing(false)
+    }
+  }
+
   const handleApiKeyImport = async () => {
     // 每行一个 ksk_；支持单个或批量。逐行校验(GetProfile) → 导入 → 后台触发额度刷新。
     const rawLines = apiKeyInput
@@ -1586,9 +1663,34 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                   )}
                 </div>
               )}
-              <Button className="w-full" onClick={handleApiKeyImport} disabled={apiKeyImporting || !apiKeyInput.trim()}>
-                {apiKeyImporting ? (isEn ? 'Verifying...' : '校验中...') : (isEn ? 'Verify & Import' : '校验并导入')}
-              </Button>
+              {apiKeyProbeResult && apiKeyProbeResult.length > 0 && (
+                <div className="p-3 rounded-lg border bg-muted/30 space-y-1.5">
+                  <p className="text-xs font-medium">{isEn ? 'Live API Probe Results' : '真实 API 探测结果'}</p>
+                  {apiKeyProbeResult.map((r, i) => {
+                    const color = r.status === 'alive' ? 'text-success' : r.status === 'suspended' ? 'text-destructive' : r.status === 'quota_exhausted' ? 'text-warning' : r.status === 'unauthorized' ? 'text-destructive' : 'text-muted-foreground'
+                    const label = r.status === 'alive' ? (isEn ? '✅ Alive' : '✅ 存活') : r.status === 'suspended' ? (isEn ? '🚫 SUSPENDED (banned)' : '🚫 被封禁') : r.status === 'quota_exhausted' ? (isEn ? '⏱ Quota exhausted' : '⏱ 额度耗尽') : r.status === 'unauthorized' ? (isEn ? '🔒 Unauthorized' : '🔒 未授权') : r.status === 'invalid' ? (isEn ? '⚠ Invalid format' : '⚠ 格式错') : (isEn ? '❌ Error' : '❌ 错误')
+                    return (
+                      <div key={i} className="text-xs space-y-0.5">
+                        <div className="flex items-center gap-2 font-mono">
+                          <span className="text-muted-foreground">{r.key}</span>
+                          <span className={color + ' font-medium font-sans'}>{label}</span>
+                          {r.latencyMs !== undefined && <span className="text-muted-foreground">{r.latencyMs}ms</span>}
+                          {r.credits !== undefined && r.credits > 0 && <span className="text-muted-foreground">credits: {r.credits.toFixed(3)}</span>}
+                        </div>
+                        {r.message && <div className="text-muted-foreground pl-4 break-all">{r.message}</div>}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+              <div className="flex gap-2">
+                <Button variant="outline" onClick={handleApiKeyProbe} disabled={apiKeyProbing || apiKeyImporting || !apiKeyInput.trim()}>
+                  {apiKeyProbing ? (isEn ? 'Probing...' : '探测中...') : (isEn ? 'Test Live API' : '测试真实 API')}
+                </Button>
+                <Button className="flex-1" onClick={handleApiKeyImport} disabled={apiKeyImporting || apiKeyProbing || !apiKeyInput.trim()}>
+                  {apiKeyImporting ? (isEn ? 'Verifying...' : '校验中...') : (isEn ? 'Verify & Import' : '校验并导入')}
+                </Button>
+              </div>
             </div>
           )}
 

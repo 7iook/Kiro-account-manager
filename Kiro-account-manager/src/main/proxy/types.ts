@@ -522,6 +522,13 @@ export interface ProxyConfig {
   clientDrivenToolExecution?: boolean
   // 禁用工具调用（移除 tools 参数）
   disableTools?: boolean
+  // v1.7.7 新增:是否往 system prompt 尾部注入中文 <execution_discipline> 纪律指令
+  // - 默认 false(off)。此指令是 v1.4.3 引入的"防止 AI 目标漂移"辅助 · 但会:
+  //   (a) 强命令口吻抑制模型深度思考/探索/澄清提问
+  //   (b) 中英混合语言污染(客户端英文任务里可能冒中文短语)
+  //   (c) 与 Claude Code / OpenCode 自带的执行纪律指令冲突
+  // - 只有明确需要模型"闷头执行不废话"的场景才手动打开
+  injectExecutionDirective?: boolean
   // Payload 大小限制（KB），超过时截断工具结果（byte 维度）
   payloadSizeLimitKB?: number
   // Token buffer reserve 开关（默认 false = 完全跳过 trimHistoryByTokens）

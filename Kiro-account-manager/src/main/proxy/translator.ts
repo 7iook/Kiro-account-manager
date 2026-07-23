@@ -1,5 +1,16 @@
 // OpenAI/Claude 格式与 Kiro 格式转换器
 import { v4 as uuidv4 } from 'uuid'
+
+// v1.7.7 module-level 开关:控制是否往 system prompt 注入中文 <execution_discipline> 纪律指令
+// proxyServer 在 start / updateConfig 时通过 setInjectExecutionDirective 同步 · 默认 off
+// 详见 types.ts ProxyConfig.injectExecutionDirective
+let __injectExecutionDirective = false
+export function setInjectExecutionDirective(v: boolean): void {
+  __injectExecutionDirective = !!v
+}
+export function getInjectExecutionDirective(): boolean {
+  return __injectExecutionDirective
+}
 import type {
   OpenAIChatRequest,
   OpenAIMessage,
@@ -433,12 +444,15 @@ export function openaiToKiro(
     }
   }
 
-  // 注入执行导向指令（防止 AI 在探索过程中丢失目标）
-  // 注:前面不再拼 timestamp(每次变化会杀死 prompt cache 命中)。
-  // Claude Code / OpenCode 客户端自己会在 system prompt 中注入日期上下文,
-  // 反代作为透明层不应重复注入。
-  // 参考 Anthropic 官方 prompt caching 文档:any byte change in prefix invalidates cache.
-  const executionDirective = `
+  // v1.7.7 改为按 config 开关注入(__injectExecutionDirective · 默认 off)。
+  // 旧版 v1.4.3+ 硬编码 on 会:
+  //   (a) 强命令口吻抑制 Claude 探索/深度思考/澄清提问
+  //   (b) 中英文语言污染(英文任务里冒中文短语)
+  //   (c) 与 Claude Code / OpenCode 自带执行纪律冲突
+  // 是社区反馈"走反代变笨"的主因之一。见 GitHub kirodotdev/Kiro #6482。
+  // 拼接位置在 system 尾部,不影响 prompt cache prefix。
+  if (__injectExecutionDirective) {
+    const executionDirective = `
 <execution_discipline>
 当用户要求执行特定任务时，你必须遵循以下纪律：
 1. **目标锁定**：在整个会话中始终牢记用户的原始目标，不要在代码探索过程中迷失方向
@@ -449,7 +463,8 @@ export function openaiToKiro(
 6. **完整交付**：直到所有任务步骤都执行完毕才算完成
 </execution_discipline>
 `
-  systemPrompt = systemPrompt + '\n\n' + executionDirective
+    systemPrompt = systemPrompt + '\n\n' + executionDirective
+  }
 
   // 构建历史消息（参考 Proxycast 实现）
   const history: KiroHistoryMessage[] = []
@@ -919,12 +934,15 @@ export function claudeToKiro(
     }).join('\n')
   }
 
-  // 注入执行导向指令（防止 AI 在探索过程中丢失目标）
-  // 注:前面不再拼 timestamp(每次变化会杀死 prompt cache 命中)。
-  // Claude Code / OpenCode 客户端自己会在 system prompt 中注入日期上下文,
-  // 反代作为透明层不应重复注入。
-  // 参考 Anthropic 官方 prompt caching 文档:any byte change in prefix invalidates cache.
-  const executionDirective = `
+  // v1.7.7 改为按 config 开关注入(__injectExecutionDirective · 默认 off)。
+  // 旧版 v1.4.3+ 硬编码 on 会:
+  //   (a) 强命令口吻抑制 Claude 探索/深度思考/澄清提问
+  //   (b) 中英文语言污染(英文任务里冒中文短语)
+  //   (c) 与 Claude Code / OpenCode 自带执行纪律冲突
+  // 是社区反馈"走反代变笨"的主因之一。见 GitHub kirodotdev/Kiro #6482。
+  // 拼接位置在 system 尾部,不影响 prompt cache prefix。
+  if (__injectExecutionDirective) {
+    const executionDirective = `
 <execution_discipline>
 当用户要求执行特定任务时，你必须遵循以下纪律：
 1. **目标锁定**：在整个会话中始终牢记用户的原始目标，不要在代码探索过程中迷失方向
@@ -935,7 +953,8 @@ export function claudeToKiro(
 6. **完整交付**：直到所有任务步骤都执行完毕才算完成
 </execution_discipline>
 `
-  systemPrompt = systemPrompt + '\n\n' + executionDirective
+    systemPrompt = systemPrompt + '\n\n' + executionDirective
+  }
 
   // 构建历史消息 - Kiro API 要求严格的 user -> assistant 交替
   const history: KiroHistoryMessage[] = []

@@ -32,7 +32,8 @@ import {
   createOpenaiStreamChunk,
   createClaudeStreamEvent,
   responsesToOpenAIChat,
-  openAIChatToResponsesResponse
+  openAIChatToResponsesResponse,
+  setInjectExecutionDirective
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
@@ -397,6 +398,9 @@ export class ProxyServer {
       return
     }
 
+    // v1.7.7 同步 prompt 注入开关到 translator module-level flag
+    setInjectExecutionDirective(this.config.injectExecutionDirective ?? false)
+
     // P0-2 安全护栏：外网绑定 + 无 API Key → 拒绝启动（用户可以显式 allowExternalWithoutApiKey 解除）
     if (this.isBindingExternal(this.config.host)) {
       const hasAnyKey = (this.config.apiKeys?.some(k => k.enabled && k.key) ?? false) || !!this.config.apiKey
@@ -670,6 +674,10 @@ export class ProxyServer {
     const enableWasOff = !this.config.enableModelCapabilityRouting
     const enableNowOn = config.enableModelCapabilityRouting === true
     this.config = { ...this.config, ...config }
+    // v1.7.7 同步 prompt 注入开关(字段可能未传 · undefined 保持当前值、false/true 同步)
+    if (config.injectExecutionDirective !== undefined) {
+      setInjectExecutionDirective(!!config.injectExecutionDirective)
+    }
     // 同步账号选择策略到 accountPool
     if (config.accountSelectionStrategy !== undefined) {
       this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
@@ -2303,7 +2311,8 @@ export class ProxyServer {
       'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
-      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog'
+      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog',
+      'injectExecutionDirective'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
     ]

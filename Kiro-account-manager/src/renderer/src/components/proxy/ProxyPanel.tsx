@@ -79,6 +79,8 @@ interface ProxyConfig {
   autoStart?: boolean
   clientDrivenToolExecution?: boolean
   disableTools?: boolean
+  // v1.7.7 是否往 system prompt 尾部注入中文 <execution_discipline> 纪律指令(默认 off)
+  injectExecutionDirective?: boolean
   payloadSizeLimitKB?: number
   enableTokenBufferReserve?: boolean
   tokenBufferReserve?: number
@@ -1227,6 +1229,22 @@ export function ProxyPanel() {
                       window.api.proxyUpdateConfig({ disableTools: checked })
                     }}
                     disabled={isRunning}
+                    className="scale-90"
+                  />
+                </div>
+              </div>
+              {/* v1.7.7 中文 execution_discipline 纪律指令注入开关 · 默认 off */}
+              <div className="space-y-1.5">
+                <Label htmlFor="injectExecDir" className="text-xs" title={isEn ? 'Inject a Chinese <execution_discipline> block at the end of every system prompt. Default OFF: introduced in v1.4.3 but suppresses model exploration/deep-thinking/clarification and mixes languages — a likely cause of feeling the model got "dumber" via proxy. Turn ON only if you specifically want a strict "execute without small talk" tone.' : '在每次请求的 system prompt 末尾注入中文 <execution_discipline> 纪律指令。默认关闭:v1.4.3 引入的强命令口吻会抑制模型的探索/深度思考/澄清追问,还会中英混杂污染,是"走反代变笨"的可能主因。只有明确需要模型"闷头执行不废话"风格时才开启。'}>{isEn ? 'Inject Execution Discipline' : '注入中文执行纪律'}</Label>
+                <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent">
+                  <span className="text-xs text-muted-foreground">{isEn ? 'v1.4.3 legacy · default off' : 'v1.4.3 遗留 · 默认关'}</span>
+                  <Switch
+                    id="injectExecDir"
+                    checked={config.injectExecutionDirective || false}
+                    onCheckedChange={(checked) => {
+                      setConfig(prev => ({ ...prev, injectExecutionDirective: checked }))
+                      window.api.proxyUpdateConfig({ injectExecutionDirective: checked })
+                    }}
                     className="scale-90"
                   />
                 </div>
