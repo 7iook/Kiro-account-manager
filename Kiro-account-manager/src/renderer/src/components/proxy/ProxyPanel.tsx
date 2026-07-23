@@ -87,6 +87,10 @@ interface ProxyConfig {
   // v1.7.6 模型能力路由(§3.3)
   enableModelCapabilityRouting?: boolean
   capabilityUnknownPolicy?: 'strict' | 'probe-once'
+  // v1.7.6 429 rate limit 重试策略(Kiro 后端概率式限流)
+  rateLimitRetryMaxAttempts?: number
+  rateLimitRetryBaseMs?: number
+  rateLimitRetryStrategy?: 'fast' | 'linear' | 'exponential'
   // 多账号轮询范围（与 main/proxy/types.ts 保持一致）
   multiAccountSelectionMode?: 'all' | 'groups'
   multiAccountGroupIds?: string[]
@@ -140,7 +144,7 @@ function ensureProxyResponseListenerRegistered(): void {
       credits: info.credits,
       responseTime: info.responseTime,
       error: info.error
-    }, ..._proxyRecentLogs.slice(0, 99)]
+    }, ..._proxyRecentLogs.slice(0, 499)]
     _refSetProxyRecentLogs?.(_proxyRecentLogs)
   })
 }
@@ -186,6 +190,8 @@ export function ProxyPanel() {
 
   const accounts = useAccountsStore(state => state.accounts)
   const groups = useAccountsStore(state => state.groups)
+  // 账号池热切换 · 2026-07-23 hot-swap-accounts
+  const switchProxyActiveAccount = useAccountsStore(state => state.switchProxyActiveAccount)
 
   // 生成随机 API Key
   const generateApiKey = useCallback(() => {
@@ -879,6 +885,89 @@ export function ProxyPanel() {
                 </span>
               </div>
             )}
+            {/* v1.7.6 429 概率式限流重试策略 · 通用适用(与多账号无关,单账号也生效) */}
+            <div className="col-span-3 flex items-center gap-3 flex-wrap p-2 rounded-md bg-warning/[0.04] border border-warning/20">
+              <Label className="text-sm shrink-0 font-medium" title={isEn ? 'Kiro backend uses probabilistic rate limit. Short backoff + more retries penetrates windows better.' : 'Kiro 后端是概率式限流,短 backoff + 高次数重试穿透窗口更快'}>
+                {isEn ? '429 Retry' : '429 重试'}:
+              </Label>
+              <div className="flex items-center gap-1.5">
+                <Label htmlFor="rlmax" className="text-xs text-muted-foreground">{isEn ? 'Max' : '次数'}</Label>
+                <Input
+                  id="rlmax"
+                  type="number"
+                  min={1}
+                  max={50}
+                  step={1}
+                  value={config.rateLimitRetryMaxAttempts ?? 8}
+                  onChange={(e) => {
+                    const v = Math.max(1, Math.min(50, parseInt(e.target.value) || 8))
+                    setConfig(prev => ({ ...prev, rateLimitRetryMaxAttempts: v }))
+                    window.api.proxyUpdateConfig({ rateLimitRetryMaxAttempts: v } as Partial<ProxyConfig>)
+                  }}
+                  className="w-16 h-7 text-xs"
+                />
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Label htmlFor="rlbase" className="text-xs text-muted-foreground">{isEn ? 'Base(ms)' : '基础(ms)'}</Label>
+                <Input
+                  id="rlbase"
+                  type="number"
+                  min={50}
+                  max={10000}
+                  step={50}
+                  value={config.rateLimitRetryBaseMs ?? 400}
+                  onChange={(e) => {
+                    const v = Math.max(50, Math.min(10000, parseInt(e.target.value) || 400))
+                    setConfig(prev => ({ ...prev, rateLimitRetryBaseMs: v }))
+                    window.api.proxyUpdateConfig({ rateLimitRetryBaseMs: v } as Partial<ProxyConfig>)
+                  }}
+                  className="w-20 h-7 text-xs"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <Label className="text-xs text-muted-foreground shrink-0">{isEn ? 'Strategy' : '策略'}</Label>
+                <div className="flex gap-1 bg-muted/30 rounded-lg p-0.5">
+                  {(['fast', 'linear', 'exponential'] as const).map(s => {
+                    const active = (config.rateLimitRetryStrategy || 'fast') === s
+                    const label = s === 'fast' ? (isEn ? 'Fast' : '快速')
+                      : s === 'linear' ? (isEn ? 'Linear' : '线性')
+                      : (isEn ? 'Exp' : '指数')
+                    return (
+                      <button
+                        key={s}
+                        type="button"
+                        className={`px-2 py-0.5 rounded text-xs font-medium transition-all ${
+                          active ? 'bg-primary text-primary-foreground shadow-sm'
+                                 : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                        }`}
+                        onClick={() => {
+                          setConfig(prev => ({ ...prev, rateLimitRetryStrategy: s }))
+                          window.api.proxyUpdateConfig({ rateLimitRetryStrategy: s } as Partial<ProxyConfig>)
+                        }}
+                      >
+                        {label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+              <span className="text-xs text-muted-foreground">
+                {(() => {
+                  const s = config.rateLimitRetryStrategy || 'fast'
+                  const b = config.rateLimitRetryBaseMs ?? 400
+                  const n = config.rateLimitRetryMaxAttempts ?? 8
+                  if (s === 'fast') return isEn
+                    ? `${b}ms ±25% jitter × ${n} attempts (~${(b * n / 1000).toFixed(1)}s total). Best for probabilistic rate limits.`
+                    : `${b}ms ±25% jitter × ${n} 次 (~${(b * n / 1000).toFixed(1)}s 总耗时) · 概率式限流最佳`
+                  if (s === 'linear') return isEn
+                    ? `${b}ms, ${b*2}ms, ${b*3}ms ... × ${n} attempts (cap 5s)`
+                    : `${b}ms, ${b*2}ms, ${b*3}ms ... × ${n} 次(封顶 5s)`
+                  return isEn
+                    ? `${b}ms, ${b*2}ms, ${b*4}ms ... × ${n} attempts (cap 15s, legacy)`
+                    : `${b}ms, ${b*2}ms, ${b*4}ms ... × ${n} 次(封顶 15s,旧行为)`
+                })()}
+              </span>
+            </div>
             {/* 多账号轮询范围：全部账号 / 指定分组 */}
             {config.enableMultiAccount && (() => {
               const selMode = config.multiAccountSelectionMode || 'all'
@@ -998,7 +1087,6 @@ export function ProxyPanel() {
                     variant="outline"
                     className="w-full justify-start"
                     onClick={() => setShowAccountSelectDialog(true)}
-                    disabled={isRunning}
                   >
                     <UserCheck className="h-4 w-4 mr-2" />
                     {config.selectedAccountId ? (
@@ -1690,6 +1778,11 @@ export function ProxyPanel() {
         onSelect={(accountId) => {
           setConfig(prev => ({ ...prev, selectedAccountId: accountId }))
           window.api.proxyUpdateConfig({ selectedAccountIds: accountId ? [accountId] : [] })
+          // 反代运行中 & 指定了账号 → 热切换主进程账号池的 currentIndex
+          // 详见 2026-07-23 hot-swap-accounts 决策卡 §3
+          if (isRunning && accountId) {
+            void switchProxyActiveAccount(accountId)
+          }
         }}
         isEn={isEn}
       />

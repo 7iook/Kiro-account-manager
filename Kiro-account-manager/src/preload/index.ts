@@ -827,6 +827,26 @@ const api = {
     return ipcRenderer.invoke('proxy-clear-account-suspended', accountId)
   },
 
+  // ============ 账号池热切换(反代运行中不 stop · 2026-07-23 hot-swap-accounts)============
+
+  // 热切换:强制下一次请求使用指定账号(单账号 & 多账号模式通用)
+  setActiveProxyAccount: (accountId: string): Promise<{
+    success: boolean
+    account?: { id: string; email?: string; isAvailable: boolean }
+    error?: string
+  }> => {
+    return ipcRenderer.invoke('proxy-set-active-account', { accountId })
+  },
+
+  // 热编辑账号池成员(add / remove / replace 互斥,replace 优先)
+  updateProxyPoolMembers: (payload: {
+    add?: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string; tokenEndpoint?: string; issuerUrl?: string; scopes?: string; groupId?: string; weight?: number }>
+    remove?: string[]
+    replace?: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string; tokenEndpoint?: string; issuerUrl?: string; scopes?: string; groupId?: string; weight?: number }>
+  }): Promise<{ success: boolean; addedCount?: number; removedCount?: number; poolSize?: number; error?: string }> => {
+    return ipcRenderer.invoke('proxy-update-pool-members', payload)
+  },
+
   // v1.7.6 能力路由 · 手动触发全池能力同步
   proxySyncCapabilities: (): Promise<{ success: boolean; total?: number; ok?: number; failed?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-sync-capabilities')

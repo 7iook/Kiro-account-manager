@@ -121,6 +121,19 @@ export class AccountPool {
     }
   }
 
+  // 热切换:强制下一次请求使用指定账号(round-robin 模式下"从此账号开始轮")
+  // 详见 2026-07-23 hot-swap-accounts 决策卡 §3
+  // @returns true 切换成功;false 账号不在池内
+  setActiveAccount(accountId: string): boolean {
+    const list = Array.from(this.accounts.keys())
+    const idx = list.indexOf(accountId)
+    if (idx < 0) return false
+    this.currentIndex = idx
+    // SWRR credit 状态重置,避免残留倾斜(仅 weighted 策略生效,其它策略无害)
+    this.swrr.reset()
+    return true
+  }
+
   // 获取下一个可用账号（粘滞 + 断路器 + 指数退避 + 概率重试）
   getNextAccount(excludeIds?: Set<string>): ProxyAccount | null {
     const accountList = Array.from(this.accounts.values())

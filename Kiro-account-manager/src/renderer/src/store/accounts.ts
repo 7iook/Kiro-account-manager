@@ -536,6 +536,18 @@ interface AccountsActions {
   }) => { distributed: number; perProxy: Record<string, number>; skipped: number }
   /** 读取账号绑定的代理 URL（供主进程同步用） */
   getAccountProxyUrl: (accountId: string) => string | undefined
+
+  // ============ 账号池热切换(反代运行中不 stop · 2026-07-23 hot-swap-accounts)============
+
+  /** 热切换:反代运行中强制下一次请求使用指定账号 */
+  switchProxyActiveAccount: (accountId: string) => Promise<{ success: boolean; error?: string }>
+
+  /** 热编辑账号池成员(add / remove / replace) */
+  syncPoolMembersToProxy: (payload: {
+    add?: Array<Record<string, unknown>>
+    remove?: string[]
+    replace?: Array<Record<string, unknown>>
+  }) => Promise<{ success: boolean; addedCount?: number; removedCount?: number; poolSize?: number; error?: string }>
 }
 
 type AccountsStore = AccountsState & AccountsActions
@@ -3425,6 +3437,35 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const proxy = state.proxyPool.get(proxyId)
     if (!proxy || !proxy.enabled || proxy.status === 'dead') return undefined
     return proxy.url
+  },
+
+  // ============ 账号池热切换 · 2026-07-23 hot-swap-accounts ============
+  switchProxyActiveAccount: async (accountId) => {
+    try {
+      const result = await window.api.setActiveProxyAccount(accountId)
+      if (!result.success) {
+        console.warn('[Store] switchProxyActiveAccount failed:', result.error)
+      }
+      return result
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error('[Store] switchProxyActiveAccount error:', msg)
+      return { success: false, error: msg }
+    }
+  },
+
+  syncPoolMembersToProxy: async (payload) => {
+    try {
+      const result = await window.api.updateProxyPoolMembers(payload as never)
+      if (!result.success) {
+        console.warn('[Store] syncPoolMembersToProxy failed:', result.error)
+      }
+      return result
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error('[Store] syncPoolMembersToProxy error:', msg)
+      return { success: false, error: msg }
+    }
   }
 }))
 

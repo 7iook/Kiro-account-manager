@@ -446,7 +446,20 @@ export function interceptConsole(): void {
     }
     // console 拦截路径同样经过统一脱敏 + Error 正规化，消除脱敏旁路与 Error 序列化成 {} 的问题
     const norm = normalizeAndRedactLogEntry(message, data)
-    return { timestamp: new Date().toISOString(), level, category, message: norm.message, data: norm.data }
+    // 生产 gate:INFO 级别 data 强制走 200B preview,消除 stringify 全对象的 CPU 峰值
+    // 详见 2026-07-23 frontend-freeze RCA 假设 B
+    let finalData = norm.data
+    if (app.isPackaged && level === 'INFO' && finalData != null) {
+      try {
+        const s = typeof finalData === 'string' ? finalData : JSON.stringify(finalData)
+        if (s.length > 200) {
+          finalData = s.slice(0, 200) + '…[+' + (s.length - 200) + 'B]'
+        }
+      } catch {
+        finalData = '[unserializable]'
+      }
+    }
+    return { timestamp: new Date().toISOString(), level, category, message: norm.message, data: finalData }
   }
 
   console.log = (...args: unknown[]) => {

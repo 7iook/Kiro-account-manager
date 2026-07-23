@@ -16,7 +16,7 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setTokenRefreshCallbackForModelFetch, setAccountModelSyncCallback, setAgentMode, KNOWN_SSO_OIDC_REGIONS, resolveApiKeyProfileArn, isKiroApiDebug, type KiroProfile } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setTokenRefreshCallbackForModelFetch, setAccountModelSyncCallback, setRateLimitRetryConfig, setAgentMode, KNOWN_SSO_OIDC_REGIONS, resolveApiKeyProfileArn, isKiroApiDebug, type KiroProfile } from './proxy/kiroApi'
 import { resolveProfileArnForVerify, buildCompleteLoginResult } from './proxy/profile-selection'
 import {
   writeKiroAuthTokenFile,
@@ -33,6 +33,7 @@ import { refreshOidcTokenAcrossRegions } from './oidcRefresh'
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
+import { installIpcSizeGuard } from './utils/emitToRenderer'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
@@ -409,6 +410,12 @@ function initProxyServer(): ProxyServer {
   if (config.tokenBufferReserve) {
     setTokenBufferReserve(config.tokenBufferReserve)
   }
+  // v1.7.6 恢复 429 rate limit 重试策略(包括 strategy 默认)
+  setRateLimitRetryConfig({
+    maxAttempts: config.rateLimitRetryMaxAttempts,
+    baseMs: config.rateLimitRetryBaseMs,
+    strategy: config.rateLimitRetryStrategy
+  })
   // 恢复 Agent 模式（vibe / spec）
   if (config.agentMode) {
     setAgentMode(config.agentMode)
@@ -2701,6 +2708,10 @@ function createWindow(): void {
     return { action: 'deny' }
   })
 
+  // ★ SSOT IPC 出口守卫 · 一处收口 · 防止大 payload 跨进程克隆卡死 renderer
+  // 详见 src/main/utils/emitToRenderer.ts 与 2026-07-23 frontend-freeze RCA
+  installIpcSizeGuard(mainWindow.webContents)
+
   // HMR for renderer base on electron-vite cli.
   // Load the remote URL for development or the local html file for production.
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
@@ -3139,6 +3150,125 @@ app.whenReady().then(async () => {
     } catch (err) {
       console.error('[account-set-proxy-binding] error:', err)
       return { success: false }
+    }
+  })
+
+  // ============ 账号池热切换(反代运行中不 stop)============
+  // 详见 2026-07-23 hot-swap-accounts 决策卡 §3
+  /**
+   * 强制下一次请求使用指定账号
+   * 校验:proxyServer 运行中 + 账号在池 + 非 suspended
+   * 错误码:PROXY_NOT_RUNNING / ACCOUNT_NOT_IN_POOL / ACCOUNT_NOT_AVAILABLE
+   * Idempotent:是(切到同一账号 no-op)
+   */
+  ipcMain.handle('proxy-set-active-account', (_event, params: { accountId?: string }) => {
+    try {
+      const accountId = params?.accountId
+      if (!accountId) {
+        return { success: false, error: 'ACCOUNT_NOT_IN_POOL' }
+      }
+      if (!proxyServer) {
+        return { success: false, error: 'PROXY_NOT_RUNNING' }
+      }
+      const pool = proxyServer.getAccountPool()
+      const acc = pool.getAccount(accountId)
+      if (!acc) {
+        return { success: false, error: 'ACCOUNT_NOT_IN_POOL' }
+      }
+      if (pool.isSuspended(acc)) {
+        return { success: false, error: 'ACCOUNT_NOT_AVAILABLE' }
+      }
+      const ok = pool.setActiveAccount(accountId)
+      if (!ok) {
+        return { success: false, error: 'ACCOUNT_NOT_IN_POOL' }
+      }
+      console.log(`[AccountPool] Hot-switch active account to ${acc.email || accountId.slice(0, 8)}`)
+      return {
+        success: true,
+        account: {
+          id: acc.id,
+          email: acc.email,
+          isAvailable: acc.isAvailable !== false
+        }
+      }
+    } catch (err) {
+      console.error('[proxy-set-active-account] error:', err)
+      return { success: false, error: err instanceof Error ? err.message : 'Unknown error' }
+    }
+  })
+
+  /**
+   * 热编辑账号池成员(add / remove / replace 互斥,replace 优先)
+   * 校验:操作后 pool 非空(replace 空数组 / remove 后为空 → 拒绝)
+   * 错误码:WOULD_EMPTY_POOL / INVALID_ACCOUNT_SHAPE
+   * Idempotent:add 是(已存在 update 不重复)· remove 是(不存在跳过)
+   */
+  ipcMain.handle('proxy-update-pool-members', (_event, params: {
+    add?: ProxyAccount[]
+    remove?: string[]
+    replace?: ProxyAccount[]
+  }) => {
+    try {
+      if (!proxyServer) {
+        return { success: false, error: 'PROXY_NOT_RUNNING' }
+      }
+      const pool = proxyServer.getAccountPool()
+      const { add, remove, replace } = params || {}
+
+      // replace 优先
+      if (Array.isArray(replace)) {
+        if (replace.length === 0) {
+          return { success: false, error: 'WOULD_EMPTY_POOL' }
+        }
+        for (const acc of replace) {
+          if (!acc?.id || !acc?.accessToken) {
+            return { success: false, error: 'INVALID_ACCOUNT_SHAPE' }
+          }
+        }
+        pool.clear()
+        for (const acc of replace) {
+          pool.addAccount(acc)
+        }
+        console.log(`[AccountPool] Hot-replace pool: ${replace.length} accounts`)
+        return { success: true, addedCount: replace.length, removedCount: 0, poolSize: pool.size }
+      }
+
+      // add / remove
+      let addedCount = 0
+      let removedCount = 0
+
+      if (Array.isArray(add)) {
+        for (const acc of add) {
+          if (!acc?.id || !acc?.accessToken) {
+            return { success: false, error: 'INVALID_ACCOUNT_SHAPE' }
+          }
+        }
+        for (const acc of add) {
+          // addAccount 覆盖式写入,幂等
+          pool.addAccount(acc)
+          addedCount++
+        }
+      }
+
+      if (Array.isArray(remove)) {
+        for (const id of remove) {
+          if (pool.getAccount(id)) {
+            pool.removeAccount(id)
+            removedCount++
+          }
+        }
+      }
+
+      // 操作后 pool 非空校验(仅在 remove 且未 add 的情况下才可能触发)
+      if (pool.size === 0) {
+        return { success: false, error: 'WOULD_EMPTY_POOL' }
+      }
+
+      console.log(`[AccountPool] Hot-update pool: +${addedCount}/-${removedCount}, size=${pool.size}`)
+      return { success: true, addedCount, removedCount, poolSize: pool.size }
+    } catch (err) {
+      console.error('[proxy-update-pool-members] error:', err)
+      return { success: false, error: err instanceof Error ? err.message : 'Unknown error' }
     }
   })
 
@@ -6999,6 +7129,14 @@ app.whenReady().then(async () => {
       }
       if (config.tokenBufferReserve !== undefined) {
         setTokenBufferReserve(config.tokenBufferReserve)
+      }
+      // v1.7.6 同步 429 rate limit 重试策略(任何一个字段变化就更新)
+      if (config.rateLimitRetryMaxAttempts !== undefined || config.rateLimitRetryBaseMs !== undefined || config.rateLimitRetryStrategy !== undefined) {
+        setRateLimitRetryConfig({
+          maxAttempts: config.rateLimitRetryMaxAttempts,
+          baseMs: config.rateLimitRetryBaseMs,
+          strategy: config.rateLimitRetryStrategy
+        })
       }
       // 同步 Agent 模式
       if (config.agentMode) {
