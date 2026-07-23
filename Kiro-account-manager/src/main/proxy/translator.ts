@@ -1215,6 +1215,15 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
           content: [{ text: resultContent }],
           status: 'success'
         })
+      } else if ((block.type as string) === 'web_search_tool_result') {
+        // Anthropic web_search 结果 block:history 带过去 Kiro 后端不识别会 400
+        // 参考:F:\kiro-rs converter.rs:1438 提取纯文本保留(轻量方案:直接跳过 · 用户可用 exa MCP 补)
+        console.log(`[Translator] Skipped web_search_tool_result in history`)
+        continue
+      } else if ((block.type as string) === 'server_tool_use') {
+        // history 里 user role 一般不带 server_tool_use,但防御性跳过
+        console.log(`[Translator] Skipped server_tool_use in user content`)
+        continue
       }
     }
   }
@@ -1245,6 +1254,12 @@ function extractClaudeAssistantContent(
         // redacted_thinking 是加密的思考内容，原样保留
         redactedContent = (redactedContent || '') + block.data
       } else if (block.type === 'tool_use' && block.id && block.name) {
+        // Anthropic hosted tool 在 history 里的 tool_use 也要跳过(Kiro 后端不识别)
+        // 呼应 §5.3 变体扫:请求侧 filter 了,history 侧也必须清干净
+        if (ANTHROPIC_HOSTED_TOOL_NAMES.has(block.name)) {
+          console.log(`[Translator] Skipped hosted tool_use in history: ${block.name}`)
+          continue
+        }
         if (!block.input || typeof block.input !== 'object' || Array.isArray(block.input)) {
           throw new Error(`tool_use requires object input: ${block.name}`)
         }
@@ -1253,6 +1268,11 @@ function extractClaudeAssistantContent(
           name: toolNameRegistry.toKiroName(block.name),
           input: block.input as Record<string, unknown>
         })
+      } else if ((block.type as string) === 'server_tool_use') {
+        // Anthropic server-side tool_use 块(比如 web_search 结果):history 带过去会导致 Kiro 400
+        // 参考:F:\kiro-rs converter.rs:1437 "server_tool_use 应被忽略"
+        console.log(`[Translator] Skipped server_tool_use in history`)
+        continue
       }
     }
   }
@@ -1276,13 +1296,57 @@ function extractClaudeAssistantContent(
   return { content, toolUses }
 }
 
+// Anthropic server-side hosted tools:由 Anthropic 后端自己执行,请求侧 tools 数组
+// 只带 { type, name, max_uses? },**无 input_schema** → 反代传给 Kiro 后端会因
+// toolSpecification.inputSchema.json = undefined 触发 400 REQUEST_BODY_INVALID。
+// 参考:F:\kiro-rs converter.rs:1049-1054、F:\9router translator/formats/claude.js:283
+// RCA: .agent-workspace/.archive/2026-07-23/hosted-tool-filter/hosted-tool-filter-rca.md
+const ANTHROPIC_HOSTED_TOOL_NAMES = new Set([
+  'web_search',
+  'bash',
+  'text_editor',
+  'str_replace_based_edit_tool',
+  'str_replace_editor',
+  'computer'
+])
+// Anthropic hosted tool 的 type 字段格式:`{name}_YYYYMMDD`(例 web_search_20250305)
+const ANTHROPIC_HOSTED_TOOL_TYPE_PATTERN =
+  /^(web_search|bash|text_editor|str_replace_based_edit_tool|str_replace_editor|computer)_\d{8}$/
+
+function isAnthropicHostedTool(tool: { name?: string; type?: string; input_schema?: unknown }): boolean {
+  // 判据 1:type 字段匹配 hosted tool 版本模式
+  if (typeof tool.type === 'string' && ANTHROPIC_HOSTED_TOOL_TYPE_PATTERN.test(tool.type)) {
+    return true
+  }
+  // 判据 2:name 在 hosted 白名单 且 input_schema 缺失/空对象(function tool 一定有 input_schema)
+  if (tool.name && ANTHROPIC_HOSTED_TOOL_NAMES.has(tool.name)) {
+    const schema = tool.input_schema
+    if (schema === undefined || schema === null) return true
+    if (typeof schema === 'object' && Object.keys(schema as Record<string, unknown>).length === 0) return true
+  }
+  return false
+}
+
 function convertClaudeTools(
-  tools: { name: string; description: string; input_schema: unknown; cache_control?: { type: string } }[] | undefined,
+  tools: { name: string; type?: string; description: string; input_schema: unknown; cache_control?: { type: string } }[] | undefined,
   toolNameRegistry: ToolNameRegistry
 ): KiroToolWrapper[] {
   if (!tools) return []
 
-  return tools.flatMap(tool => {
+  // Filter Anthropic hosted tools(Kiro 后端不支持 · 无 input_schema 会 400)
+  const dropped: string[] = []
+  const filtered = tools.filter(t => {
+    if (isAnthropicHostedTool(t)) {
+      dropped.push(t.type || t.name || '<unknown>')
+      return false
+    }
+    return true
+  })
+  if (dropped.length > 0) {
+    console.log(`[Translator] Dropped ${dropped.length} Anthropic hosted tool(s): ${dropped.join(', ')} (Kiro 后端不支持;客户端若需搜索请配置 MCP web-search)`)
+  }
+
+  return filtered.flatMap(tool => {
     let description = tool.description || `Tool: ${tool.name}`
     // 截断过长的描述
     if (description.length > KIRO_MAX_TOOL_DESC_LEN) {
