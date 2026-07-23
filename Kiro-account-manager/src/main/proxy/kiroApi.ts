@@ -62,6 +62,36 @@ export function setLogStreamEvents(enabled: boolean): void {
   logStreamEvents = enabled
 }
 
+// v1.7.6 429 rate limit 重试策略 · 前端可配
+// Kiro 后端是概率式限流(窗口随机),快速密集重试比慢退避更能穿透
+// 默认:8 次 · 400ms 起 · fast 策略(固定 + ±25% jitter),总耗时 ~4-6s
+export type RateLimitRetryStrategy = 'fast' | 'linear' | 'exponential'
+export interface RateLimitRetryConfig {
+  maxAttempts: number      // 每端点最大 429 重试次数
+  baseMs: number           // 基础 backoff 毫秒
+  strategy: RateLimitRetryStrategy
+}
+const rateLimitRetryConfig: RateLimitRetryConfig = {
+  maxAttempts: 8,
+  baseMs: 400,
+  strategy: 'fast'
+}
+export function setRateLimitRetryConfig(cfg: Partial<RateLimitRetryConfig>): void {
+  if (typeof cfg.maxAttempts === 'number' && cfg.maxAttempts > 0) {
+    rateLimitRetryConfig.maxAttempts = Math.max(1, Math.min(50, Math.floor(cfg.maxAttempts)))
+  }
+  if (typeof cfg.baseMs === 'number' && cfg.baseMs > 0) {
+    rateLimitRetryConfig.baseMs = Math.max(50, Math.min(10000, Math.floor(cfg.baseMs)))
+  }
+  if (cfg.strategy === 'fast' || cfg.strategy === 'linear' || cfg.strategy === 'exponential') {
+    rateLimitRetryConfig.strategy = cfg.strategy
+  }
+  console.log(`[KiroAPI] rateLimitRetryConfig updated: ${JSON.stringify(rateLimitRetryConfig)}`)
+}
+export function getRateLimitRetryConfig(): Readonly<RateLimitRetryConfig> {
+  return { ...rateLimitRetryConfig }
+}
+
 // Payload 大小限制（KB），用户可在高级设置中调整
 let payloadSizeLimitKB = 153600 // 默认 150MB（支持大图片）
 export function setPayloadSizeLimitKB(limitKB: number): void {
@@ -1552,18 +1582,33 @@ export async function callKiroApiStream(
         : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
 
       if (response.status === 429) {
-        // 429 = rate limit(短期请求过多),不是永久配额耗尽。
-        // 策略:同端点指数退避 + 重试(默认 3 次)。Retry-After header 优先(HTTP 标准)。
-        // 都失败才 continue 到下一端点。参考:GitHub kirodotdev/Kiro#8998 credits 充足也 429,
-        // 时间序列证明 rate limit 窗口通常 10-15 秒后恢复,退避重试能救回大多数 burst 失败。
-        const RATE_LIMIT_MAX_RETRIES = 3
+        // 429 = Kiro 后端概率式限流(不是真 QPS 上限,窗口随机开关)。
+        // 策略:短 backoff + 高重试次数 + jitter,让请求密集打向服务端有更大概率命中开窗。
+        // 之前策略 3 次 · 2s→5s→10s(exponential)对概率窗口过慢,大部分错过窗口 → 端点全打完 → 500。
+        // 新策略默认 8 次 · 400ms 起线性 + ±25% jitter,总耗时 ~4-6s 内密集试探。
+        // Retry-After header 优先(HTTP 标准),某些平台会给出真实等待时间。
+        // 参考:GitHub kirodotdev/Kiro#8998 credits 充足也 429。
+        // 前端 ProxyConfig 可调 rateLimitRetryMaxAttempts / rateLimitRetryBaseMs / rateLimitRetryStrategy。
+        const maxRetries = rateLimitRetryConfig.maxAttempts
+        const baseMs = rateLimitRetryConfig.baseMs
+        const strategy = rateLimitRetryConfig.strategy
         let retried = 0
-        while (response.status === 429 && retried < RATE_LIMIT_MAX_RETRIES) {
+        while (response.status === 429 && retried < maxRetries) {
           const retryAfterHeader = response.headers.get('retry-after')
           const asSec = retryAfterHeader ? parseInt(retryAfterHeader, 10) : NaN
-          const waitMs = !isNaN(asSec) && asSec > 0 ? Math.min(asSec * 1000, 15000)
-            : (retried === 0 ? 2000 : retried === 1 ? 5000 : 10000)
-          console.log(`[KiroAPI] ${endpoint.name} 429 rate-limited, backoff ${waitMs}ms retry ${retried + 1}/${RATE_LIMIT_MAX_RETRIES}`)
+          let waitMs: number
+          if (!isNaN(asSec) && asSec > 0) {
+            waitMs = Math.min(asSec * 1000, 15000)
+          } else if (strategy === 'exponential') {
+            waitMs = Math.min(baseMs * Math.pow(2, retried), 15000)
+          } else if (strategy === 'linear') {
+            waitMs = Math.min(baseMs + retried * baseMs, 5000)
+          } else {
+            // 'fast'(默认): 固定 baseMs + ±25% jitter,让并发请求错开重试
+            const jitter = (Math.random() - 0.5) * 0.5 * baseMs // ±25%
+            waitMs = Math.max(50, Math.round(baseMs + jitter))
+          }
+          console.log(`[KiroAPI] ${endpoint.name} 429 rate-limited, backoff ${waitMs}ms retry ${retried + 1}/${maxRetries} (strategy=${strategy})`)
           await new Promise(r => setTimeout(r, waitMs))
           throwIfAborted(signal)
           response = agent
@@ -1572,8 +1617,8 @@ export async function callKiroApiStream(
           retried++
         }
         if (response.status === 429) {
-          console.log(`[KiroAPI] ${endpoint.name} still rate-limited after ${RATE_LIMIT_MAX_RETRIES} retries, trying next endpoint...`)
-          lastError = new Error(`Rate limited on ${endpoint.name} after ${RATE_LIMIT_MAX_RETRIES} retries`)
+          console.log(`[KiroAPI] ${endpoint.name} still rate-limited after ${maxRetries} retries, trying next endpoint...`)
+          lastError = new Error(`Rate limited on ${endpoint.name} after ${maxRetries} retries`)
           continue
         }
         console.log(`[KiroAPI] ${endpoint.name} recovered from 429 after ${retried} retries`)
@@ -1611,6 +1656,17 @@ export async function callKiroApiStream(
         return
       }
       lastError = error as Error
+      const errMsgFull = (error as Error).message || String(error)
+      const errStack = (error as Error).stack || ''
+      // v1.7.6 调试:显式打出 error.message 让 UI 日志也能看到具体 body(不止 "failed:" 空串)
+      proxyLogger.error('KiroAPI', `Endpoint ${endpoint.name} failed: ${errMsgFull.slice(0, 500)}`, {
+        endpoint: endpoint.name,
+        endpointUrl: endpoint.url,
+        account: account.email || account.id?.slice(0, 8) || '?',
+        region: account.region,
+        arnRegion: parseRegionFromProfileArn(account.profileArn),
+        stack: errStack.split('\n').slice(0, 3).join(' | ')
+      })
       console.error(`[KiroAPI] Endpoint ${endpoint.name} failed:`, error)
       
       // 如果是认证错误，不继续尝试其他端点

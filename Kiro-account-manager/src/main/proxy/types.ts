@@ -596,6 +596,19 @@ export interface ProxyConfig {
   capabilityUnknownPolicy?: 'strict' | 'probe-once'
   /** 能力同步周期(ms,默认 3600000 = 1h)。fetchKiroModels 后台同步间隔 */
   modelCapabilitySyncIntervalMs?: number
+
+  // ============ v1.7.6 新增: 429 rate limit 重试策略(Kiro 后端概率式限流) ============
+  /** 每端点 429 最大重试次数,默认 8(区间 1-50) */
+  rateLimitRetryMaxAttempts?: number
+  /** 基础 backoff 毫秒,默认 400ms(区间 50-10000) */
+  rateLimitRetryBaseMs?: number
+  /**
+   * 重试 backoff 策略:
+   * - fast(默认): 固定 baseMs + ±25% jitter,密集打向概率限流窗口
+   * - linear: baseMs, baseMs*2, baseMs*3 ...(封顶 5s)
+   * - exponential: baseMs, baseMs*2, baseMs*4 ...(封顶 15s,旧默认行为)
+   */
+  rateLimitRetryStrategy?: 'fast' | 'linear' | 'exponential'
 }
 
 export interface TlsConfig {

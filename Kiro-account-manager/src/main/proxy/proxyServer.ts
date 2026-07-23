@@ -3137,6 +3137,14 @@ export class ProxyServer {
             resolve()
             return
           }
+          const errMsgFull = error.message || String(error)
+          // v1.7.6 调试:显式把 error 内容写到 UI 可见日志
+          proxyLogger.error('ProxyServer', `Stream error (OpenAI chat): ${errMsgFull.slice(0, 500)}`, {
+            path: '/v1/chat/completions',
+            model,
+            account: (account as { email?: string }).email || account.id?.slice(0, 8) || '?',
+            errorType: error.name || 'Error'
+          })
           console.error('[ProxyServer] Stream error:', error)
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
           res.end()
@@ -3556,6 +3564,14 @@ export class ProxyServer {
             resolve()
             return
           }
+          const errMsgFull2 = error.message || String(error)
+          // v1.7.6 调试:显式把 error 内容写到 UI 可见日志
+          proxyLogger.error('ProxyServer', `Stream error (Claude msg): ${errMsgFull2.slice(0, 500)}`, {
+            path: '/v1/messages',
+            model,
+            account: (account as { email?: string }).email || account.id?.slice(0, 8) || '?',
+            errorType: error.name || 'Error'
+          })
           console.error('[ProxyServer] Stream error:', error)
           const errorEvent = createClaudeStreamEvent('error', {
             error: { type: 'api_error', message: error.message }
