@@ -2561,10 +2561,22 @@ export class ProxyServer {
     this.recordNewRequest()
     this.throwIfAborted(signal)
     // v1.7.6 传入 modelId 让能力路由生效(gemini 端点也参与,§4.8 sweep)
+    const holdEnabledGemini = this.config.holdWhenNoAccount === true
     const account = await this.getAvailableAccount(signal, undefined, matchedApiKey?.id, openaiRequest.model)
     this.throwIfAborted(signal)
     if (!account) {
+      // Hold Gate 汇合点 A(task#5):开关开 → 挂起等待换号,而非现状直接 503。
+      if (holdEnabledGemini) {
+        await this.startGeminiWithHold(res, openaiRequest, modelId, startTime, matchedApiKey, isStream, signal)
+        return
+      }
       this.sendError(res, 503, 'No available accounts')
+      return
+    }
+
+    // Hold Gate 汇合点 B(task#5):选到号但首字节前失败 & 切号后无号 → 挂起。开关关 → 走下方原有路径,行为逐字不变。
+    if (holdEnabledGemini) {
+      await this.startGeminiWithHold(res, openaiRequest, modelId, startTime, matchedApiKey, isStream, signal, account)
       return
     }
 
@@ -2844,9 +2856,16 @@ export class ProxyServer {
 
     // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
+    const wantStreamChat = request.stream === true
+    const holdEnabledChat = this.config.holdWhenNoAccount === true
     const account = await this.getAvailableAccount(signal, affinityHintChat, matchedApiKey?.id, request.model)
     this.throwIfAborted(signal)
     if (!account) {
+      // Hold Gate 汇合点 A(task#5):开关开 → 挂起等待换号,而非现状直接 503。
+      if (holdEnabledChat) {
+        await this.startOpenAIChatWithHold(res, processedRequest, request.model, startTime, matchedApiKey, wantStreamChat, signal)
+        return
+      }
       this.recordRequestFailed()
       const quotaStatus = this.accountPool.getQuotaStatus()
       const errorMsg = quotaStatus.exhausted > 0 && quotaStatus.available === 0
@@ -2859,6 +2878,12 @@ export class ProxyServer {
     }
 
     this.events.onRequest?.({ path: '/v1/chat/completions', method: 'POST', accountId: account.id })
+
+    // Hold Gate 汇合点 B(task#5):选到号但首字节前失败 & 切号后无号 → 挂起。开关关 → 走下方原有路径,行为逐字不变。
+    if (holdEnabledChat) {
+      await this.startOpenAIChatWithHold(res, processedRequest, request.model, startTime, matchedApiKey, wantStreamChat, signal, account)
+      return
+    }
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
@@ -2965,9 +2990,15 @@ export class ProxyServer {
     }
 
     this.throwIfAborted(signal)
+    const holdEnabledResp = this.config.holdWhenNoAccount === true
     const account = await this.getAvailableAccount(signal, affinityHintResp, matchedApiKey?.id, chatRequest.model)
     this.throwIfAborted(signal)
     if (!account) {
+      // Hold Gate 汇合点 A(task#5):开关开 → 挂起等待换号,而非现状直接 503。
+      if (holdEnabledResp) {
+        await this.startOpenAIResponsesWithHold(res, processedRequest, responseRequest, chatRequest.model, startTime, matchedApiKey, processedRequest.stream === true, signal, undefined, affinityHintResp)
+        return
+      }
       this.recordRequestFailed()
       const quotaStatus = this.accountPool.getQuotaStatus()
       const errorMsg = quotaStatus.exhausted > 0 && quotaStatus.available === 0
@@ -2980,6 +3011,12 @@ export class ProxyServer {
     }
 
     this.events.onRequest?.({ path: '/v1/responses', method: 'POST', accountId: account.id })
+
+    // Hold Gate 汇合点 B(task#5):选到号但首字节前失败 & 切号后无号 → 挂起。开关关 → 走下方原有路径,行为逐字不变。
+    if (holdEnabledResp) {
+      await this.startOpenAIResponsesWithHold(res, processedRequest, responseRequest, chatRequest.model, startTime, matchedApiKey, processedRequest.stream === true, signal, account, affinityHintResp)
+      return
+    }
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
@@ -3089,7 +3126,11 @@ export class ProxyServer {
     headersSent: boolean = false,
     matchedApiKey?: import('./types').ApiKey,
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    // Hold Gate 接线(task#5,ADR-0001 边界 2):首字节前上游失败时回调。
+    // 返回 true = 已被挂起门闸接管(不发 error chunk,交给 resume 重试);false = 未接管,按现状发 error。
+    // 仅在"尚未写出任何语义正文(initial/content/tool chunk)"时才可能被调用。
+    onPreBodyError?: (error: Error) => boolean
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -3103,8 +3144,12 @@ export class ProxyServer {
     let toolCallIndex = 0
     const pendingToolCalls: Map<string, { index: number; name: string; arguments: string }> = new Map()
     let collectedContent = ''
-    // 发送初始 chunk（仅首轮）
-    if (currentRound === 0) {
+    // ADR-0001 边界 1(SSE bootstrap 时序):initial chunk(role:assistant)从"进入即发"延迟到"首个语义正文前"。
+    // 挂起态(resume 前)从不写出正文,故首字节前失败可无缝切号重放。currentRound>0(续接)视为已发。
+    let bodyStartSent = currentRound !== 0
+    const emitBodyStartOnce = () => {
+      if (bodyStartSent) return
+      bodyStartSent = true
       const initialChunk = createOpenaiStreamChunk(id, model, { role: 'assistant' })
       res.write(`data: ${JSON.stringify(initialChunk)}\n\n`)
     }
@@ -3115,6 +3160,8 @@ export class ProxyServer {
         kiroPayload,
         (text, toolUse, isThinking) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
+          // ADR-0001 边界 1:首个语义正文前惰性补发 initial chunk(恰好一次);此后 onPreBodyError 不再接管。
+          emitBodyStartOnce()
           if (text && text.trim()) {
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 reasoning_content
@@ -3155,7 +3202,9 @@ export class ProxyServer {
             resolve()
             return
           }
-          
+          // 空响应(上游未吐 chunk 即完成)也需补发 initial chunk,保证 SSE 完整。
+          emitBodyStartOnce()
+
           this.recordRequestSuccess()
           this.stats.totalTokens += usage.inputTokens + usage.outputTokens
           this.stats.inputTokens += usage.inputTokens
@@ -3217,12 +3266,26 @@ export class ProxyServer {
             errorType: error.name || 'Error'
           })
           console.error('[ProxyServer] Stream error:', error)
-          res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
-          res.end()
 
+          // Hold Gate 接线(task#5):先记账失败账号(recordError + suspended 检测),使 resume 拿号跳过它。
           this.recordRequestFailed()
           const errStatusCode = error.message.match(/(\d{3})/)?.[1]
           this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+          const suspendInfoOai = this.detectSuspendedError(error.message)
+          if (suspendInfoOai) {
+            const newlyMarked = this.accountPool.markSuspended(account.id, suspendInfoOai.reason, suspendInfoOai.message)
+            if (newlyMarked) this.events.onAccountSuspended?.({ accountId: account.id, email: (account as { email?: string }).email, reason: suspendInfoOai.reason, message: suspendInfoOai.message })
+          }
+
+          // ADR-0001 边界 2:仅在"尚未写出任何语义正文(bodyStartSent=false)"时,才允许挂起门闸接管。
+          if (!bodyStartSent && onPreBodyError?.(error)) {
+            this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 503, error: `held: ${error.message}` })
+            resolve()
+            return
+          }
+
+          res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
+          res.end()
           this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
@@ -3237,6 +3300,264 @@ export class ProxyServer {
         }
         resolve()
       })
+    })
+  }
+
+  /**
+   * Hold Gate OpenAI /v1/chat/completions 挂起编排(task#5)。流式复用 runWithHold + 改造后的 handleOpenAIStream;
+   * 非流式复用 runJsonRequestWithHold + callWithRetry。开关关时不走此路径,行为逐字不变。
+   */
+  private async startOpenAIChatWithHold(
+    res: http.ServerResponse,
+    processedRequest: OpenAIChatRequest,
+    model: string,
+    startTime: number,
+    matchedApiKey: import('./types').ApiKey | undefined,
+    stream: boolean,
+    signal?: AbortSignal,
+    seedAccount?: ProxyAccount
+  ): Promise<void> {
+    if (this.steeringPrompt) processedRequest.messages = this.injectSteeringOpenAI(processedRequest.messages)
+    const thinkingConfig = this.getThinkingConfig(processedRequest.model)
+    const affinityHint = processedRequest.conversation_id
+    const pickAccount = (_tried: Set<string>) => this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, model)
+
+    if (stream) {
+      // 先建 SSE 连接;initial chunk 由 handleOpenAIStream 惰性延迟到首字节。
+      if (!this.isResponseClosed(res)) res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+      const attempt = (acc: ProxyAccount): Promise<'done' | 'pre_body_failed'> => new Promise((resolveAttempt) => {
+        const toolNameRegistry = new ToolNameRegistry()
+        const kiroPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, thinkingConfig)
+        this.events.onRequest?.({ path: '/v1/chat/completions', method: 'POST', accountId: acc.id })
+        let settled = false
+        const onPreBodyError = (_e: Error): boolean => { if (!settled) { settled = true; resolveAttempt('pre_body_failed') } ; return true }
+        this.handleOpenAIStream(res, acc, kiroPayload, model, startTime, 0, undefined, true, matchedApiKey, toolNameRegistry, signal, onPreBodyError)
+          .then(() => { if (!settled) { settled = true; resolveAttempt('done') } })
+          .catch(() => { if (!settled) { settled = true; resolveAttempt('done') } })
+      })
+      await this.runWithHold({
+        res, startTime, signal, seedAccount, pickAccount, attempt,
+        sendPing: () => { if (!this.isResponseClosed(res)) res.write(': ping\n\n') },
+        onTimeoutError: () => { if (!this.isResponseClosed(res)) { res.write(`data: ${JSON.stringify({ error: { message: 'Hold timeout: no account became available in time (HOLD_TIMEOUT)' } })}\n\n`); res.end() } },
+        onTimeoutGracefulStop: () => { if (!this.isResponseClosed(res)) { const c = createOpenaiStreamChunk(`chatcmpl-${uuidv4()}`, model, { role: 'assistant', content: '[请求等待可用账号超时,请重新发送]' }, 'stop'); res.write(`data: ${JSON.stringify(c)}\n\n`); res.write('data: [DONE]\n\n'); res.end() } }
+      })
+      return
+    }
+
+    // 非流式
+    await this.runJsonRequestWithHold<{ result: Awaited<ReturnType<typeof callKiroApi>>; toolNameRegistry: ToolNameRegistry }>({
+      res, startTime, signal, seedAccount, path: '/v1/chat/completions', model, pickAccount,
+      doCall: async (acc) => {
+        const toolNameRegistry = new ToolNameRegistry()
+        this.events.onRequest?.({ path: '/v1/chat/completions', method: 'POST', accountId: acc.id })
+        const { result, account: usedAccount } = await this.callWithRetry(
+          acc, async (a) => callKiroApi(a, openaiToKiro(processedRequest, a.profileArn, toolNameRegistry, thinkingConfig), signal),
+          '/v1/chat/completions', signal, model
+        )
+        return { result: { result, toolNameRegistry } as any, account: usedAccount }
+      },
+      writeSuccess: (wrapped: any, usedAccount) => {
+        const { result, toolNameRegistry } = wrapped
+        const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, model, toolNameRegistry, result.reasoningContent)
+        this.recordRequestSuccess()
+        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
+        this.stats.inputTokens += result.usage.inputTokens
+        this.stats.outputTokens += result.usage.outputTokens
+        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(response))
+        const respTime = Date.now() - startTime
+        this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
+        this.recordRequest({ path: '/v1/chat/completions', model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
+        if (matchedApiKey) this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, model, '/v1/chat/completions')
+      },
+      onTimeoutError: () => { if (!this.isResponseClosed(res)) this.sendError(res, 503, 'Hold timeout: no account became available in time (HOLD_TIMEOUT)') },
+      onTimeoutGracefulStop: () => { if (!this.isResponseClosed(res)) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ id: `chatcmpl-${uuidv4()}`, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: 'assistant', content: '[请求等待可用账号超时,请重新发送]' }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } })) } }
+    })
+  }
+
+  /**
+   * Hold Gate OpenAI /v1/responses 挂起编排(task#5)。responses 是"伪流式"(先 callWithRetry 拿完整结果再拆成 SSE 事件),
+   * 故流式/非流式都用 runJsonRequestWithHold:doCall=callWithRetry;writeSuccess 里按 stream 写 SSE 事件序列或 JSON。
+   * 流式的 response.created 首字节延迟到拿到 result 后才写(writeSuccess 内),使首字节前失败可挂起。
+   */
+  private async startOpenAIResponsesWithHold(
+    res: http.ServerResponse,
+    processedRequest: OpenAIChatRequest,
+    responseRequest: OpenAIResponsesRequest,
+    model: string,
+    startTime: number,
+    matchedApiKey: import('./types').ApiKey | undefined,
+    stream: boolean,
+    signal?: AbortSignal,
+    seedAccount?: ProxyAccount,
+    affinityHint?: string
+  ): Promise<void> {
+    if (stream && !this.isResponseClosed(res)) {
+      // 先建 SSE 连接(空头,尚不写 response.created,延迟到拿到结果)。
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+    }
+    await this.runJsonRequestWithHold<{ result: Awaited<ReturnType<typeof callKiroApi>>; toolNameRegistry: ToolNameRegistry }>({
+      res, startTime, signal, seedAccount, path: '/v1/responses', model,
+      pickAccount: (_tried) => this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, model),
+      doCall: async (acc) => {
+        const toolNameRegistry = new ToolNameRegistry()
+        this.events.onRequest?.({ path: '/v1/responses', method: 'POST', accountId: acc.id })
+        const { result, account: usedAccount } = await this.callWithRetry(
+          acc, async (a) => callKiroApi(a, openaiToKiro(processedRequest, a.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model)), signal),
+          '/v1/responses', signal, model
+        )
+        return { result: { result, toolNameRegistry } as any, account: usedAccount }
+      },
+      writeSuccess: (wrapped: any, usedAccount) => {
+        const { result, toolNameRegistry } = wrapped
+        const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, model, toolNameRegistry, result.reasoningContent)
+        const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
+        const commonRecord = () => {
+          this.recordRequestSuccess()
+          this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
+          this.stats.inputTokens += result.usage.inputTokens
+          this.stats.outputTokens += result.usage.outputTokens
+          this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+          const respTime = Date.now() - startTime
+          this.events.onResponse?.({ path: '/v1/responses', model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
+          this.recordRequest({ path: '/v1/responses', model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
+          if (matchedApiKey) this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, model, '/v1/responses')
+        }
+        if (stream) {
+          const responseId = `resp_${uuidv4()}`
+          res.write(`event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: responseId, object: 'response', created_at: Math.floor(Date.now() / 1000), model, output: [] } })}\n\n`)
+          const streamedResponse = { ...response, id: responseId }
+          streamedResponse.output.forEach((item, outputIndex) => {
+            res.write(`event: response.output_item.added\ndata: ${JSON.stringify({ type: 'response.output_item.added', output_index: outputIndex, item })}\n\n`)
+            if (item.type === 'message') {
+              item.content.forEach((part, contentIndex) => {
+                res.write(`event: response.content_part.added\ndata: ${JSON.stringify({ type: 'response.content_part.added', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part: { type: part.type, text: '' } })}\n\n`)
+                if (part.text) res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', item_id: item.id, output_index: outputIndex, content_index: contentIndex, delta: part.text })}\n\n`)
+                res.write(`event: response.output_text.done\ndata: ${JSON.stringify({ type: 'response.output_text.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, text: part.text })}\n\n`)
+                res.write(`event: response.content_part.done\ndata: ${JSON.stringify({ type: 'response.content_part.done', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part })}\n\n`)
+              })
+            } else {
+              if (item.arguments) res.write(`event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: item.id, output_index: outputIndex, delta: item.arguments })}\n\n`)
+              res.write(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.done', item_id: item.id, output_index: outputIndex, arguments: item.arguments })}\n\n`)
+            }
+            res.write(`event: response.output_item.done\ndata: ${JSON.stringify({ type: 'response.output_item.done', output_index: outputIndex, item })}\n\n`)
+          })
+          res.write(`event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: streamedResponse })}\n\n`)
+          res.end()
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(response))
+        }
+        commonRecord()
+      },
+      onTimeoutError: () => {
+        if (this.isResponseClosed(res)) return
+        if (stream) { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', message: 'Hold timeout: no account became available in time (HOLD_TIMEOUT)' })}\n\n`); res.end() }
+        else this.sendError(res, 503, 'Hold timeout: no account became available in time (HOLD_TIMEOUT)')
+      },
+      onTimeoutGracefulStop: () => {
+        if (this.isResponseClosed(res)) return
+        if (stream) { const rid = `resp_${uuidv4()}`; res.write(`event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: rid, object: 'response', created_at: Math.floor(Date.now() / 1000), model, output: [] } })}\n\n`); res.write(`event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: rid, object: 'response', model, output: [{ type: 'message', id: `msg_${uuidv4()}`, role: 'assistant', content: [{ type: 'output_text', text: '[请求等待可用账号超时,请重新发送]' }] }] } })}\n\n`); res.end() }
+        else { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ id: `resp_${uuidv4()}`, object: 'response', model, output: [{ type: 'message', id: `msg_${uuidv4()}`, role: 'assistant', content: [{ type: 'output_text', text: '[请求等待可用账号超时,请重新发送]' }] }] })) }
+      }
+    })
+  }
+
+  /**
+   * Hold Gate Gemini(/v1beta generateContent|streamGenerateContent)挂起编排(task#5)。
+   * 流式复用 runWithHold(内联 attempt 调 callKiroApiStream + candidates chunk 首字节延迟);
+   * 非流式复用 runJsonRequestWithHold(doCall=callKiroApi 单次)。开关关时不走此路径,行为逐字不变。
+   */
+  private async startGeminiWithHold(
+    res: http.ServerResponse,
+    openaiRequest: OpenAIChatRequest,
+    modelId: string,
+    startTime: number,
+    matchedApiKey: import('./types').ApiKey | undefined,
+    isStream: boolean,
+    signal?: AbortSignal,
+    seedAccount?: ProxyAccount
+  ): Promise<void> {
+    const model = openaiRequest.model
+    const pickAccount = (_tried: Set<string>) => this.getAvailableAccount(signal, undefined, matchedApiKey?.id, model)
+
+    if (isStream) {
+      if (!this.isResponseClosed(res)) res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+      const attempt = (acc: ProxyAccount): Promise<'done' | 'pre_body_failed'> => new Promise((resolveAttempt) => {
+        const toolNameRegistry = new ToolNameRegistry()
+        const kiroPayload = openaiToKiro(openaiRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(model))
+        this.events.onRequest?.({ path: '/v1beta', method: 'POST', accountId: acc.id })
+        let settled = false
+        let bodyStarted = false
+        callKiroApiStream(
+          acc as ProxyAccount, kiroPayload,
+          (text) => {
+            if (signal?.aborted || this.isResponseClosed(res)) return
+            bodyStarted = true // 首个 candidates chunk 即语义正文,此后不可挂起重放
+            if (text) { const chunk = { candidates: [{ content: { parts: [{ text }], role: 'model' }, finishReason: null }] }; res.write(`data: ${JSON.stringify(chunk)}\n\n`) }
+            return this.waitForDrain(res)
+          },
+          (usage) => {
+            if (signal?.aborted || this.isResponseClosed(res)) { if (!settled) { settled = true; resolveAttempt('done') } ; return }
+            const finalChunk = { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: usage.inputTokens, candidatesTokenCount: usage.outputTokens, totalTokenCount: usage.inputTokens + usage.outputTokens } }
+            res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
+            res.end()
+            this.recordRequestSuccess()
+            this.stats.totalTokens += usage.inputTokens + usage.outputTokens
+            this.stats.inputTokens += usage.inputTokens
+            this.stats.outputTokens += usage.outputTokens
+            this.stats.totalCredits += usage.credits || 0
+            this.accountPool.recordSuccess(acc.id, usage.inputTokens + usage.outputTokens)
+            if (!settled) { settled = true; resolveAttempt('done') }
+          },
+          (error) => {
+            if (this.isAbortError(error, signal) || this.isResponseClosed(res)) { if (!settled) { settled = true; resolveAttempt('done') } ; return }
+            // 记账失败账号(recordError + suspended 检测),使 resume 跳过它。
+            this.recordRequestFailed()
+            const sc = error.message.match(/(\d{3})/)?.[1]
+            this.accountPool.recordError(acc.id, sc ? classifyError(parseInt(sc)) : ErrorType.RECOVERABLE, sc ? parseInt(sc) : undefined)
+            const susp = this.detectSuspendedError(error.message)
+            if (susp) { const nm = this.accountPool.markSuspended(acc.id, susp.reason, susp.message); if (nm) this.events.onAccountSuspended?.({ accountId: acc.id, email: (acc as { email?: string }).email, reason: susp.reason, message: susp.message }) }
+            // 首字节前失败 → 交给 runWithHold 切号/挂起;已吐正文 → 现状 error。
+            if (!bodyStarted) { if (!settled) { settled = true; resolveAttempt('pre_body_failed') } ; return }
+            res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
+            res.end()
+            if (!settled) { settled = true; resolveAttempt('done') }
+          },
+          signal, this.config.preferredEndpoint
+        ).catch(() => { if (!settled) { settled = true; resolveAttempt('done') } })
+      })
+      await this.runWithHold({
+        res, startTime, signal, seedAccount, pickAccount, attempt,
+        sendPing: () => { if (!this.isResponseClosed(res)) res.write(': ping\n\n') },
+        onTimeoutError: () => { if (!this.isResponseClosed(res)) { res.write(`data: ${JSON.stringify({ error: { message: 'Hold timeout (HOLD_TIMEOUT)' } })}\n\n`); res.end() } },
+        onTimeoutGracefulStop: () => { if (!this.isResponseClosed(res)) { res.write(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: '[请求等待可用账号超时,请重新发送]' }], role: 'model' }, finishReason: 'STOP' }] })}\n\n`); res.end() } }
+      })
+      return
+    }
+
+    // 非流式
+    await this.runJsonRequestWithHold<Awaited<ReturnType<typeof callKiroApi>>>({
+      res, startTime, signal, seedAccount, path: '/v1beta', model: modelId, pickAccount,
+      doCall: async (acc) => {
+        const toolNameRegistry = new ToolNameRegistry()
+        this.events.onRequest?.({ path: '/v1beta', method: 'POST', accountId: acc.id })
+        const result = await callKiroApi(acc, openaiToKiro(openaiRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(model)), signal)
+        return { result, account: acc }
+      },
+      writeSuccess: (result, usedAccount) => {
+        this.recordRequestSuccess()
+        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
+        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({
+          candidates: [{ content: { parts: [{ text: result.content }], role: 'model' }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: result.usage.inputTokens, candidatesTokenCount: result.usage.outputTokens, totalTokenCount: result.usage.inputTokens + result.usage.outputTokens }
+        }))
+      },
+      onTimeoutError: () => { if (!this.isResponseClosed(res)) this.sendError(res, 503, 'Hold timeout (HOLD_TIMEOUT)') },
+      onTimeoutGracefulStop: () => { if (!this.isResponseClosed(res)) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: '[请求等待可用账号超时,请重新发送]' }], role: 'model' }, finishReason: 'STOP' }] })) } }
     })
   }
 
@@ -3284,10 +3605,11 @@ export class ProxyServer {
     const account = await this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, request.model)
     this.throwIfAborted(signal)
     if (!account) {
-      // Hold Gate 汇合点 A(方案 §1 状态机 RECEIVED→无号):流式 + 开关开 → 挂起等待换号,
-      // 而非现状直接 503。resume 时重新拿号 + 重跑完整流式转发(见 startClaudeStreamWithHold)。
-      if (wantStream && holdEnabled) {
-        await this.startClaudeStreamWithHold(res, processedRequest, request.model, startTime, matchedApiKey, signal)
+      // Hold Gate 汇合点 A(方案 §1 状态机 RECEIVED→无号):开关开 → 挂起等待换号,而非现状直接 503。
+      // 流式走 SSE 挂起编排;非流式(task#5)走 JSON 挂起编排(无心跳,HTTP keep-alive 硬等)。
+      if (holdEnabled) {
+        if (wantStream) await this.startClaudeStreamWithHold(res, processedRequest, request.model, startTime, matchedApiKey, signal)
+        else await this.startClaudeNonStreamWithHold(res, processedRequest, request.model, startTime, matchedApiKey, signal)
         return
       }
       this.recordRequestFailed()
@@ -3304,10 +3626,11 @@ export class ProxyServer {
     this.events.onRequest?.({ path: '/v1/messages', method: 'POST', accountId: account.id })
 
     // Hold Gate 汇合点 B(方案 §1:选到号但首字节前上游失败 & 切号后无号):
-    // 流式 + 开关开时,把首次拿到的号交给带挂起感知的转发器 —— 它在首字节前失败(且未吐正文)
-    // 时进入 HELD,而非直接发 SSE error。非流式 / 开关关 → 走下方原有路径,行为逐字不变。
-    if (wantStream && holdEnabled) {
-      await this.startClaudeStreamWithHold(res, processedRequest, request.model, startTime, matchedApiKey, signal, account)
+    // 开关开时,把首次拿到的号交给带挂起感知的转发器 —— 首字节前失败(且未吐正文)时进入 HELD,
+    // 而非直接报错。流式走 SSE 编排,非流式(task#5)走 JSON 编排。开关关 → 走下方原有路径,行为逐字不变。
+    if (holdEnabled) {
+      if (wantStream) await this.startClaudeStreamWithHold(res, processedRequest, request.model, startTime, matchedApiKey, signal, account)
+      else await this.startClaudeNonStreamWithHold(res, processedRequest, request.model, startTime, matchedApiKey, signal, account)
       return
     }
 
@@ -3400,7 +3723,153 @@ export class ProxyServer {
   }
 
   /**
-   * Hold Gate 流式转发编排(task#3 收口 · ADR-0001)。
+   * 通用挂起编排(task#5 · 5 端点复用 · 消除 shotgun surgery)。
+   * 主循环:seed/拿号 → attempt 一次转发 → 首字节前失败则切下一个未试号 → 无号则 enterHold 等换号 → resume 重跑。
+   * 各端点通过回调注入差异(attempt 的转发/首字节前失败检测、sendPing 心跳、超时收尾格式),编排主体共用。
+   * 绝对 deadline 从 startTime 起算,全程不重置(Invariant 3);超时收尾由 HoldGate 按 timeoutAction 驱动对应回调。
+   * @returns attempt 返回 'done'(终态:成功 / 已吐正文失败 / abort)即结束;'pre_body_failed'(首字节前失败)可切号或挂起。
+   */
+  private async runWithHold(opts: {
+    res: http.ServerResponse
+    startTime: number
+    signal: AbortSignal | undefined
+    seedAccount: ProxyAccount | undefined
+    /** 拿一个可用号(内部去重由 runWithHold 负责,回调只需返回池给的号或 null)。 */
+    pickAccount: (triedIds: Set<string>) => Promise<ProxyAccount | null>
+    /** 用一个账号做一次完整转发。返回 'done' 或 'pre_body_failed'(可切号/挂起)。 */
+    attempt: (acc: ProxyAccount) => Promise<'done' | 'pre_body_failed'>
+    /** 挂起态心跳(流式写 SSE ping / 注释行;非流式无通道则 no-op)。 */
+    sendPing: () => void
+    /** 超时收尾 - error(触及绝对 deadline 且 timeoutAction=error):按端点格式发失败信号。 */
+    onTimeoutError: () => void
+    /** 超时收尾 - graceful_stop:按端点格式发"干净结束"信号。 */
+    onTimeoutGracefulStop: () => void
+  }): Promise<void> {
+    const { res, startTime, signal, seedAccount, pickAccount, attempt, sendPing, onTimeoutError, onTimeoutGracefulStop } = opts
+    // 本次请求已试过的账号(避免 resume/切号反复命中同一挂账号)。
+    const triedIds = new Set<string>()
+
+    const pickFresh = async (): Promise<ProxyAccount | null> => {
+      const acc = await pickAccount(triedIds)
+      if (acc && !triedIds.has(acc.id)) return acc
+      return null
+    }
+
+    // 挂起等待:进入 HELD,直到 resume(手动/自动)/ 超时 / abort 认领。返回 true=被 resume(应重试),false=终态。
+    const waitInHold = (): Promise<boolean> => {
+      return new Promise<boolean>((resolveHold) => {
+        let holdId = 0
+        const settleHold = (retry: boolean): void => { this.emitHeldRequestsChanged(); resolveHold(retry) }
+        const hooks: HeldRequestHooks = {
+          sendPing,
+          resume: () => settleHold(true),
+          sendError: () => { onTimeoutError(); this.recordRequestFailed(); settleHold(false) },
+          sendGracefulStop: () => { onTimeoutGracefulStop(); this.recordRequestFailed(); settleHold(false) }
+        }
+        holdId = this.holdGate.enterHold({ receivedAt: startTime, hooks })
+        this.emitHeldRequestsChanged()
+        // 客户端中途断开 → abort 该挂起条目(停心跳、清 timer、认领作废),视为终态。
+        const onAbort = (): void => { this.holdGate.abort(holdId); this.emitHeldRequestsChanged(); settleHold(false) }
+        if (signal) {
+          if (signal.aborted) { onAbort(); return }
+          signal.addEventListener('abort', onAbort, { once: true })
+        }
+      })
+    }
+
+    let acc: ProxyAccount | null = seedAccount ?? await pickFresh()
+    for (;;) {
+      if (this.isResponseClosed(res)) return
+      if (!acc) {
+        const shouldRetry = await waitInHold()
+        if (!shouldRetry) return // 超时/abort 终态
+        acc = await pickFresh()
+        if (!acc) { triedIds.clear(); acc = await pickFresh() } // resume 后仍未拿到(去抖竞争),清 tried 再试一次
+        continue
+      }
+      triedIds.add(acc.id)
+      const outcome = await attempt(acc)
+      if (outcome === 'done') return // 终态(成功 / 已吐正文失败 / abort)
+      // 首字节前失败:先即时切下一个未试过的号,拿不到再挂起。
+      acc = await pickFresh()
+    }
+  }
+
+  /**
+   * 判断一个上游错误是否"值得挂起"(账号级可恢复错误 —— 换个号/等配额恢复就能好)。
+   * 命中 = 401/403/Auth / 402/429/quota/throttle/limit / 5xx / suspended → 返回 true(可切号或挂起);
+   * 未命中(如 400 malformed、校验失败)= 请求本身有问题,换号无用,应原样报错 → false。
+   * 判据与 callWithRetry 的切号分支保持一致(SSOT:同一套"何时切号"的语义)。
+   */
+  private isHoldWorthyError(errMsg: string): boolean {
+    if (!errMsg) return false
+    if (this.detectSuspendedError(errMsg)) return true
+    return (
+      errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('Auth') ||
+      errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') ||
+      errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') ||
+      errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') ||
+      errMsg.includes('rate limit') ||
+      errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504')
+    )
+  }
+
+  /**
+   * 非流式(JSON)请求的通用挂起编排(task#5 · 3 个 JSON 端点复用:Claude 非流式 / OpenAI chat 非流式 / responses 非流式)。
+   * 复用 runWithHold 核心,attempt 内跑 callWithRetry(保留其端点切换/token 刷新/suspended 检测能力):
+   *   - callWithRetry 成功 → writeSuccess 写响应 → 'done';
+   *   - 抛账号级可恢复错误(isHoldWorthyError)→ 'pre_body_failed'(runWithHold 切号,无号则挂起);
+   *   - 抛请求本身错误(400 等)→ handleApiError 原样报错 → 'done'(换号无用,不挂起)。
+   * 非流式无 SSE 心跳通道:挂起期间靠 HTTP keep-alive 硬等,受 holdTotalBudgetMs 约束(方案"实现约束");
+   * 若客户端 HTTP 层超时早于此,连接断开触发 abort → 退化为原有报错(不比现状差)。
+   * @param doCall 用给定账号做一次带重试的上游调用(内部 callWithRetry);seedAccount 作为首个尝试号。
+   */
+  private async runJsonRequestWithHold<T>(opts: {
+    res: http.ServerResponse
+    startTime: number
+    signal: AbortSignal | undefined
+    seedAccount: ProxyAccount | undefined
+    path: string
+    model: string
+    pickAccount: (triedIds: Set<string>) => Promise<ProxyAccount | null>
+    doCall: (acc: ProxyAccount) => Promise<{ result: T; account: ProxyAccount }>
+    writeSuccess: (result: T, usedAccount: ProxyAccount) => void
+    /** 超时收尾 - error:按端点格式发失败响应(headers 尚未发,可直接 writeHead+end)。 */
+    onTimeoutError: () => void
+    /** 超时收尾 - graceful_stop:按端点格式发"干净结束"响应。 */
+    onTimeoutGracefulStop: () => void
+  }): Promise<void> {
+    const attempt = async (acc: ProxyAccount): Promise<'done' | 'pre_body_failed'> => {
+      try {
+        const { result, account: usedAccount } = await opts.doCall(acc)
+        if (this.isResponseClosed(opts.res)) return 'done'
+        opts.writeSuccess(result, usedAccount)
+        return 'done'
+      } catch (error) {
+        if (this.isAbortError(error, opts.signal) || this.isResponseClosed(opts.res)) return 'done'
+        const errMsg = (error as Error).message || String(error)
+        // 账号级可恢复错误(callWithRetry 已把失败号记账/切号耗尽)→ 交给 runWithHold 切号或挂起。
+        if (this.isHoldWorthyError(errMsg)) return 'pre_body_failed'
+        // 请求本身错误(换号无用)→ 原样报错,不挂起。
+        this.handleApiError(opts.res, acc, error as Error, opts.path, opts.model, opts.startTime, opts.signal)
+        return 'done'
+      }
+    }
+    await this.runWithHold({
+      res: opts.res,
+      startTime: opts.startTime,
+      signal: opts.signal,
+      seedAccount: opts.seedAccount,
+      pickAccount: opts.pickAccount,
+      attempt,
+      sendPing: () => { /* 非流式无 SSE 心跳通道:靠 HTTP keep-alive 硬等(方案实现约束) */ },
+      onTimeoutError: opts.onTimeoutError,
+      onTimeoutGracefulStop: opts.onTimeoutGracefulStop
+    })
+  }
+
+  /**
+   * Hold Gate 流式转发编排(task#3 收口 · ADR-0001;task#5 重构为复用 runWithHold)。
    * 封装"拿号 → 构造 payload → handleClaudeStream"一次尝试,并在两个失败汇合点接挂起门闸:
    *   ① 无可用号(首次或切号后)→ enterHold 等待换号(手动放行 / 池自动检测),resume 重跑;
    *   ② 首字节前上游失败(未吐正文)→ 先即时切下一个号重试,无号可切 → enterHold。
@@ -3428,20 +3897,11 @@ export class ProxyServer {
     }
     const claudeThinkingConfig = this.getThinkingConfig(processedRequest.model)
     const affinityHint = processedRequest.conversation_id
-    // 本次请求已试过的账号(避免 resume/切号反复命中同一挂账号)。
-    const triedIds = new Set<string>()
-
-    // SSE ping 心跳:挂起态保活客户端 watchdog(ADR-0001 边界 1)。
-    const sendPing = (): void => {
-      if (this.isResponseClosed(res)) return
-      res.write('event: ping\ndata: {"type":"ping"}\n\n')
-    }
 
     // 用一个账号做一次完整流式转发。返回 'done'(终态:成功/已吐正文的失败/abort)
     // 或 'pre_body_failed'(首字节前失败,可切号或挂起)。
-    const attemptOnce = (acc: ProxyAccount): Promise<'done' | 'pre_body_failed'> => {
+    const attempt = (acc: ProxyAccount): Promise<'done' | 'pre_body_failed'> => {
       return new Promise<'done' | 'pre_body_failed'>((resolveAttempt) => {
-        triedIds.add(acc.id)
         const toolNameRegistry = new ToolNameRegistry()
         const kiroPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, claudeThinkingConfig)
         const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length * 0.3))
@@ -3470,75 +3930,99 @@ export class ProxyServer {
       })
     }
 
-    // 拿一个"未试过的"可用号;无则 null。
-    const pickFreshAccount = async (): Promise<ProxyAccount | null> => {
-      const acc = await this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, model)
-      if (acc && !triedIds.has(acc.id)) return acc
-      return null
-    }
-
-    // 挂起等待:进入 HELD,直到 resume(手动/自动)/ 超时 / abort 认领。返回 true=被 resume(应重试),false=终态(超时/abort)。
-    const waitInHold = (): Promise<boolean> => {
-      return new Promise<boolean>((resolveHold) => {
-        let holdId = 0
-        const settleHold = (retry: boolean): void => { this.emitHeldRequestsChanged(); resolveHold(retry) }
-        const hooks: HeldRequestHooks = {
-          sendPing,
-          resume: () => settleHold(true),
-          sendError: () => {
-            if (!this.isResponseClosed(res)) {
-              const errorEvent = createClaudeStreamEvent('error', { error: { type: 'overloaded_error', message: 'Hold timeout: no account became available in time (HOLD_TIMEOUT)' } })
-              res.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
-              res.end()
-            }
-            this.recordRequestFailed()
-            settleHold(false)
-          },
-          sendGracefulStop: () => {
-            if (!this.isResponseClosed(res)) {
-              const msgStart = createClaudeStreamEvent('message_start', { message: { id: `msg_${uuidv4()}`, type: 'message', role: 'assistant', content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } })
-              res.write(`event: message_start\ndata: ${JSON.stringify(msgStart)}\n\n`)
-              const blockStart = createClaudeStreamEvent('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
-              res.write(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`)
-              const delta = createClaudeStreamEvent('content_block_delta', { index: 0, delta: { type: 'text_delta', text: '[请求等待可用账号超时,请重新发送]' } })
-              res.write(`event: content_block_delta\ndata: ${JSON.stringify(delta)}\n\n`)
-              res.write(`event: content_block_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_stop', { index: 0 }))}\n\n`)
-              res.write(`event: message_delta\ndata: ${JSON.stringify(createClaudeStreamEvent('message_delta', { delta: { stop_reason: 'end_turn', stop_sequence: null } as any, usage: { output_tokens: 0 } }))}\n\n`)
-              res.write(`event: message_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('message_stop'))}\n\n`)
-              res.end()
-            }
-            this.recordRequestFailed()
-            settleHold(false)
-          }
-        }
-        holdId = this.holdGate.enterHold({ receivedAt: startTime, hooks })
-        this.emitHeldRequestsChanged()
-        // 客户端中途断开 → abort 该挂起条目(停心跳、清 timer、认领作废),视为终态。
-        const onAbort = (): void => { this.holdGate.abort(holdId); this.emitHeldRequestsChanged(); settleHold(false) }
-        if (signal) {
-          if (signal.aborted) { onAbort(); return }
-          signal.addEventListener('abort', onAbort, { once: true })
-        }
-      })
-    }
-
-    // 主编排循环:尝试转发 → 首字节前失败则切号 → 无号则挂起等待 → resume 再来。
-    let acc: ProxyAccount | null = seedAccount ?? await pickFreshAccount()
-    for (;;) {
-      if (this.isResponseClosed(res)) return
-      if (!acc) {
-        // 无可用号(汇合点 A,或切号后耗尽)→ 挂起。
-        const shouldRetry = await waitInHold()
-        if (!shouldRetry) return // 超时/abort 终态
-        acc = await pickFreshAccount()
-        if (!acc) { triedIds.clear(); acc = await pickFreshAccount() } // resume 后仍未拿到(去抖竞争),清 tried 再试一次
-        continue
+    await this.runWithHold({
+      res, startTime, signal, seedAccount,
+      pickAccount: (_tried) => this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, model),
+      attempt,
+      // SSE ping 心跳:挂起态保活客户端 watchdog(ADR-0001 边界 1)。
+      sendPing: () => { if (!this.isResponseClosed(res)) res.write('event: ping\ndata: {"type":"ping"}\n\n') },
+      // 超时收尾 - error:发 SSE error 事件(overloaded_error/HOLD_TIMEOUT),客户端识别为可重试失败。
+      onTimeoutError: () => {
+        if (this.isResponseClosed(res)) return
+        const errorEvent = createClaudeStreamEvent('error', { error: { type: 'overloaded_error', message: 'Hold timeout: no account became available in time (HOLD_TIMEOUT)' } })
+        res.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
+        res.end()
+      },
+      // 超时收尾 - graceful_stop:发提示文本 + 完整 message_stop 干净收尾。
+      onTimeoutGracefulStop: () => {
+        if (this.isResponseClosed(res)) return
+        const msgStart = createClaudeStreamEvent('message_start', { message: { id: `msg_${uuidv4()}`, type: 'message', role: 'assistant', content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } })
+        res.write(`event: message_start\ndata: ${JSON.stringify(msgStart)}\n\n`)
+        const blockStart = createClaudeStreamEvent('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
+        res.write(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`)
+        const delta = createClaudeStreamEvent('content_block_delta', { index: 0, delta: { type: 'text_delta', text: '[请求等待可用账号超时,请重新发送]' } })
+        res.write(`event: content_block_delta\ndata: ${JSON.stringify(delta)}\n\n`)
+        res.write(`event: content_block_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_stop', { index: 0 }))}\n\n`)
+        res.write(`event: message_delta\ndata: ${JSON.stringify(createClaudeStreamEvent('message_delta', { delta: { stop_reason: 'end_turn', stop_sequence: null } as any, usage: { output_tokens: 0 } }))}\n\n`)
+        res.write(`event: message_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('message_stop'))}\n\n`)
+        res.end()
       }
-      const outcome = await attemptOnce(acc)
-      if (outcome === 'done') return // 终态(成功 / 已吐正文失败 / abort)
-      // 首字节前失败(汇合点 B):先即时切下一个未试过的号,拿不到再挂起。
-      acc = await pickFreshAccount()
+    })
+  }
+
+  /**
+   * Hold Gate 非流式(JSON)转发编排(task#5 · Claude /v1/messages 非流式)。
+   * 复用 runJsonRequestWithHold:每个 attempt 用当前账号构造 payload → callWithRetry → 成功写 JSON 响应。
+   * 无 SSE 心跳,挂起靠 HTTP keep-alive 硬等(受 holdTotalBudgetMs 约束)。
+   */
+  private async startClaudeNonStreamWithHold(
+    res: http.ServerResponse,
+    processedRequest: ClaudeRequest,
+    model: string,
+    startTime: number,
+    matchedApiKey: import('./types').ApiKey | undefined,
+    signal?: AbortSignal,
+    seedAccount?: ProxyAccount
+  ): Promise<void> {
+    if (this.steeringPrompt) {
+      processedRequest.system = this.injectSteeringClaude(processedRequest.system) as string | undefined
     }
+    const claudeThinkingConfig = this.getThinkingConfig(processedRequest.model)
+    const affinityHint = processedRequest.conversation_id
+
+    await this.runJsonRequestWithHold<{
+      result: Awaited<ReturnType<typeof callKiroApi>>
+      cacheProfile: ReturnType<typeof promptCacheTracker.buildClaudeProfile>
+      cacheUsage: ReturnType<typeof promptCacheTracker.compute>
+    }>({
+      res, startTime, signal, seedAccount, path: '/v1/messages', model,
+      pickAccount: (_tried) => this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, model),
+      doCall: async (acc) => {
+        const toolNameRegistry = new ToolNameRegistry()
+        const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, claudeThinkingConfig)).length * 0.3))
+        const cacheProfile = promptCacheTracker.buildClaudeProfile(processedRequest.system, processedRequest.messages, processedRequest.tools, estimatedInputTokens, processedRequest.model)
+        const cacheUsage = promptCacheTracker.compute(acc.id, cacheProfile)
+        this.events.onRequest?.({ path: '/v1/messages', method: 'POST', accountId: acc.id })
+        const { result, account: usedAccount } = await this.callWithRetry(
+          acc,
+          async (a) => callKiroApi(a, claudeToKiro(processedRequest, a.profileArn, toolNameRegistry, claudeThinkingConfig), signal),
+          '/v1/messages', signal, model
+        )
+        return { result: { result, cacheProfile, cacheUsage, toolNameRegistry } as any, account: usedAccount }
+      },
+      writeSuccess: (wrapped: any, usedAccount) => {
+        const { result, cacheProfile, cacheUsage, toolNameRegistry } = wrapped
+        const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, model, toolNameRegistry, result.reasoningContent)
+        if (cacheProfile && cacheUsage) {
+          if (cacheUsage.cacheCreationInputTokens > 0) response.usage.cache_creation_input_tokens = cacheUsage.cacheCreationInputTokens
+          if (cacheUsage.cacheReadInputTokens > 0) response.usage.cache_read_input_tokens = cacheUsage.cacheReadInputTokens
+          promptCacheTracker.update(usedAccount.id, cacheProfile)
+        }
+        this.recordRequestSuccess()
+        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
+        this.stats.inputTokens += result.usage.inputTokens
+        this.stats.outputTokens += result.usage.outputTokens
+        this.accountPool.recordSuccess(usedAccount.id, result.usage.inputTokens + result.usage.outputTokens)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(response))
+        const respTime = Date.now() - startTime
+        this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
+        this.recordRequest({ path: '/v1/messages', model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
+        if (matchedApiKey) this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, model, '/v1/messages')
+      },
+      onTimeoutError: () => { if (!this.isResponseClosed(res)) this.sendError(res, 503, 'Hold timeout: no account became available in time (HOLD_TIMEOUT)', 'anthropic') },
+      onTimeoutGracefulStop: () => { if (!this.isResponseClosed(res)) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ id: `msg_${uuidv4()}`, type: 'message', role: 'assistant', model, content: [{ type: 'text', text: '[请求等待可用账号超时,请重新发送]' }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } })) } }
+    })
   }
 
   // 处理 Claude 流式响应
