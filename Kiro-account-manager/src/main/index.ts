@@ -48,6 +48,35 @@ import {
   defaultTraySettings
 } from './tray'
 
+// ============ 后台节流:用 Chromium 命令行开关，不用 webPreferences.backgroundThrottling ============
+//
+// 2026-07-25 修复「挂后台/最小化一段时间后前端点不开」(第 4 次同症状，但与前 3 次根因不同)
+//
+// 前 3 次(c3d7905 / 29d6773 / estimateTokens memoize)都是主进程 event loop 被 CPU 饿死。
+// 本次实测否证了那条路径:main CPU 仅 9.2% + 反代 HTTP 1-2ms 秒回 → event loop 完全健康，
+// 但 UI 仍点不开。改判为 Electron 自身 bug:
+//
+//   webPreferences.backgroundThrottling:false + frame:false(Windows 上本应用就是 frameless)
+//   → Electron 的 allow_disabling_blink_scheduler_throttling_per_renderview.patch 在
+//     WebViewImpl::SetVisibilityState 里短路 return，跳过 observers_ 通知
+//   → 窗口被最小化/遮挡后内部 visibility 状态永久 desync
+//   → 依赖 is_page_visible_ 门控的渲染/输入路径再也恢复不了(hover 有效但点击全死)
+//
+//   上游证据:electron#29646「backgroundThrottling:false causes window to become
+//   unresponsive after restoring」(frameless 窗口复现步骤与用户描述完全一致)；
+//   electron#50250 给出 patch 层根因，修复 PR#50264 至 2026-07 仍未合入。本项目 Electron 38.1.2 带此 patch。
+//
+// 修法:改用 Chromium 原生命令行开关。它们走「进程优先级 + timer 节流」层，
+// 完全不经过上面那个有 bug 的 blink visibility patch，因此没有 desync 风险。
+// 三个开关合起来覆盖原 backgroundThrottling:false 的全部目的(保证隐藏时定时器照常跑):
+//   - disable-background-timer-throttling      : setInterval/setTimeout 不被降频(原始需求)
+//   - disable-renderer-backgrounding           : 不降低不可见页面渲染进程的优先级
+//   - disable-backgrounding-occluded-windows   : 被遮挡(非最小化)窗口同样不进入后台态
+// 注意:必须在 app ready 之前 appendSwitch，ready 之后设置无效。
+app.commandLine.appendSwitch('disable-background-timer-throttling')
+app.commandLine.appendSwitch('disable-renderer-backgrounding')
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
+
 // ============ 自动更新配置 ============
 autoUpdater.autoDownload = false
 autoUpdater.autoInstallOnAppQuit = true
@@ -394,12 +423,38 @@ function initProxyServer(): ProxyServer {
     retryDelayMs: 1000,
     tokenRefreshBeforeExpiry: 300, // 5分钟提前刷新
     clientDrivenToolExecution: true,
-    enableTokenBufferReserve: false,
+    // 2026-07-26 默认开启：关闭时超模型 context window 的请求会原样出站导致三端点全 400
+    // （RCA: .archive/2026-07-26/proxy-400-model-and-content-length/）
+    enableTokenBufferReserve: true,
     tokenBufferReserve: 20000
   }
   
   // 合并保存的配置和默认配置
   const config: ProxyConfig = savedConfig ? { ...defaultConfig, ...savedConfig } : defaultConfig
+
+  // ===== 一次性迁移:纠正历史持久化的 enableTokenBufferReserve=false =====
+  // 仅改 defaultConfig 无效 —— savedConfig 会覆盖它(该字段在 proxyServer 的
+  // updateConfig 白名单里,任何一次配置保存都会把当年的 false 落盘)。
+  // v1.6.8~v1.7.6 期间该开关默认关闭,关闭时超模型 context window 的请求原样出站
+  // → 三端点全 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD。这里一次性纠正为 true。
+  // 带 FLAG 只执行一次:此后用户若主动关闭,不会被再次强开。
+  if (store) {
+    const MIGRATION_KEY = 'accountDataMigration'
+    const FLAG = 'tokenBufferReserveDefaultOn'
+    const migrationState = (store.get(MIGRATION_KEY, {}) as Record<string, number>) || {}
+    if (!migrationState[FLAG]) {
+      const wasOff = config.enableTokenBufferReserve !== true
+      config.enableTokenBufferReserve = true
+      // 无条件写回:`proxy-get-status` 在 proxyServer 未初始化时会**原样返回 store 里的
+      // config**,若 store 里缺该字段,渲染进程 `config.enableTokenBufferReserve || false`
+      // 会显示"关闭"而主进程实际已开启 → 显示与实际不一致。这里确保 store 里一定有该字段。
+      store.set('proxyConfig', config)
+      if (wasOff) {
+        console.log('[Migration] enableTokenBufferReserve 由历史 false 纠正为 true(防上下文超限 400)')
+      }
+      store.set(MIGRATION_KEY, { ...migrationState, [FLAG]: 1 })
+    }
+  }
 
   // 恢复 payload 大小限制
   if (config.payloadSizeLimitKB) {
@@ -520,6 +575,10 @@ function initProxyServer(): ProxyServer {
         debouncedStoreSet('proxyFailedRequests', failedRequests)
         // 更新托盘菜单（也防抖，避免频繁重建菜单）
         debouncedUpdateTrayMenu()
+      },
+      // 挂起门闸:被挂起请求数变化时推送前端，驱动挂起数徽标 + 放行按钮启用态
+      onHeldRequestsChanged: (info) => {
+        mainWindow?.webContents.send('proxy-held-requests-changed', info)
       },
       // 会话快照 tick：服务运行中每 60s 写 orphan snapshot 到 store
       // 强杀/崩溃/关机时 — 下次启动 restoreOrphanProxySessionIfAny 会归档它
@@ -2511,11 +2570,13 @@ function createWindow(): void {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
       contextIsolation: true,
-      nodeIntegration: false,
-      // 关闭后台节流：最小化到托盘后窗口被隐藏，Chromium 默认会把渲染进程里的
-      // setInterval（含 token 自动刷新定时器）重度降频（对齐到约每分钟甚至更慢），
-      // 导致挂托盘时 token 过期好几分钟才刷新。关掉它保证定时器照常运行。
-      backgroundThrottling: false
+      nodeIntegration: false
+      // ⚠ 不要在这里加 backgroundThrottling: false
+      // 它 + frame:false 会触发 electron#29646 / #50250:最小化/遮挡后 visibility 状态
+      // desync，窗口永久收不到点击(hover 仍有效)。同等目的已由文件头部的三个
+      // app.commandLine.appendSwitch(disable-background-timer-throttling /
+      // disable-renderer-backgrounding / disable-backgrounding-occluded-windows)实现，
+      // 那条路径不经过有 bug 的 blink patch。详见文件头部注释块。
     }
   })
 
@@ -3183,6 +3244,12 @@ app.whenReady().then(async () => {
         return { success: false, error: 'ACCOUNT_NOT_IN_POOL' }
       }
       console.log(`[AccountPool] Hot-switch active account to ${acc.email || accountId.slice(0, 8)}`)
+      // 显式换账号 ⇒ 旧会话粘性作废。不清的话,开了 sessionAffinity 的用户即使接线
+      // 正确,带固定 session id 的客户端仍会粘在旧账号上直到重启 · 详见 RCA §1.5 假设 D
+      const droppedAffinity = proxyServer.invalidateSessionAffinity()
+      if (droppedAffinity > 0) {
+        console.log(`[AccountPool] Invalidated ${droppedAffinity} session affinity entr${droppedAffinity === 1 ? 'y' : 'ies'} after hot-switch`)
+      }
       return {
         success: true,
         account: {
@@ -3244,12 +3311,6 @@ app.whenReady().then(async () => {
           }
         }
         for (const acc of add) {
-      // 显式换账号 ⇒ 旧会话粘性作废。不清的话,开了 sessionAffinity 的用户即使接线
-      // 正确,带固定 session id 的客户端仍会粘在旧账号上直到重启 · 详见 RCA §1.5 假设 D
-      const droppedAffinity = proxyServer.invalidateSessionAffinity()
-      if (droppedAffinity > 0) {
-        console.log(`[AccountPool] Invalidated ${droppedAffinity} session affinity entr${droppedAffinity === 1 ? 'y' : 'ies'} after hot-switch`)
-      }
           // 幂等 upsert:已在池只刷凭据(保留 suspendedAt / 断路器 / 统计),不在池才新增。
           // 无条件 addAccount 会静默解除运行期风控封禁 · 详见 RCA §4.2b
           pool.upsertAccount(acc)
@@ -7663,6 +7724,28 @@ app.whenReady().then(async () => {
     } catch (error) {
       console.error('[ProxyServer] Clear suspended failed:', error)
       return { success: false, error: error instanceof Error ? error.message : 'Failed to clear suspended' }
+    }
+  })
+
+  // IPC: 手动放行所有挂起请求(挂起门闸"放行"按钮)
+  ipcMain.handle('proxy-release-held-requests', () => {
+    try {
+      if (!proxyServer) return { released: 0 }
+      return { released: proxyServer.releaseHeldRequests() }
+    } catch (error) {
+      console.error('[ProxyServer] Release held requests failed:', error)
+      return { released: 0 }
+    }
+  })
+
+  // IPC: 查询当前挂起中的请求数(前端徽标 + 放行按钮启用条件)
+  ipcMain.handle('proxy-get-held-requests', () => {
+    try {
+      if (!proxyServer) return { count: 0 }
+      return { count: proxyServer.getHeldRequestsCount() }
+    } catch (error) {
+      console.error('[ProxyServer] Get held requests failed:', error)
+      return { count: 0 }
     }
   })
 

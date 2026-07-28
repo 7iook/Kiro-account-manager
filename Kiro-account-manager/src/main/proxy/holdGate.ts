@@ -1,0 +1,253 @@
+// HoldGate —— 无可用账号时冻结请求的"请求挂起门闸"(纯编排逻辑,不接线 proxyServer 主流程)
+//
+// 方案:.agent-workspace/.archive/2026-07-28/hold-gate-blocking/hold-gate-blocking-design.md §1/§5
+//
+// 设计要点(方案 Invariants):
+//  2. 恢复 = 每请求一次性原子认领:releaseAll / tryResume / 超时 / abort 四入口竞争同一 CAS 状态位,
+//     只有第一个认领成功者驱动状态迁移,其余 no-op。竞争优先级由"先到先得 + abort 直接作废"实现。
+//  3. 单请求总时长受绝对 deadline 硬约束:deadline 从 receivedAt 起算 totalBudgetMs,多次挂起循环不重置;
+//     单次挂起 timer 受 min(maxWaitMs, deadline剩余) 截断(此处仅约束 deadline 收尾,单次上限接线时使用)。
+//  4. 超时收尾三态:keep_blocking(继续发 ping,不主动结束) / error(发 SSE error) / graceful_stop(提示+message_stop)。
+//
+// 依赖全部注入(时钟/timer、ping 回调、池可用性查询),不耦合 http / 真实定时器,保证可测。
+
+/** 超时收尾策略(触及绝对 deadline 时)。 */
+export type HoldTimeoutAction = 'keep_blocking' | 'error' | 'graceful_stop'
+
+/**
+ * 可注入的时钟抽象。生产环境用 realClock(见文件尾),测试注入 FakeClock。
+ * 提供 now + setTimeout/setInterval 族,使 HoldGate 完全不触碰全局定时器。
+ */
+export interface HoldClock {
+  now(): number
+  setTimeout(fn: () => void, ms: number): unknown
+  clearTimeout(handle: unknown): void
+  setInterval(fn: () => void, ms: number): unknown
+  clearInterval(handle: unknown): void
+}
+
+/**
+ * per-request 的副作用回调抽象。HoldGate 只调用这些回调,不直接依赖 http.ServerResponse。
+ * 接线任务负责把它们实现为对真实 SSE 连接的写入。
+ */
+export interface HeldRequestHooks {
+  /** 发一次 SSE ping 心跳(保活客户端 watchdog)。 */
+  sendPing: () => void
+  /** 放行:用新号重试该请求(仅在未吐正文时安全,接线方保证)。 */
+  resume: () => void
+  /** 超时收尾 - error:发 SSE error 事件(type=overloaded_error),客户端识别为可重试失败。 */
+  sendError: () => void
+  /** 超时收尾 - graceful_stop:发一句提示文本 + message_stop 干净收尾。 */
+  sendGracefulStop: () => void
+}
+
+/** HoldGate 归一化后的运行配置(clamp/校验在 config SSOT 处完成,这里假定已合法)。 */
+export interface HoldGateRuntimeConfig {
+  pingIntervalMs: number
+  maxWaitMs: number
+  totalBudgetMs: number
+  graceMs: number
+  timeoutAction: HoldTimeoutAction
+}
+
+export interface HoldGateDeps {
+  clock: HoldClock
+  /** 查询账号池当前是否有可用号(SSOT 出口,tryResume 只依赖它)。 */
+  isPoolAvailable: () => boolean
+  config: HoldGateRuntimeConfig
+}
+
+/** enterHold 入参。receivedAt = 请求 RECEIVED 时刻(绝对 deadline 起算点,跨多次挂起不变)。 */
+export interface EnterHoldParams {
+  receivedAt: number
+  hooks: HeldRequestHooks
+}
+
+/** 被挂起请求的内部条目(含一次性认领位)。 */
+interface HeldEntry {
+  id: number
+  receivedAt: number
+  hooks: HeldRequestHooks
+  /** 一次性 CAS 认领位:一旦置 true,任何入口的后续驱动都是 no-op(Invariant 2)。 */
+  claimed: boolean
+  pingHandle: unknown
+  deadlineHandle: unknown
+}
+
+/**
+ * 请求挂起门闸。持有 heldRequests 集合 + 每请求心跳 + 绝对 deadline + 一次性原子认领。
+ * proxyServer 只在错误汇合点调用 enterHold / 在可用性变化时调用 tryResume / 在放行指令时调用 releaseAll,
+ * 不把挂起状态散落进流式主体(SSOT)。
+ */
+export class HoldGate {
+  private readonly clock: HoldClock
+  private readonly isPoolAvailable: () => boolean
+  private readonly config: HoldGateRuntimeConfig
+  private readonly held: Map<number, HeldEntry> = new Map()
+  private seq = 0
+  // 兜底轮询句柄(方案 §5 A4):配额时间衰减恢复(quotaResetAt 到点)是纯被动、无写方法可挂
+  // availabilityListener 的事件盲区。故有挂起请求期间跑一个低频轮询周期性 tryResume 兜底。
+  // 轮询周期复用 maxWaitMs(单次挂起上限即"多久没被唤醒就主动复查一次池"的节奏)。
+  private pollHandle: unknown = null
+
+  constructor(deps: HoldGateDeps) {
+    this.clock = deps.clock
+    this.isPoolAvailable = deps.isPoolAvailable
+    this.config = deps.config
+  }
+
+  /** 有挂起请求且轮询未启动时,启动低频兜底轮询(周期 = maxWaitMs)。 */
+  private startPollingIfNeeded(): void {
+    if (this.pollHandle !== null) return
+    if (this.held.size === 0) return
+    // 轮询周期下限保护:maxWaitMs 理论上已被 config 归一化 clamp,这里再兜一道防 0/负值死循环。
+    const periodMs = Math.max(1000, this.config.maxWaitMs)
+    this.pollHandle = this.clock.setInterval(() => {
+      // 周期性复查池:配额到点恢复等"无事件"恢复场景由此兜底放行。
+      this.tryResume()
+      // 放行后若已无挂起请求,停止轮询(省资源)。
+      this.stopPollingIfIdle()
+    }, periodMs)
+  }
+
+  /** 无挂起请求时停止轮询,避免空转 timer 泄漏。 */
+  private stopPollingIfIdle(): void {
+    if (this.pollHandle !== null && this.held.size === 0) {
+      this.clock.clearInterval(this.pollHandle)
+      this.pollHandle = null
+    }
+  }
+
+  /**
+   * 让一个请求进入 HELD 状态:登记条目、启动心跳、按绝对 deadline 安排超时收尾。
+   * @returns 该挂起条目的 id(供 abort 使用)。
+   */
+  enterHold(params: EnterHoldParams): number {
+    const id = ++this.seq
+    const entry: HeldEntry = {
+      id,
+      receivedAt: params.receivedAt,
+      hooks: params.hooks,
+      claimed: false,
+      pingHandle: null,
+      deadlineHandle: null
+    }
+    // 心跳:周期性发 ping
+    entry.pingHandle = this.clock.setInterval(() => {
+      if (entry.claimed) return
+      entry.hooks.sendPing()
+    }, this.config.pingIntervalMs)
+
+    // 绝对 deadline:从 receivedAt 起算 totalBudgetMs,剩余不足 graceMs 即触发收尾。
+    // 多次挂起循环共享同一 receivedAt → deadline 不重置(Invariant 3)。
+    const deadlineAt = params.receivedAt + this.config.totalBudgetMs
+    const triggerAt = deadlineAt - this.config.graceMs
+    const delay = Math.max(0, triggerAt - this.clock.now())
+    entry.deadlineHandle = this.clock.setTimeout(() => {
+      this.onTimeout(entry)
+    }, delay)
+
+    this.held.set(id, entry)
+    // 有挂起请求 → 确保兜底轮询在跑(覆盖配额时间衰减等无事件恢复,方案 §5 A4)。
+    this.startPollingIfNeeded()
+    return id
+  }
+
+  /**
+   * 一次性原子认领 + 清理该条目的 timer。返回是否认领成功(首个胜出者 true,其余 no-op false)。
+   * 所有终态入口(resume / timeout-error / timeout-graceful / abort)先过这里(Invariant 2)。
+   */
+  private claim(entry: HeldEntry): boolean {
+    if (entry.claimed) return false
+    entry.claimed = true
+    this.stopTimers(entry)
+    this.held.delete(entry.id)
+    // 挂起集合可能已空 → 停止兜底轮询,避免空转 timer 泄漏。
+    this.stopPollingIfIdle()
+    return true
+  }
+
+  private stopTimers(entry: HeldEntry): void {
+    if (entry.pingHandle !== null) {
+      this.clock.clearInterval(entry.pingHandle)
+      entry.pingHandle = null
+    }
+    if (entry.deadlineHandle !== null) {
+      this.clock.clearTimeout(entry.deadlineHandle)
+      entry.deadlineHandle = null
+    }
+  }
+
+  /** 绝对 deadline 到期收尾,按 timeoutAction 三态处理。 */
+  private onTimeout(entry: HeldEntry): void {
+    if (entry.claimed) return
+    switch (this.config.timeoutAction) {
+      case 'error':
+        if (this.claim(entry)) entry.hooks.sendError()
+        return
+      case 'graceful_stop':
+        if (this.claim(entry)) entry.hooks.sendGracefulStop()
+        return
+      case 'keep_blocking':
+      default:
+        // 不认领、不结束:请求继续 HELD,心跳继续,直到客户端自身硬顶断开(abort)。
+        return
+    }
+  }
+
+  /**
+   * 池可用性变化时尝试自动放行:仅当池确有可用号时,认领并 resume 所有未认领的 HELD 请求。
+   * 幂等:已认领请求是 no-op,绝不重复 resume(测试 3)。
+   */
+  tryResume(): void {
+    if (!this.isPoolAvailable()) return
+    for (const entry of [...this.held.values()]) {
+      if (this.claim(entry)) entry.hooks.resume()
+    }
+  }
+
+  /**
+   * 手动放行:认领并 resume 所有当前未认领的 HELD 请求(前端"放行"按钮 → IPC)。
+   * @returns 实际被放行(认领成功)的请求数;无挂起请求时返回 0(幂等)。
+   */
+  releaseAll(): number {
+    let released = 0
+    for (const entry of [...this.held.values()]) {
+      if (this.claim(entry)) {
+        entry.hooks.resume()
+        released++
+      }
+    }
+    return released
+  }
+
+  /**
+   * 客户端断开:作废该请求的认领位、停心跳清 timer、移出集合。不触发任何 resume/error/stop。
+   * abort 优先级最高:一旦 abort,resume/timeout 都无法再驱动它(Invariant 2)。
+   */
+  abort(id: number): void {
+    const entry = this.held.get(id)
+    if (!entry) return
+    // 直接认领作废(不调用任何 hooks),后续入口皆 no-op。
+    this.claim(entry)
+  }
+
+  /** 当前挂起中的请求数(UI 展示 + 放行按钮启用条件)。 */
+  getHeldCount(): number {
+    return this.held.size
+  }
+
+  /** 当前所有挂起请求的 id 列表(供测试/接线遍历)。 */
+  listHeldIds(): number[] {
+    return [...this.held.keys()]
+  }
+}
+
+/** 生产环境真实时钟(接线任务注入)。测试注入 FakeClock。 */
+export const realClock: HoldClock = {
+  now: () => Date.now(),
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+  setInterval: (fn, ms) => setInterval(fn, ms),
+  clearInterval: (h) => clearInterval(h as ReturnType<typeof setInterval>)
+}

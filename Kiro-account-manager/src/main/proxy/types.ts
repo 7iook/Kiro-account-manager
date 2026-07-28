@@ -1,5 +1,9 @@
 // Kiro Proxy 类型定义
 
+// 挂起门闸超时收尾策略(SSOT 定义在 holdGate.ts,此处重新导出供 ProxyConfig 使用)
+import type { HoldTimeoutAction } from './holdGate'
+export type { HoldTimeoutAction }
+
 // ============ OpenAI 兼容格式 ============
 export interface OpenAIChatRequest {
   model: string
@@ -616,6 +620,24 @@ export interface ProxyConfig {
    * - exponential: baseMs, baseMs*2, baseMs*4 ...(封顶 15s,旧默认行为)
    */
   rateLimitRetryStrategy?: 'fast' | 'linear' | 'exponential'
+
+  // ============ 挂起门闸(Hold Gate · 无可用账号时冻结请求)============
+  // 方案:.archive/2026-07-28/hold-gate-blocking/hold-gate-blocking-design.md §3
+  // 校验(clamp)收口在 proxyServer.normalizeHoldConfig,非有限值/越界一律回落默认并 warn
+  /** 挂起门闸总开关(默认 false,关闭时零行为变化) */
+  holdWhenNoAccount?: boolean
+  /** 挂起期间 SSE ping 心跳间隔 ms(默认 10000;clamp [1000,40000],<45s watchdog) */
+  holdPingIntervalMs?: number
+  /** 单次挂起最长等待 ms(默认 600000=10min;clamp [10000,1740000] 且 ≤ holdTotalBudgetMs) */
+  holdMaxWaitMs?: number
+  /** 从 RECEIVED 起的绝对 deadline ms(默认 1680000=28min;clamp [10000,1740000],< 客户端 30min 硬顶) */
+  holdTotalBudgetMs?: number
+  /** deadline 剩余不足此值即触发超时收尾 ms(默认 15000;clamp [1000,60000] 且 < holdTotalBudgetMs) */
+  holdGraceMs?: number
+  /** 触及绝对 deadline 时的收尾策略(默认 keep_blocking 持续卡住) */
+  holdTimeoutAction?: HoldTimeoutAction
+  /** 池出现可用号时自动放行(默认 true) */
+  holdAutoResumeOnAvailable?: boolean
 }
 
 export interface TlsConfig {

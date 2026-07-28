@@ -60,9 +60,39 @@ export class AccountPool {
     getId: (a) => a.id,
     getWeight: (a) => (typeof a.weight === 'number' ? a.weight : 100)
   })
+  // 可用性变化监听器(HoldGate.tryResume 订阅):仅当池可用号数 0→>0 才触发(去抖)。
+  // 见 .archive/2026-07-28/hold-gate-blocking/hold-gate-blocking-design.md §5 A4 + availability-paths.md
+  private availabilityListener: (() => void) | null = null
 
   constructor(config: Partial<AccountPoolConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config }
+  }
+
+  /**
+   * 注入可用性变化监听器(HoldGate 用它实现"事件即时唤醒")。覆盖式:后注入的替换前者。
+   * 传 null 可解绑。注意:配额时间衰减恢复(isQuotaExhausted 时间到点)是纯被动、无写方法
+   * 触发,不在本出口覆盖范围内 —— 那部分由 HoldGate 内部低频轮询兜底(方案 §5 A4)。
+   */
+  setAvailabilityListener(listener: (() => void) | null): void {
+    this.availabilityListener = listener
+  }
+
+  /**
+   * 在"可能让池从全挂→出现可用号"的写入路径中包裹此方法:
+   * 记录写入前 availableCount,执行 mutate,再比较写入后;仅当 0→>0 才 emit(去抖,
+   * 避免无关字段刷新 / 1→2 等非关键变化频繁唤醒 HoldGate)。
+   * HoldGate.tryResume 内部还会再查一次池状态,幂等叠加保险。
+   */
+  private notifyIfBecameAvailable(mutate: () => void): void {
+    if (!this.availabilityListener) {
+      mutate()
+      return
+    }
+    const before = this.availableCount
+    mutate()
+    if (before === 0 && this.availableCount > 0) {
+      this.availabilityListener()
+    }
   }
 
   // 切换账号选择策略
@@ -81,12 +111,14 @@ export class AccountPool {
   // 如果传入的 account 已带 suspended 字段（启动复原场景），保留其 suspended 状态
   addAccount(account: ProxyAccount): void {
     const suspended = this.isSuspended(account)
-    this.accounts.set(account.id, {
-      ...account,
-      isAvailable: !suspended,
-      requestCount: 0,
-      errorCount: 0,
-      lastUsed: 0
+    this.notifyIfBecameAvailable(() => {
+      this.accounts.set(account.id, {
+        ...account,
+        isAvailable: !suspended,
+        requestCount: 0,
+        errorCount: 0,
+        lastUsed: 0
+      })
     })
     this.accountStats.set(account.id, {
       requests: 0,
@@ -116,9 +148,48 @@ export class AccountPool {
   // 更新账号
   updateAccount(accountId: string, updates: Partial<ProxyAccount>): void {
     const account = this.accounts.get(accountId)
-    if (account) {
+    if (!account) return
+    // 仅当 updates 触及可用性判定字段时,才走去抖通知包裹(避免统计/lastUsed 等无关字段刷新误触发)。
+    // 可用性字段见 availability-paths.md §0:isAvailable / suspendedAt / quotaExhaustedAt / quotaResetAt / expiresAt / refreshToken
+    const AVAILABILITY_FIELDS: Array<keyof ProxyAccount> = [
+      'isAvailable', 'suspendedAt', 'quotaExhaustedAt', 'quotaResetAt', 'expiresAt', 'refreshToken'
+    ]
+    const touchesAvailability = AVAILABILITY_FIELDS.some(f => f in updates)
+    const apply = (): void => {
       this.accounts.set(accountId, { ...account, ...updates })
     }
+    if (touchesAvailability) {
+      this.notifyIfBecameAvailable(apply)
+    } else {
+      apply()
+    }
+  }
+
+  // 热切换入池:已在池只覆盖凭据类字段,不在池等价 addAccount
+  // 为何不能直接 addAccount:它是重置式——按入参重算 isAvailable(前端 mapper 不带
+  // suspendedAt ⇒ 算出 true)并清零 errorCount/requestCount/统计,于是“切一下账号”会静默
+  // 解除运行期风控封禁,并让 proxy-set-active-account 的 ACCOUNT_NOT_AVAILABLE 守卫失效。
+  // 详见 RCA §4.2b:.archive/2026-07-28/proxy-hot-switch-single-account/
+  // @returns 'added' 新入池 | 'updated' 已在池仅刷新凭据
+  upsertAccount(account: ProxyAccount): 'added' | 'updated' {
+    if (!this.accounts.has(account.id)) {
+      this.addAccount(account)
+      return 'added'
+    }
+    // 剔除运行期状态字段,只把凭据/路由类字段覆盖进去
+    const {
+      isAvailable: _isAvailable,
+      suspendedAt: _suspendedAt,
+      suspendReason: _suspendReason,
+      suspendMessage: _suspendMessage,
+      requestCount: _requestCount,
+      errorCount: _errorCount,
+      lastUsed: _lastUsed,
+      ...mutable
+    } = account
+    this.updateAccount(account.id, mutable)
+    console.log(`[AccountPool] Refreshed credentials for: ${account.email || account.id}`)
+    return 'updated'
   }
 
   // 热切换:强制下一次请求使用指定账号(round-robin 模式下"从此账号开始轮")
@@ -158,38 +229,6 @@ export class AccountPool {
 
       // 跳过当前请求已试过的账号
       if (excludeIds?.has(account.id)) continue
-    if (touchesAvailability) {
-      this.notifyIfBecameAvailable(apply)
-    } else {
-      apply()
-    }
-  }
-
-  // 热切换入池:已在池只覆盖凭据类字段,不在池等价 addAccount
-  // 为何不能直接 addAccount:它是重置式——按入参重算 isAvailable(前端 mapper 不带
-  // suspendedAt ⇒ 算出 true)并清零 errorCount/requestCount/统计,于是“切一下账号”会静默
-  // 解除运行期风控封禁,并让 proxy-set-active-account 的 ACCOUNT_NOT_AVAILABLE 守卫失效。
-  // 详见 RCA §4.2b:.archive/2026-07-28/proxy-hot-switch-single-account/
-  // @returns 'added' 新入池 | 'updated' 已在池仅刷新凭据
-  upsertAccount(account: ProxyAccount): 'added' | 'updated' {
-    if (!this.accounts.has(account.id)) {
-      this.addAccount(account)
-      return 'added'
-    }
-    // 剔除运行期状态字段,只把凭据/路由类字段覆盖进去
-    const {
-      isAvailable: _isAvailable,
-      suspendedAt: _suspendedAt,
-      suspendReason: _suspendReason,
-      suspendMessage: _suspendMessage,
-      requestCount: _requestCount,
-      errorCount: _errorCount,
-      lastUsed: _lastUsed,
-      ...mutable
-    } = account
-    this.updateAccount(account.id, mutable)
-    console.log(`[AccountPool] Refreshed credentials for: ${account.email || account.id}`)
-    return 'updated'
 
       // 检查账号是否可用（含断路器状态）
       if (this.isAccountAvailable(account, now)) {
@@ -325,13 +364,15 @@ export class AccountPool {
   clearSuspended(accountId: string): void {
     const account = this.accounts.get(accountId)
     if (!account || !this.isSuspended(account)) return
-    this.accounts.set(accountId, {
-      ...account,
-      suspendedAt: undefined,
-      suspendReason: undefined,
-      suspendMessage: undefined,
-      isAvailable: true,
-      errorCount: 0
+    this.notifyIfBecameAvailable(() => {
+      this.accounts.set(accountId, {
+        ...account,
+        suspendedAt: undefined,
+        suspendReason: undefined,
+        suspendMessage: undefined,
+        isAvailable: true,
+        errorCount: 0
+      })
     })
     console.log(`[AccountPool] Account ${account.email || accountId} unsuspended`)
   }
@@ -462,13 +503,15 @@ export class AccountPool {
     if (!account) return
 
     const wasExhausted = this.isQuotaExhausted(account)
-    this.accounts.set(accountId, {
-      ...account,
-      quotaUsed: used,
-      quotaLimit: limit,
-      quotaResetAt: resetAt,
-      // 如果配额从耗尽恢复，清除耗尽标记
-      quotaExhaustedAt: (used < limit) ? undefined : account.quotaExhaustedAt
+    this.notifyIfBecameAvailable(() => {
+      this.accounts.set(accountId, {
+        ...account,
+        quotaUsed: used,
+        quotaLimit: limit,
+        quotaResetAt: resetAt,
+        // 如果配额从耗尽恢复，清除耗尽标记
+        quotaExhaustedAt: (used < limit) ? undefined : account.quotaExhaustedAt
+      })
     })
 
     if (!wasExhausted && used >= limit) {
@@ -534,18 +577,20 @@ export class AccountPool {
 
   // 重置所有账号状态（含封禁标记 — 手动重置表示用户已确认可用）
   reset(): void {
-    for (const [id, account] of this.accounts) {
-      this.accounts.set(id, {
-        ...account,
-        isAvailable: true,
-        errorCount: 0,
-        cooldownUntil: undefined,
-        quotaExhaustedAt: undefined,
-        suspendedAt: undefined,
-        suspendReason: undefined,
-        suspendMessage: undefined
-      })
-    }
+    this.notifyIfBecameAvailable(() => {
+      for (const [id, account] of this.accounts) {
+        this.accounts.set(id, {
+          ...account,
+          isAvailable: true,
+          errorCount: 0,
+          cooldownUntil: undefined,
+          quotaExhaustedAt: undefined,
+          suspendedAt: undefined,
+          suspendReason: undefined,
+          suspendMessage: undefined
+        })
+      }
+    })
     this.currentIndex = 0
     this.swrr.reset()
   }

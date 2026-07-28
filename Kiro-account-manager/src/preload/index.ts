@@ -761,6 +761,16 @@ const api = {
     return ipcRenderer.invoke('proxy-update-config', config)
   },
 
+  // 挂起门闸:手动放行所有挂起请求
+  proxyReleaseHeldRequests: (): Promise<{ released: number }> => {
+    return ipcRenderer.invoke('proxy-release-held-requests')
+  },
+
+  // 挂起门闸:查询当前挂起中的请求数
+  proxyGetHeldRequests: (): Promise<{ count: number }> => {
+    return ipcRenderer.invoke('proxy-get-held-requests')
+  },
+
   // ============ v1.8 反代安全 / 可观测 IPC ============
 
   /** 获取反代自签证书信息（用于在 UI 显示指纹/有效期 + 让用户导出 .crt） */
@@ -969,6 +979,17 @@ const api = {
     ipcRenderer.on('proxy-account-update', handler)
     return () => {
       ipcRenderer.removeListener('proxy-account-update', handler)
+    }
+  },
+
+  // 监听挂起请求数变化事件(驱动挂起数徐标 + 放行按钮启用态)
+  onProxyHeldRequestsChanged: (callback: (info: { count: number }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, info: { count: number }): void => {
+      callback(info)
+    }
+    ipcRenderer.on('proxy-held-requests-changed', handler)
+    return () => {
+      ipcRenderer.removeListener('proxy-held-requests-changed', handler)
     }
   },
 

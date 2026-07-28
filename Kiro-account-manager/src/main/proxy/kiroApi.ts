@@ -1,5 +1,6 @@
 // Kiro API 调用核心模块
 import { v4 as uuidv4 } from 'uuid'
+import { createHash } from 'node:crypto'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import type {
   KiroPayload,
@@ -93,14 +94,22 @@ export function getRateLimitRetryConfig(): Readonly<RateLimitRetryConfig> {
 }
 
 // Payload 大小限制（KB），用户可在高级设置中调整
-let payloadSizeLimitKB = 153600 // 默认 150MB（支持大图片）
+// 默认 4608KB = 4.5MB：上游请求体硬限实测约 5MiB（参 F:\kiro-rs），留安全余量。
+// 注意：这是 **byte 维度** 的兼底；token 超 context window 由 enableTokenBufferReserve 处理。
+let payloadSizeLimitKB = 4608
 export function setPayloadSizeLimitKB(limitKB: number): void {
   payloadSizeLimitKB = Math.max(256, Math.min(204800, limitKB))
 }
 
-// Token buffer reserve 开关（默认 false = 完全跳过 trimHistoryByTokens）
-// 关闭时后端不再裁剪任何旧消息，超出 context window 由 Kiro 后端原样返回错误
-let enableTokenBufferReserve = false
+// Token buffer reserve 开关（默认 true）
+// 2026-07-26 从 false 改为 true（见 .archive/2026-07-26 proxy-400-dual-defect-rca.md）：
+//   实测受控对照证实 Kiro 后端按**模型 token context window**判限，不是按 payload 字节数：
+//     claude-opus-5  1,792,972 B (ctx 1,000,000) → 200 OK
+//     gpt-5.6-sol      945,144 B (ctx   272,000) → 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD
+//   关闭时 trimHistoryByTokens 整段跳过 → 超限请求原样出站 → 三端点全 400。
+//   该裁剪仅在 currentTokens > effectiveLimit 时才动手，平时不改内容，
+//   因此**不会破坏 prompt cache 的 prefix 稳定性**（参 727be0b）。
+let enableTokenBufferReserve = true
 export function setEnableTokenBufferReserve(enabled: boolean): void {
   enableTokenBufferReserve = !!enabled
 }
@@ -479,6 +488,22 @@ const codeWhispererModelCache = new Map<string, { models: KiroModel[]; timestamp
 
 // 模型 ID 映射
 const MODEL_ID_MAP: Record<string, string> = {
+  // GPT-5.6 系列(2026-07-24 修复 INVALID_MODEL_ID)
+  // Kiro catalog 的 canonical id 带 tier 后缀(gpt-5.6-sol / -terra / -luna),
+  // 裸 `gpt-5.6` 只有 CodeWhisperer 端点会做 catalog 二次解析,V2 KiroRuntime / AmazonQ
+  // 直接 400 INVALID_MODEL_ID → 表现为"有时成功(fallback 到第三个端点)、有时挂"。
+  // 客户端(如 Claude Code 的 ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6 · SUB 用 model:sonnet)
+  // 常传裸别名,这里静态映射到旗舰 Sol,首个端点即命中。
+  // 官方证据:kiro.dev/docs/models GPT-5.6 Sol/Terra/Luna 三档 · 272K ctx · 2.4x/1.2x/0.6x credit
+  'gpt-5.6': 'gpt-5.6-sol',
+  'gpt-5-6': 'gpt-5.6-sol',
+  'gpt-5.6-sol': 'gpt-5.6-sol',
+  'gpt-5.6-terra': 'gpt-5.6-terra',
+  'gpt-5.6-luna': 'gpt-5.6-luna',
+  'gpt-5': 'gpt-5.6-sol',
+  // Claude 5 系列(2026-07-24 Opus 5 发布)
+  'claude-opus-5': 'claude-opus-5',
+  'claude-sonnet-5': 'claude-sonnet-5',
   // Claude 4.5 系列
   'claude-sonnet-4-5': 'claude-sonnet-4.5',
   'claude-sonnet-4.5': 'claude-sonnet-4.5',
@@ -1284,9 +1309,22 @@ export function buildKiroPayload(
   }
 
   // ====== 第二阶段：按 byte 截断 tool result 内容 ======
-  // 避免 HTTP body 过大被 Kiro 网关拒绝
-  // 用户可在高级设置中调整限制值（默认 1536KB = 1.5MB）
-  const PAYLOAD_SIZE_LIMIT = (payloadSizeLimitKB || 1536) * 1024
+  // 避免 HTTP body 过大被 Kiro 网关拒绝（byte 维度，与上面的 token 维度互补）
+  //
+  // 2026-07-26 修正(RCA: .archive/2026-07-26/proxy-400-model-and-content-length/):
+  //   v1.7.5 曾把默认 1.5MB 提到 150MB(changelog 写"支持大图片",但 trim 只截
+  //   tool_result.content[].text、根本不碰 images,那次改动基于误解)。
+  //   随后一版把硬顶压回 1536KB —— 方向同样错:受控对照证明 byte 不是 Kiro 的判限维度
+  //     claude-opus-5 1,792,972 B (ctx 1,000,000) → 200 OK
+  //     gpt-5.6-sol     945,144 B (ctx   272,000) → 400 CONTENT_LENGTH_EXCEEDS_THRESHOLD
+  //   1.79MB 能过而 0.92MB 被拒 ⇒ 拒绝来自 token 超 context window(已由第一阶段处理)。
+  //   压到 1536KB 反而会去裁那个本来能成功的 1.79MB 请求,白白改写历史内容 →
+  //   破坏 prompt cache 的 prefix 逐字节匹配(参 727be0b),credit 涨回 5 倍。
+  //   现按参考项目实测值设定:F:\kiro-rs src/model/config.rs 注释「上游请求体硬性限制
+  //   实测约 5MiB 会触发 400」,其默认取 4.5MiB 留安全余量 —— 这里对齐 4608KB。
+  const HARD_TRIM_CEILING_KB = 4608
+  const effectiveTrimKB = Math.min(payloadSizeLimitKB || HARD_TRIM_CEILING_KB, HARD_TRIM_CEILING_KB)
+  const PAYLOAD_SIZE_LIMIT = effectiveTrimKB * 1024
   const TOOL_RESULT_TRUNCATE_LENGTH = 4000
   let initialPayloadSize = JSON.stringify(payload).length
   if (initialPayloadSize > PAYLOAD_SIZE_LIMIT && payload.conversationState.history) {
@@ -1538,7 +1576,32 @@ export async function callKiroApiStream(
 
   let lastError: Error | null = null
 
-  for (const endpoint of endpoints) {
+  // ===== 上下文溢出响应式恢复(参考 Kiro IDE 官方 ContextOverflowHandler)=====
+  // Kiro IDE 的做法是**响应式**而非预测式:照常发请求,catch ContextWindowExceededError
+  // 后再本地恢复(其指标名 contextUsagePercentAtOverflow 记录的是"溢出时"的百分比,
+  // 不是用百分比预测溢出)。它有三级降级:截断式 summarization → map-reduce 总结 →
+  // brute-force 本地截断(preserveRecentRounds:0,零 API 依赖故不可能失败)。
+  //
+  // 反代这里实现等价的第 1 + 第 3 级:收到 CONTENT_LENGTH_EXCEEDS_THRESHOLD 后按递进
+  // 比例裁掉最旧 history,重试**同一端点**(换端点无用,三端点共用同一后端限制)。
+  //
+  // 为何用「相对比例」而不是「绝对 token 上限」:本地 token 估算不可靠 —— 同一
+  // byte/3.5 口径在两个真实样本上偏差 0.7% vs 82%(RCA 2026-07-26)。而按当前估算值
+  // 的比例裁剪只需要「裁掉约 30%/55%/80% 的内容」,与绝对精度无关,估算再偏也成立。
+  //
+  // 直接收益:Claude Code 的 /compact 请求本身超限时(上游已知死锁 anthropics/claude-code
+  // #26518 #8136 #65905),反代裁剪后重试可让 compact 成功,打破死锁。
+  const CONTEXT_OVERFLOW_RECOVERY_RATIOS = [0.7, 0.45, 0.2]
+  let overflowRecoveryAttempt = 0
+
+  for (let endpointIdx = 0; endpointIdx < endpoints.length; endpointIdx++) {
+    const endpoint = endpoints[endpointIdx]
+    // [DIAG] 记录本端点实际出站的 modelId,供 catch 分支写入 UI 日志。
+    // 背景:INVALID_MODEL_ID 类 400 在 UI 侧完全是黑盒 —— 只有 console 里
+    // 打了 "Model ID",打包版没有终端 → 无法区分「客户端传了未映射的裸别名」
+    // vs「映射对了但账户/region 无该模型权限」。诊断可见性是一等公民。
+    let outboundModelId: string | undefined
+    let clientRequestedModelId: string | undefined
     try {
       throwIfAborted(signal)
       const requestPayload = clonePayload(payload)
@@ -1549,9 +1612,11 @@ export async function callKiroApiStream(
         requestPayload.profileArn = resolvedArn
       }
       const requestedModelId = getPayloadModelId(requestPayload)
+      clientRequestedModelId = requestedModelId
       if (endpoint.name === 'CodeWhisperer') {
         applyPayloadModelId(requestPayload, await resolveCodeWhispererModelId(account, requestedModelId, signal))
       }
+      outboundModelId = getPayloadModelId(requestPayload)
 
       applyPayloadOrigin(requestPayload, resolveEffectiveOrigin(account, endpoint.origin))
 
@@ -1677,9 +1742,14 @@ export async function callKiroApiStream(
       const errMsgFull = (error as Error).message || String(error)
       const errStack = (error as Error).stack || ''
       // v1.7.6 调试:显式打出 error.message 让 UI 日志也能看到具体 body(不止 "failed:" 空串)
-      proxyLogger.error('KiroAPI', `Endpoint ${endpoint.name} failed: ${errMsgFull.slice(0, 500)}`, {
+      proxyLogger.error('KiroAPI', `Endpoint ${endpoint.name} failed [model=${outboundModelId ?? 'unset'}]: ${errMsgFull.slice(0, 500)}`, {
         endpoint: endpoint.name,
         endpointUrl: endpoint.url,
+        // [DIAG] outboundModelId = 真正发给该端点的 modelId(CodeWhisperer 会二次解析成
+        // 大写枚举);clientModelId = mapModelId 之后进 payload 的值。两者 + 错误 body
+        // 三元组足以区分「别名未映射」vs「映射对但无权限」vs「端点不支持该模型」。
+        outboundModelId: outboundModelId ?? 'unset',
+        clientModelId: clientRequestedModelId ?? 'unset',
         account: account.email || account.id?.slice(0, 8) || '?',
         region: account.region,
         arnRegion: parseRegionFromProfileArn(account.profileArn),
@@ -1689,6 +1759,50 @@ export async function callKiroApiStream(
       
       // 如果是认证错误，不继续尝试其他端点
       if ((error as Error).message.includes('Auth error')) {
+        onError(error as Error)
+        return
+      }
+
+      // 上下文超出模型 context window → 响应式恢复(见函数顶部 ContextOverflowHandler 注释)。
+      // 换端点无用(三端点共用同一后端限制,实测 04:16:12/:15/:18 三连全 400),
+      // 正确处理是本地裁掉最旧 history 后**重试同一端点**。
+      // 注意:INVALID_MODEL_ID 不走此路 —— 只有 CodeWhisperer 会做 catalog 二次解析,
+      // 裸别名在 V2 端点被拒但能被 CodeWhisperer 救回,必须保留换端点 fallback。
+      if ((error as Error).message.includes('CONTENT_LENGTH_EXCEEDS_THRESHOLD')) {
+        if (overflowRecoveryAttempt < CONTEXT_OVERFLOW_RECOVERY_RATIOS.length) {
+          const ratio = CONTEXT_OVERFLOW_RECOVERY_RATIOS[overflowRecoveryAttempt]
+          overflowRecoveryAttempt++
+          const beforeTokens = estimatePayloadTokens(payload)
+          const beforeMessages = payload.conversationState.history?.length ?? 0
+          // 裁剪作用于**外层 payload**,使后续重试/换端点都用裁后版本。
+          // trimHistoryByTokens 内含三重保护:跳过 system prompt pair、toolUse/toolResult
+          // 成对裁剪(防 orphan → 上游 400)、ensureStartsWithUserMessage。
+          const trimResult = trimHistoryByTokens(payload, Math.floor(beforeTokens * ratio))
+          if (trimResult.trimmed > 0) {
+            const msg = `Context overflow recovery ${overflowRecoveryAttempt}/${CONTEXT_OVERFLOW_RECOVERY_RATIOS.length}: dropped ${trimResult.trimmed} oldest history messages (${beforeMessages}→${payload.conversationState.history?.length ?? 0}, ≈${beforeTokens.toLocaleString()}→${trimResult.finalTokens.toLocaleString()} est. tokens, target ratio ${ratio}), retrying ${endpoint.name}`
+            console.warn(`[KiroAPI] ${msg}`)
+            proxyLogger.warn('KiroAPI', msg, {
+              endpoint: endpoint.name,
+              outboundModelId: outboundModelId ?? 'unset',
+              attempt: overflowRecoveryAttempt,
+              droppedMessages: trimResult.trimmed,
+              historyBefore: beforeMessages,
+              historyAfter: payload.conversationState.history?.length ?? 0
+            })
+            endpointIdx--  // 重试同一端点(裁剪后的 payload),不消耗端点 fallback 机会
+            continue
+          }
+          // 裁不动了(history 已到保护下限)→ 落到下面直接返回
+          console.warn(`[KiroAPI] Context overflow recovery ${overflowRecoveryAttempt} could not trim further (history=${beforeMessages}), giving up`)
+        }
+        const giveUp = `Context window exceeded [model=${outboundModelId ?? 'unset'}] — recovery exhausted after ${overflowRecoveryAttempt} attempt(s); skipping remaining endpoints (same backend limit)`
+        console.warn(`[KiroAPI] ${giveUp}`)
+        proxyLogger.error('KiroAPI', giveUp, {
+          endpoint: endpoint.name,
+          outboundModelId: outboundModelId ?? 'unset',
+          recoveryAttempts: overflowRecoveryAttempt,
+          remainingEndpointsSkipped: endpoints.length - endpointIdx - 1
+        })
         onError(error as Error)
         return
       }
@@ -1795,8 +1909,48 @@ interface ToolUseState {
 
 // Token 估算（被 promptCacheTracker 等模块使用，用于 cache 块大小判定）
 // 优先使用 tiktoken cl100k_base 精确计算（±5%），失败时自动降级到字符系数（±15%）
+//
+// ⚡ 2026-07-25 主进程 event loop 饿死修复（第 3 次同母题，前两次:c3d7905 / 29d6773）
+//
+// 症状:长会话 + 多客户端并发跑一段时间后，UI 点击完全无响应（renderer 的
+//   ipcRenderer.invoke 排不上队），但反代 5580 仍正常处理请求。
+// 实测证据:main 进程 80% CPU 持续 / renderer 仅 2.3%（说明 renderer 空转等主进程，
+//   不是 Chromium 后台节流问题）。
+// 根因:promptCacheTracker.flattenCacheBlocks() 对每个 cache block 调 estimateTokens()，
+//   而 Claude Code 长会话可达 658 个 block / 累计 658K tokens ≈ 2.6MB 文本。
+//   tiktoken 是纯 JS 同步实现（~1-3 MB/s）→ 单请求 1-2.6 秒纯 CPU 阻塞 event loop。
+//   history 只增不减，所以「跑越久越卡」；多会话并发时主进程永久饱和。
+// 修法:memoize。history 是 append-only，同一 block 在后续每轮重复出现，tiktoken
+//   结果完全相同。用 native crypto SHA-1 作 key（C++ 实现，2.6MB 约 5ms，比 tiktoken
+//   快 200-500 倍），第二轮起命中率 ~99%。
+// 边界:短文本（<512B）直接算，hash 开销大于收益；cache 上限 20000 条防内存泄漏。
+const tokenCountCache = new Map<string, number>()
+const TOKEN_COUNT_CACHE_MAX = 20000
+const TOKEN_COUNT_CACHE_MIN_LEN = 512
+
 export function estimateTokens(text: string): number {
-  return countTokens(text)
+  if (!text) return 0
+  // 短文本:hash + Map 开销 > tiktoken 直算，不走缓存
+  if (text.length < TOKEN_COUNT_CACHE_MIN_LEN) return countTokens(text)
+
+  const key = createHash('sha1').update(text, 'utf-8').digest('base64')
+  const hit = tokenCountCache.get(key)
+  if (hit !== undefined) return hit
+
+  const tokens = countTokens(text)
+  // 简单容量控制:超限整体清空（LRU 的复杂度对本场景不划算，
+  // 清空后下一轮会重新填充，最坏情况退化成一次全量重算）
+  if (tokenCountCache.size >= TOKEN_COUNT_CACHE_MAX) {
+    tokenCountCache.clear()
+    console.log(`[TokenCounter] estimateTokens cache cleared at ${TOKEN_COUNT_CACHE_MAX} entries`)
+  }
+  tokenCountCache.set(key, tokens)
+  return tokens
+}
+
+/** 测试/诊断用:返回 memoize 缓存当前条目数 */
+export function getEstimateTokensCacheSize(): number {
+  return tokenCountCache.size
 }
 
 // 解析 AWS Event Stream 二进制格式

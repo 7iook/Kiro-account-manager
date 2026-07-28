@@ -113,6 +113,14 @@ interface ProxyConfig {
   enableMetrics?: boolean
   fallbackPort?: number
   enableAuditLog?: boolean
+  // 挂起门闸(Hold Gate):无可用账号时冻结请求,换号后无缝续接
+  holdWhenNoAccount?: boolean
+  holdPingIntervalMs?: number
+  holdMaxWaitMs?: number
+  holdTotalBudgetMs?: number
+  holdGraceMs?: number
+  holdTimeoutAction?: 'keep_blocking' | 'error' | 'graceful_stop'
+  holdAutoResumeOnAvailable?: boolean
 }
 
 // 反代请求日志：模块级持久化 + 单次订阅，避免切到其它页面 unmount 后日志清空、中间请求事件丢失
@@ -157,6 +165,8 @@ export function ProxyPanel() {
   const [isRunning, setIsRunning] = useState(false)
   // v1.7.6 能力路由 bootstrap 同步进行中状态(供 UI loading 显示 + 幂等按钮禁用)
   const [capabilitySyncInflight, setCapabilitySyncInflight] = useState(false)
+  // 挂起门闸:当前被挂起(HELD)的请求数(徽标 + 放行按钮启用态)
+  const [heldCount, setHeldCount] = useState(0)
   const [config, setConfig] = useState<ProxyConfig>({
     enabled: false,
     port: 5580,
@@ -434,11 +444,18 @@ export function ProxyPanel() {
       }
     })
 
+    // 挂起门闸:订阅挂起数变化 + 初次拉取当前值
+    const unsubHeld = window.api.onProxyHeldRequestsChanged((info) => {
+      setHeldCount(info.count)
+    })
+    void window.api.proxyGetHeldRequests().then(r => setHeldCount(r.count)).catch(() => {})
+
     return () => {
       unsubRequest()
       unsubStatsHook()
       unsubError()
       unsubStatus()
+      unsubHeld()
       _refSetProxyRecentLogs = null
     }
   }, [fetchStatus, loadAvailableModels])
@@ -1095,6 +1112,35 @@ export function ProxyPanel() {
                 </div>
               </>
             )}
+            {/* 挂起门闸:无可用账号时冻结请求,换号后无缝续接(单/多账号都适用) */}
+            <div className="flex items-center gap-2">
+              <Switch
+                id="holdWhenNoAccount"
+                checked={config.holdWhenNoAccount || false}
+                onCheckedChange={(checked) => {
+                  setConfig(prev => ({ ...prev, holdWhenNoAccount: checked }))
+                  window.api.proxyUpdateConfig({ holdWhenNoAccount: checked })
+                }}
+              />
+              <Label htmlFor="holdWhenNoAccount" className="text-sm cursor-pointer truncate" title={isEn ? 'Freeze requests when no account available; seamlessly resume after switching accounts (streaming only)' : '无可用账号时冻结请求(转圈等待不中断),换好账号后自动无缝续接(仅流式)'}>
+                {isEn ? 'Hold Gate' : '挂起门闸'}
+              </Label>
+              {heldCount > 0 && (
+                <Badge variant="secondary" className="text-xs" title={isEn ? 'Requests currently held' : '当前挂起中的请求数'}>
+                  {isEn ? `${heldCount} held` : `挂起 ${heldCount}`}
+                </Badge>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-6 px-2 text-xs"
+                disabled={heldCount === 0}
+                onClick={() => { void window.api.proxyReleaseHeldRequests() }}
+                title={isEn ? 'Manually release all held requests (retry with available accounts)' : '手动放行所有挂起请求(用可用账号重试)'}
+              >
+                {isEn ? 'Release' : '放行'}
+              </Button>
+            </div>
             <div className="flex items-center gap-2">
               <Switch
                 id="logRequests"
@@ -1162,16 +1208,16 @@ export function ProxyPanel() {
                 />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="payloadSizeLimit" className="text-xs" title={isEn ? 'When payload exceeds this limit, oldest tool results will be truncated. Default 1536KB (1.5MB).' : '超过此限制时，最旧工具结果将被截断。默认 1536KB (1.5MB)'}>{isEn ? 'Payload (KB)' : 'Payload (KB)'}</Label>
+                <Label htmlFor="payloadSizeLimit" className="text-xs" title={isEn ? 'Byte-level fallback: when payload exceeds this, oldest tool results are truncated. Default 4608KB (4.5MB); upstream hard limit is ~5MiB. Token-level overflow is handled separately by Token Buffer Reserve.' : 'byte 维度兼底：超过此限制时，最旧工具结果将被截断。默认 4608KB (4.5MB)，上游硬限实测约 5MiB。token 超 context window 由「Token 余量预留」单独处理'}>{isEn ? 'Payload (KB)' : 'Payload (KB)'}</Label>
                 <Input
                   id="payloadSizeLimit"
                   type="number"
                   min={256}
                   max={204800}
                   step={1024}
-                  value={config.payloadSizeLimitKB || 153600}
+                  value={config.payloadSizeLimitKB || 4608}
                   onChange={(e) => {
-                    const kb = parseInt(e.target.value) || 153600
+                    const kb = parseInt(e.target.value) || 4608
                     setConfig(prev => ({ ...prev, payloadSizeLimitKB: kb }))
                     window.api.proxyUpdateConfig({ payloadSizeLimitKB: kb })
                   }}

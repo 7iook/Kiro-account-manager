@@ -38,6 +38,8 @@ import {
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
 import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
+import { HoldGate, realClock, type HoldGateRuntimeConfig, type HeldRequestHooks } from './holdGate'
+import { normalizeHoldConfig } from './holdConfig'
 
 
 export interface ProxyServerEvents {
@@ -57,6 +59,9 @@ export interface ProxyServerEvents {
   // 会话内定期快照回调：服务运行中每 60s 用 snapshotSession() 触发一次，主进程写 store 作为 orphan 保底（强杀/崩溃下次启动能归档）
   onSessionTick?: (record: ProxySessionRecord) => void
   onPoolEmpty?: () => Promise<void> // 账号池为空时触发（冷启动懒加载）
+  // 挂起门闸:当前被挂起(HELD)请求数变化时触发,驱动前端徽标/放行按钮态
+  // 方案:.archive/2026-07-28/hold-gate-blocking/hold-gate-blocking-design.md §5
+  onHeldRequestsChanged?: (info: { count: number }) => void
 }
 
 type ModelModality = 'text' | 'audio' | 'image' | 'video' | 'pdf'
@@ -268,6 +273,12 @@ export class ProxyServer {
   private stats: ProxyStats
   private sessionStats: { totalRequests: number; successRequests: number; failedRequests: number; credits: number; inputTokens: number; outputTokens: number; startTime: number }
   private events: ProxyServerEvents
+  // 挂起门闸(Hold Gate):无可用账号时冻结流式请求。基础设施层建好实例 + 出口,
+  // task#3 负责在 handleClaudeStream 错误汇合点调 enterHold 接线。
+  // 方案:.archive/2026-07-28/hold-gate-blocking/hold-gate-blocking-design.md
+  private holdGate: HoldGate
+  /** HoldGate 运行配置(持久引用;updateConfig 原地更新,HoldGate 持有同一引用) */
+  private holdRuntimeConfig: HoldGateRuntimeConfig
   private refreshingTokens: Map<string, Promise<boolean>> = new Map() // 在途刷新去重（并发方共享同一结果）
   /** v1.7.6 probe-once: 单账户 × 单模型的探测锁,key=`${accountId}:${modelId}`,防并发爆量 */
   private modelProbeInflight: Map<string, number> = new Map()
@@ -377,6 +388,45 @@ export class ProxyServer {
       startTime: 0
     }
     this.events = events
+
+    // 挂起门闸实例化(基础设施):注入真实时钟 + 池可用性查询 + 归一化后的 hold 配置。
+    // holdRuntimeConfig 是持久引用对象,updateConfig 时 Object.assign 原地更新其字段;
+    // HoldGate 持有同一引用,故新配置对之后 enterHold 的新请求即时生效(已 held 请求 timer 不追溯)。
+    this.holdRuntimeConfig = normalizeHoldConfig(this.config)
+    this.holdGate = new HoldGate({
+      clock: realClock,
+      isPoolAvailable: () => this.accountPool.availableCount > 0,
+      config: this.holdRuntimeConfig
+    })
+    // 事件即时唤醒:池从全挂→出现可用号时,若开关开 + 允许自动放行,则尝试放行挂起请求。
+    // 时间衰减恢复(配额到点)的兜底轮询由 task#3 接线时叠加(方案 §5 A4)。
+    this.accountPool.setAvailabilityListener(() => {
+      if (this.config.holdWhenNoAccount && (this.config.holdAutoResumeOnAvailable ?? true)) {
+        this.holdGate.tryResume()
+      }
+    })
+  }
+
+  /** 手动放行所有挂起请求(前端"放行"按钮 → IPC)。@returns 实际放行数(幂等,无挂起时 0)。 */
+  releaseHeldRequests(): number {
+    const released = this.holdGate.releaseAll()
+    this.events.onHeldRequestsChanged?.({ count: this.holdGate.getHeldCount() })
+    return released
+  }
+
+  /** 当前挂起中的请求数(前端徽标 + 放行按钮启用条件)。 */
+  getHeldRequestsCount(): number {
+    return this.holdGate.getHeldCount()
+  }
+
+  /** HoldGate 实例(task#3 接线 handleClaudeStream 时调 enterHold/abort 用)。 */
+  getHoldGate(): HoldGate {
+    return this.holdGate
+  }
+
+  /** 触发挂起数变化事件(task#3 在 enterHold/abort 后调,驱动前端徽标)。 */
+  emitHeldRequestsChanged(): void {
+    this.events.onHeldRequestsChanged?.({ count: this.holdGate.getHeldCount() })
   }
 
   /**
@@ -674,7 +724,15 @@ export class ProxyServer {
     const enableWasOff = !this.config.enableModelCapabilityRouting
     const enableNowOn = config.enableModelCapabilityRouting === true
     this.config = { ...this.config, ...config }
-    // v1.7.7 同步 prompt 注入开关(字段可能未传 · undefined 保持当前值、false/true 同步)
+    // 同步挂起门闸运行配置(clamp/校验收口在 holdConfig SSOT);原地更新持久引用,
+    // HoldGate 持有同一对象 → 对之后 enterHold 的新请求即时生效。仅当传入任一 hold* 字段时才重算。
+    const HOLD_KEYS: Array<keyof ProxyConfig> = [
+      'holdWhenNoAccount', 'holdPingIntervalMs', 'holdMaxWaitMs', 'holdTotalBudgetMs',
+      'holdGraceMs', 'holdTimeoutAction', 'holdAutoResumeOnAvailable'
+    ]
+    if (HOLD_KEYS.some(k => k in config)) {
+      Object.assign(this.holdRuntimeConfig, normalizeHoldConfig(this.config))
+    }
     if (config.injectExecutionDirective !== undefined) {
       setInjectExecutionDirective(!!config.injectExecutionDirective)
     }
@@ -2312,7 +2370,11 @@ export class ProxyServer {
       'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
       'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
       'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog',
-      'injectExecutionDirective'
+      'injectExecutionDirective',
+      // 挂起门闸(Hold Gate)运行行为字段 —— 与其它运行字段一致允许远程改
+      // (安全/监听字段仍排除;这些只改请求编排行为,clamp 校验在 updateConfig 收口)
+      'holdWhenNoAccount', 'holdPingIntervalMs', 'holdMaxWaitMs', 'holdTotalBudgetMs',
+      'holdGraceMs', 'holdTimeoutAction', 'holdAutoResumeOnAvailable'
       // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
       // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
     ]
@@ -3217,9 +3279,17 @@ export class ProxyServer {
 
     // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
+    const wantStream = request.stream === true
+    const holdEnabled = this.config.holdWhenNoAccount === true
     const account = await this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, request.model)
     this.throwIfAborted(signal)
     if (!account) {
+      // Hold Gate 汇合点 A(方案 §1 状态机 RECEIVED→无号):流式 + 开关开 → 挂起等待换号,
+      // 而非现状直接 503。resume 时重新拿号 + 重跑完整流式转发(见 startClaudeStreamWithHold)。
+      if (wantStream && holdEnabled) {
+        await this.startClaudeStreamWithHold(res, processedRequest, request.model, startTime, matchedApiKey, signal)
+        return
+      }
       this.recordRequestFailed()
       const quotaStatus = this.accountPool.getQuotaStatus()
       const errorMsg = quotaStatus.exhausted > 0 && quotaStatus.available === 0
@@ -3232,6 +3302,14 @@ export class ProxyServer {
     }
 
     this.events.onRequest?.({ path: '/v1/messages', method: 'POST', accountId: account.id })
+
+    // Hold Gate 汇合点 B(方案 §1:选到号但首字节前上游失败 & 切号后无号):
+    // 流式 + 开关开时,把首次拿到的号交给带挂起感知的转发器 —— 它在首字节前失败(且未吐正文)
+    // 时进入 HELD,而非直接发 SSE error。非流式 / 开关关 → 走下方原有路径,行为逐字不变。
+    if (wantStream && holdEnabled) {
+      await this.startClaudeStreamWithHold(res, processedRequest, request.model, startTime, matchedApiKey, signal, account)
+      return
+    }
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
@@ -3321,6 +3399,148 @@ export class ProxyServer {
     }
   }
 
+  /**
+   * Hold Gate 流式转发编排(task#3 收口 · ADR-0001)。
+   * 封装"拿号 → 构造 payload → handleClaudeStream"一次尝试,并在两个失败汇合点接挂起门闸:
+   *   ① 无可用号(首次或切号后)→ enterHold 等待换号(手动放行 / 池自动检测),resume 重跑;
+   *   ② 首字节前上游失败(未吐正文)→ 先即时切下一个号重试,无号可切 → enterHold。
+   * 一旦吐了语义正文(message_start 之后),失败只能走 SSE error 收尾(协议硬限制,由 handleClaudeStream 处理)。
+   * 绝对 deadline 从 receivedAt(=startTime)起算,全程不重置(Invariant 3);超时收尾由 HoldGate 按 timeoutAction 处理。
+   * @param seedAccount 汇合点 B 首次已拿到的号(汇合点 A 无号时为 undefined)。
+   */
+  private async startClaudeStreamWithHold(
+    res: http.ServerResponse,
+    processedRequest: ClaudeRequest,
+    model: string,
+    startTime: number,
+    matchedApiKey: import('./types').ApiKey | undefined,
+    signal?: AbortSignal,
+    seedAccount?: ProxyAccount
+  ): Promise<void> {
+    // 先建立 SSE 连接(发响应头),使挂起态能写 ping 心跳;此时尚未发 message_start(延迟到首字节)。
+    if (!this.isResponseClosed(res)) {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
+    }
+
+    // 注入 steering(与非挂起路径一致);每次重试用当前 account 的 profileArn 重新构造 payload。
+    if (this.steeringPrompt) {
+      processedRequest.system = this.injectSteeringClaude(processedRequest.system) as string | undefined
+    }
+    const claudeThinkingConfig = this.getThinkingConfig(processedRequest.model)
+    const affinityHint = processedRequest.conversation_id
+    // 本次请求已试过的账号(避免 resume/切号反复命中同一挂账号)。
+    const triedIds = new Set<string>()
+
+    // SSE ping 心跳:挂起态保活客户端 watchdog(ADR-0001 边界 1)。
+    const sendPing = (): void => {
+      if (this.isResponseClosed(res)) return
+      res.write('event: ping\ndata: {"type":"ping"}\n\n')
+    }
+
+    // 用一个账号做一次完整流式转发。返回 'done'(终态:成功/已吐正文的失败/abort)
+    // 或 'pre_body_failed'(首字节前失败,可切号或挂起)。
+    const attemptOnce = (acc: ProxyAccount): Promise<'done' | 'pre_body_failed'> => {
+      return new Promise<'done' | 'pre_body_failed'>((resolveAttempt) => {
+        triedIds.add(acc.id)
+        const toolNameRegistry = new ToolNameRegistry()
+        const kiroPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, claudeThinkingConfig)
+        const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length * 0.3))
+        const cacheProfile = promptCacheTracker.buildClaudeProfile(
+          processedRequest.system, processedRequest.messages, processedRequest.tools, estimatedInputTokens, processedRequest.model
+        )
+        const cacheUsage = promptCacheTracker.compute(acc.id, cacheProfile)
+        this.events.onRequest?.({ path: '/v1/messages', method: 'POST', accountId: acc.id })
+        let settled = false
+        const onPreBodyError = (_error: Error): boolean => {
+          // 首字节前失败:标记为可切号/挂起,接管(不发 SSE error)。
+          if (!settled) { settled = true; resolveAttempt('pre_body_failed') }
+          return true
+        }
+        // headersSent=true:响应头已发;currentRound=0:message_start 由 handleClaudeStream 惰性延迟到首字节。
+        this.handleClaudeStream(
+          res, acc, kiroPayload, model, startTime, 0, undefined, true, 0, matchedApiKey, toolNameRegistry, signal,
+          cacheProfile ? { ...cacheUsage, cacheProfile, accountId: acc.id } : undefined,
+          onPreBodyError
+        ).then(() => {
+          // handleClaudeStream 走完(成功收尾 / 已吐正文的 error / abort)。若不是被 onPreBodyError 接管的,即终态。
+          if (!settled) { settled = true; resolveAttempt('done') }
+        }).catch(() => {
+          if (!settled) { settled = true; resolveAttempt('done') }
+        })
+      })
+    }
+
+    // 拿一个"未试过的"可用号;无则 null。
+    const pickFreshAccount = async (): Promise<ProxyAccount | null> => {
+      const acc = await this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, model)
+      if (acc && !triedIds.has(acc.id)) return acc
+      return null
+    }
+
+    // 挂起等待:进入 HELD,直到 resume(手动/自动)/ 超时 / abort 认领。返回 true=被 resume(应重试),false=终态(超时/abort)。
+    const waitInHold = (): Promise<boolean> => {
+      return new Promise<boolean>((resolveHold) => {
+        let holdId = 0
+        const settleHold = (retry: boolean): void => { this.emitHeldRequestsChanged(); resolveHold(retry) }
+        const hooks: HeldRequestHooks = {
+          sendPing,
+          resume: () => settleHold(true),
+          sendError: () => {
+            if (!this.isResponseClosed(res)) {
+              const errorEvent = createClaudeStreamEvent('error', { error: { type: 'overloaded_error', message: 'Hold timeout: no account became available in time (HOLD_TIMEOUT)' } })
+              res.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
+              res.end()
+            }
+            this.recordRequestFailed()
+            settleHold(false)
+          },
+          sendGracefulStop: () => {
+            if (!this.isResponseClosed(res)) {
+              const msgStart = createClaudeStreamEvent('message_start', { message: { id: `msg_${uuidv4()}`, type: 'message', role: 'assistant', content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } })
+              res.write(`event: message_start\ndata: ${JSON.stringify(msgStart)}\n\n`)
+              const blockStart = createClaudeStreamEvent('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
+              res.write(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`)
+              const delta = createClaudeStreamEvent('content_block_delta', { index: 0, delta: { type: 'text_delta', text: '[请求等待可用账号超时,请重新发送]' } })
+              res.write(`event: content_block_delta\ndata: ${JSON.stringify(delta)}\n\n`)
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('content_block_stop', { index: 0 }))}\n\n`)
+              res.write(`event: message_delta\ndata: ${JSON.stringify(createClaudeStreamEvent('message_delta', { delta: { stop_reason: 'end_turn', stop_sequence: null } as any, usage: { output_tokens: 0 } }))}\n\n`)
+              res.write(`event: message_stop\ndata: ${JSON.stringify(createClaudeStreamEvent('message_stop'))}\n\n`)
+              res.end()
+            }
+            this.recordRequestFailed()
+            settleHold(false)
+          }
+        }
+        holdId = this.holdGate.enterHold({ receivedAt: startTime, hooks })
+        this.emitHeldRequestsChanged()
+        // 客户端中途断开 → abort 该挂起条目(停心跳、清 timer、认领作废),视为终态。
+        const onAbort = (): void => { this.holdGate.abort(holdId); this.emitHeldRequestsChanged(); settleHold(false) }
+        if (signal) {
+          if (signal.aborted) { onAbort(); return }
+          signal.addEventListener('abort', onAbort, { once: true })
+        }
+      })
+    }
+
+    // 主编排循环:尝试转发 → 首字节前失败则切号 → 无号则挂起等待 → resume 再来。
+    let acc: ProxyAccount | null = seedAccount ?? await pickFreshAccount()
+    for (;;) {
+      if (this.isResponseClosed(res)) return
+      if (!acc) {
+        // 无可用号(汇合点 A,或切号后耗尽)→ 挂起。
+        const shouldRetry = await waitInHold()
+        if (!shouldRetry) return // 超时/abort 终态
+        acc = await pickFreshAccount()
+        if (!acc) { triedIds.clear(); acc = await pickFreshAccount() } // resume 后仍未拿到(去抖竞争),清 tried 再试一次
+        continue
+      }
+      const outcome = await attemptOnce(acc)
+      if (outcome === 'done') return // 终态(成功 / 已吐正文失败 / abort)
+      // 首字节前失败(汇合点 B):先即时切下一个未试过的号,拿不到再挂起。
+      acc = await pickFreshAccount()
+    }
+  }
+
   // 处理 Claude 流式响应
   private async handleClaudeStream(
     res: http.ServerResponse,
@@ -3335,7 +3555,11 @@ export class ProxyServer {
     matchedApiKey?: import('./types').ApiKey,
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
     signal?: AbortSignal,
-    simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string }
+    simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string },
+    // Hold Gate 接线(task#3,ADR-0001 边界 2):首字节前上游失败时回调。
+    // 返回 true = 已被挂起门闸接管(不发 SSE error,交给 resume 重试);false = 未接管,按现状发 error。
+    // 仅在"尚未发出 message_start(未写入任何语义正文)"时才可能被调用 —— 一旦吐了正文,重放会重复输出。
+    onPreBodyError?: (error: Error) => boolean
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -3353,21 +3577,15 @@ export class ProxyServer {
     let collectedContent = ''
     const pendingToolCalls: Map<string, { name: string; input: Record<string, unknown> }> = new Map()
 
-    const flushThinkingSignature = () => {
-      if (!pendingThinkingSignature) return
-      const signatureDelta = createClaudeStreamEvent('content_block_delta', {
-        index: currentBlockIndex,
-        delta: { type: 'signature_delta', signature: pendingThinkingSignature }
-      })
-      res.write(`event: content_block_delta\ndata: ${JSON.stringify(signatureDelta)}\n\n`)
-      pendingThinkingSignature = undefined
-    }
-
-    // 估算输入 tokens（基于 payload 大小）
-    const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length / 3))
-    
-    // 发送 message_start（仅首轮）
-    if (currentRound === 0) {
+    // ADR-0001 边界 1(SSE bootstrap 时序):message_start 从"进入函数即发"延迟到"首个语义正文写出前"。
+    // 挂起态(resume 前)从不进入本函数,故永不发 message_start;拿到号真正转发时,首个 delta/tool 前
+    // 惰性发一次。这样"未吐正文前失败"可无缝切号重放,不背"已提交正文"包袱(Invariant 1)。
+    // currentRound>0(多轮工具续接)时 message_start 已在首轮发过,这里视为已发。
+    let messageStartSent = currentRound !== 0
+    const emitMessageStartOnce = () => {
+      if (messageStartSent) return
+      messageStartSent = true
+      const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length / 3))
       const messageStart = createClaudeStreamEvent('message_start', {
         message: {
           id,
@@ -3383,12 +3601,25 @@ export class ProxyServer {
       res.write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`)
     }
 
+    const flushThinkingSignature = () => {
+      if (!pendingThinkingSignature) return
+      const signatureDelta = createClaudeStreamEvent('content_block_delta', {
+        index: currentBlockIndex,
+        delta: { type: 'signature_delta', signature: pendingThinkingSignature }
+      })
+      res.write(`event: content_block_delta\ndata: ${JSON.stringify(signatureDelta)}\n\n`)
+      pendingThinkingSignature = undefined
+    }
+
     return new Promise((resolve) => {
       callKiroApiStream(
         account as any,
         kiroPayload,
         (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
+          // ADR-0001 边界 1:首个语义正文写出前,惰性补发 message_start(恰好一次)。
+          // 此后 onPreBodyError 不再接管(messageStartSent=true → 已吐正文,重放会重复)。
+          emitMessageStartOnce()
           // 优先处理 redacted_thinking（加密的 thinking 块，需单独 content_block）
           if (redactedContent) {
             if (hasStartedTextBlock) {
@@ -3516,6 +3747,8 @@ export class ProxyServer {
             resolve()
             return
           }
+          // 空响应(上游未吐任何 chunk 即完成)也需补发 message_start,保证 SSE 协议完整。
+          emitMessageStartOnce()
           if (hasStartedThinkingBlock) {
             flushThinkingSignature()
             const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
@@ -3573,24 +3806,45 @@ export class ProxyServer {
             resolve()
             return
           }
-          const errMsgFull2 = error.message || String(error)
-          // v1.7.6 调试:显式把 error 内容写到 UI 可见日志
-          proxyLogger.error('ProxyServer', `Stream error (Claude msg): ${errMsgFull2.slice(0, 500)}`, {
+          console.error('[ProxyServer] Stream error:', error)
+
+          // Hold Gate 接线(task#3):先按现状把失败账号的状态记账(suspended/quota/冷却),
+          // 使随后的 resume 拿号能跳过这个刚挂的账号。
+          this.recordRequestFailed()
+          const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
+          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+          // 单账号被 403 suspended 时 recordError 不足以标记长期封禁,补一道 detect+markSuspended,
+          // 否则 resume 会再次选中同一挂账号死循环。
+          const suspendInfo2 = this.detectSuspendedError(error.message)
+          if (suspendInfo2) {
+            const newlyMarked = this.accountPool.markSuspended(account.id, suspendInfo2.reason, suspendInfo2.message)
+            if (newlyMarked) {
+              this.events.onAccountSuspended?.({ accountId: account.id, email: (account as { email?: string }).email, reason: suspendInfo2.reason, message: suspendInfo2.message })
+            }
+          }
+
+          // ADR-0001 边界 2:仅在"尚未发出 message_start(未吐任何语义正文)"时,才允许挂起门闸接管。
+          // 接管成功 → 静默 resolve,不发 SSE error(交给 resume 用新号重放,客户端无感)。
+          if (!messageStartSent && onPreBodyError?.(error)) {
+            this.events.onResponse?.({ path: '/v1/messages', model, status: 503, error: `held: ${error.message}` })
+            resolve()
+            return
+          }
+
+          const errMsgFull2b = error.message || String(error)
+          // v1.7.6 调试:显式把 error 内容写到 UI 可见日志(接管失败或已吐正文,才走现状 error 路径)
+          proxyLogger.error('ProxyServer', `Stream error (Claude msg): ${errMsgFull2b.slice(0, 500)}`, {
             path: '/v1/messages',
             model,
             account: (account as { email?: string }).email || account.id?.slice(0, 8) || '?',
             errorType: error.name || 'Error'
           })
-          console.error('[ProxyServer] Stream error:', error)
           const errorEvent = createClaudeStreamEvent('error', {
             error: { type: 'api_error', message: error.message }
           })
           res.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
           res.end()
 
-          this.recordRequestFailed()
-          const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
           this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
@@ -3816,6 +4070,29 @@ export class ProxyServer {
     this.sessionAffinity.set(sessionHint, { accountId, lastAt: Date.now() })
   }
 
+  /**
+   * 失效会话粘性(显式换账号时调用)
+   * 不传 accountId → 清全部;传了 → 只清指向该账号的条目。
+   * 语义:用户显式换账号后,旧会话不得继续粘在旧账号上(否则仍需重启服务才生效)。
+   * 详见 RCA §1.5 假设 D:.archive/2026-07-28/proxy-hot-switch-single-account/
+   * @returns 被清理的条目数
+   */
+  invalidateSessionAffinity(accountId?: string): number {
+    if (!accountId) {
+      const n = this.sessionAffinity.size
+      this.sessionAffinity.clear()
+      return n
+    }
+    let n = 0
+    for (const [key, entry] of this.sessionAffinity) {
+      if (entry.accountId === accountId) {
+        this.sessionAffinity.delete(key)
+        n++
+      }
+    }
+    return n
+  }
+
   /** P2-17 审计日志 */
   private appendAuditLog(type: string, data: Record<string, unknown>): void {
     if (!this.config.enableAuditLog) return
@@ -3878,29 +4155,6 @@ export class ProxyServer {
     lines.push(`kiro_proxy_tokens_total{type="input"} ${s.inputTokens}`)
     lines.push(`kiro_proxy_tokens_total{type="output"} ${s.outputTokens}`)
     lines.push(`kiro_proxy_tokens_total{type="cache_read"} ${s.cacheReadTokens}`)
-  /**
-   * 失效会话粘性(显式换账号时调用)
-   * 不传 accountId → 清全部;传了 → 只清指向该账号的条目。
-   * 语义:用户显式换账号后,旧会话不得继续粘在旧账号上(否则仍需重启服务才生效)。
-   * 详见 RCA §1.5 假设 D:.archive/2026-07-28/proxy-hot-switch-single-account/
-   * @returns 被清理的条目数
-   */
-  invalidateSessionAffinity(accountId?: string): number {
-    if (!accountId) {
-      const n = this.sessionAffinity.size
-      this.sessionAffinity.clear()
-      return n
-    }
-    let n = 0
-    for (const [key, entry] of this.sessionAffinity) {
-      if (entry.accountId === accountId) {
-        this.sessionAffinity.delete(key)
-        n++
-      }
-    }
-    return n
-  }
-
     lines.push(`kiro_proxy_tokens_total{type="cache_write"} ${s.cacheWriteTokens}`)
     lines.push('# HELP kiro_proxy_credits_total Total credits consumed')
     lines.push('# TYPE kiro_proxy_credits_total counter')

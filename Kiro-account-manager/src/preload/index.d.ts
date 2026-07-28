@@ -700,6 +700,10 @@ interface KiroApi {
   // 更新反代服务器配置
   proxyUpdateConfig: (config: Record<string, unknown>) => Promise<{ success: boolean; config?: unknown; error?: string }>
 
+  // 挂起门闸:手动放行所有挂起请求 / 查询挂起数
+  proxyReleaseHeldRequests: () => Promise<{ released: number }>
+  proxyGetHeldRequests: () => Promise<{ count: number }>
+
   // ============ v1.8 反代安全 / 可观测 IPC ============
   proxySelfSignedCertInfo: () => Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }>
   proxySelfSignedCertRegenerate: () => Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }>
@@ -794,6 +798,9 @@ interface KiroApi {
 
   // 监听反代账号更新事件（token 刷新 / Enterprise profileArn 自愈）
   onProxyAccountUpdate: (callback: (info: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string }) => void) => () => void
+
+  // 监听挂起请求数变化事件(驱动挂起数徐标 + 放行按钮启用态)
+  onProxyHeldRequestsChanged: (callback: (info: { count: number }) => void) => () => void
 
   // ============ Usage API 类型设置 ============
 

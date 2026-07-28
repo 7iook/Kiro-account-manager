@@ -77,8 +77,12 @@ async function ensureWindow(show: boolean, proxy?: string): Promise<BrowserWindo
     autoHideMenuBar: true,
     webPreferences: {
       partition: PARTITION,
-      // 后台隐藏时不节流定时器/网络，保证 Proton 仍能实时收新邮件
-      backgroundThrottling: false,
+      // 后台隐藏时不节流定时器/网络，保证 Proton 仍能实时收新邮件。
+      // 2026-07-25:原先这里写 backgroundThrottling:false，已移除 —— 该 flag 触发
+      // electron#29646 / #50250 的 visibility desync（最小化/遮挡后窗口收不到点击）。
+      // 同等效果改由 src/main/index.ts 头部的三个 app.commandLine.appendSwitch 全局提供
+      // （disable-background-timer-throttling / disable-renderer-backgrounding /
+      //   disable-backgrounding-occluded-windows），全局开关对本窗口同样生效。
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true
