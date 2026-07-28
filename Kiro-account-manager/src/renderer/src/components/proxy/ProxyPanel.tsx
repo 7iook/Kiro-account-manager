@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, FileText, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2 } from 'lucide-react'
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Switch, Badge, Select } from '../ui'
 import { ProxySecurityPanel } from './ProxySecurityPanel'
-import { useAccountsStore } from '../../store/accounts'
+import { useAccountsStore, toProxyAccount } from '../../store/accounts'
 import { useTranslation } from '../../hooks/useTranslation'
 import { ProxyLogsDialog } from './ProxyLogsDialog'
 import { ProxyDetailedLogsDialog } from './ProxyDetailedLogsDialog'
@@ -192,8 +192,8 @@ export function ProxyPanel() {
 
   const accounts = useAccountsStore(state => state.accounts)
   const groups = useAccountsStore(state => state.groups)
-  // 账号池热切换 · 2026-07-23 hot-swap-accounts
-  const switchProxyActiveAccount = useAccountsStore(state => state.switchProxyActiveAccount)
+  // 账号池热切换收口 · RCA .archive/2026-07-28/proxy-hot-switch-single-account/
+  const syncActiveAccountToProxy = useAccountsStore(state => state.syncActiveAccountToProxy)
 
   // 生成随机 API Key
   const generateApiKey = useCallback(() => {
@@ -299,29 +299,7 @@ export function ProxyPanel() {
         })
       }
 
-      const proxyAccounts = candidates.map(acc => ({
-          id: acc.id,
-          email: acc.email,
-          accessToken: acc.credentials.accessToken,
-          refreshToken: acc.credentials?.refreshToken,
-          profileArn: acc.profileArn || acc.credentials?.profileArn,
-          expiresAt: acc.credentials?.expiresAt,
-          machineId: acc.machineId,
-          // Token 刷新所需字段
-          clientId: acc.credentials?.clientId,
-          clientSecret: acc.credentials?.clientSecret,
-          region: acc.credentials?.region || 'us-east-1',
-          authMethod: acc.credentials?.authMethod,
-          provider: acc.credentials?.provider || acc.idp,
-          // external_idp (Azure AD) 反代刷新需微软端点
-          tokenEndpoint: acc.credentials?.tokenEndpoint,
-          issuerUrl: acc.credentials?.issuerUrl,
-          scopes: acc.credentials?.scopes,
-          // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险），即便前端忘了重同步也安全
-          groupId: acc.groupId,
-          // v1.7.6 SWRR 权重(缺省 100)
-          weight: typeof acc.weight === 'number' ? acc.weight : 100
-        }))
+      const proxyAccounts = candidates.map(acc => toProxyAccount(acc))
 
       const result = await window.api.proxySyncAccounts(proxyAccounts)
       if (result.success) {
@@ -1795,11 +1773,12 @@ export function ProxyPanel() {
         selectedAccountId={config.selectedAccountId}
         onSelect={(accountId) => {
           setConfig(prev => ({ ...prev, selectedAccountId: accountId }))
-          window.api.proxyUpdateConfig({ selectedAccountIds: accountId ? [accountId] : [] })
-          // 反代运行中 & 指定了账号 → 热切换主进程账号池的 currentIndex
-          // 详见 2026-07-23 hot-swap-accounts 决策卡 §3
-          if (isRunning && accountId) {
-            void switchProxyActiveAccount(accountId)
+          if (accountId) {
+            // 走唯一收口(入池/刷凭据 + 写 selectedAccountIds + 指针/粘性)· RCA §6
+            void syncActiveAccountToProxy(accountId)
+          } else {
+            // “第一个可用账号” = 清空指定
+            window.api.proxyUpdateConfig({ selectedAccountIds: [] })
           }
         }}
         isEn={isEn}

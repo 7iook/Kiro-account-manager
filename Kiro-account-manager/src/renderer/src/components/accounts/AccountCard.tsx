@@ -292,6 +292,10 @@ export const AccountCard = memo(function AccountCard({
 
     if (success) {
       setActiveAccount(account.id)
+      // 把「当前该用哪个账号」传播到反代(运行中不用停服务)· RCA §6
+      // .archive/2026-07-28/proxy-hot-switch-single-account/
+      // 必须在上方 refreshedCredentials 回写 store 之后调,收口函数从 store 现读凭据
+      void useAccountsStore.getState().syncActiveAccountToProxy(account.id)
     } else {
       alert(isEn ? `Switch failed: ${errorMsg}` : `切换失败: ${errorMsg}`)
     }

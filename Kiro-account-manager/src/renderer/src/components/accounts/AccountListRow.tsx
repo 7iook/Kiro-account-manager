@@ -216,6 +216,9 @@ function AccountListRowComponent({
 
     if (success) {
       setActiveAccount(account.id)
+      // 把「当前该用哪个账号」传播到反代(运行中不用停服务)· RCA §6
+      // .archive/2026-07-28/proxy-hot-switch-single-account/
+      void useAccountsStore.getState().syncActiveAccountToProxy(account.id)
     } else {
       alert(isEn ? `Switch failed: ${errorMsg}` : `切换失败：${errorMsg}`)
     }

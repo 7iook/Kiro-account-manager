@@ -3244,8 +3244,15 @@ app.whenReady().then(async () => {
           }
         }
         for (const acc of add) {
-          // addAccount 覆盖式写入,幂等
-          pool.addAccount(acc)
+      // 显式换账号 ⇒ 旧会话粘性作废。不清的话,开了 sessionAffinity 的用户即使接线
+      // 正确,带固定 session id 的客户端仍会粘在旧账号上直到重启 · 详见 RCA §1.5 假设 D
+      const droppedAffinity = proxyServer.invalidateSessionAffinity()
+      if (droppedAffinity > 0) {
+        console.log(`[AccountPool] Invalidated ${droppedAffinity} session affinity entr${droppedAffinity === 1 ? 'y' : 'ies'} after hot-switch`)
+      }
+          // 幂等 upsert:已在池只刷凭据(保留 suspendedAt / 断路器 / 统计),不在池才新增。
+          // 无条件 addAccount 会静默解除运行期风控封禁 · 详见 RCA §4.2b
+          pool.upsertAccount(acc)
           addedCount++
         }
       }

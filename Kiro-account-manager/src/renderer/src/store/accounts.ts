@@ -542,6 +542,17 @@ interface AccountsActions {
   /** 热切换:反代运行中强制下一次请求使用指定账号 */
   switchProxyActiveAccount: (accountId: string) => Promise<{ success: boolean; error?: string }>
 
+  /**
+   * 将「当前该用哪个账号」传播到反代(唯一收口点)
+   * 所有切换账号的入口(账号卡 / 列表行 / 额度耗尽自动切换 / 反代面板指定)都走这里。
+   * 详见 RCA:.archive/2026-07-28/proxy-hot-switch-single-account/
+   */
+  syncActiveAccountToProxy: (accountId: string) => Promise<{
+    applied: boolean
+    mode?: 'single' | 'multi'
+    reason?: string
+  }>
+
   /** 热编辑账号池成员(add / remove / replace) */
   syncPoolMembersToProxy: (payload: {
     add?: Array<Record<string, unknown>>
@@ -551,6 +562,58 @@ interface AccountsActions {
 }
 
 type AccountsStore = AccountsState & AccountsActions
+
+/** 反代账号同步载荷(与 preload proxySyncAccounts / updateProxyPoolMembers 的入参契约一致) */
+export interface ProxyAccountPayload {
+  id: string
+  email?: string
+  accessToken: string
+  refreshToken?: string
+  profileArn?: string
+  expiresAt?: number
+  machineId?: string
+  clientId?: string
+  clientSecret?: string
+  region?: string
+  authMethod?: string
+  provider?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  groupId?: string
+  weight?: number
+}
+
+/**
+ * Account → 反代 ProxyAccount 载荷的唯一字段映射真源(SSOT)
+ * 消费者:ProxyPanel.syncAccounts(全量同步) + syncActiveAccountToProxy(单账号热切换)
+ * 加字段时只改这里 —— 曾经这份映射内联在 ProxyPanel 里,新增消费者极易漏字段(E-055 母题)
+ */
+export function toProxyAccount(acc: Account): ProxyAccountPayload {
+  return {
+    id: acc.id,
+    email: acc.email,
+    accessToken: acc.credentials.accessToken,
+    refreshToken: acc.credentials?.refreshToken,
+    profileArn: acc.profileArn || acc.credentials?.profileArn,
+    expiresAt: acc.credentials?.expiresAt,
+    machineId: acc.machineId,
+    // Token 刷新所需字段
+    clientId: acc.credentials?.clientId,
+    clientSecret: acc.credentials?.clientSecret,
+    region: acc.credentials?.region || 'us-east-1',
+    authMethod: acc.credentials?.authMethod,
+    provider: acc.credentials?.provider || acc.idp,
+    // external_idp (Azure AD) 反代刷新需微软端点
+    tokenEndpoint: acc.credentials?.tokenEndpoint,
+    issuerUrl: acc.credentials?.issuerUrl,
+    scopes: acc.credentials?.scopes,
+    // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险）
+    groupId: acc.groupId,
+    // v1.7.6 SWRR 权重(缺省 100)
+    weight: typeof acc.weight === 'number' ? acc.weight : 100
+  }
+}
 
 // 默认排序
 const defaultSort: AccountSort = { field: 'lastUsedAt', order: 'desc' }
@@ -2313,6 +2376,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             audience: availCreds.credentials?.audience
           }).catch(err => console.warn('[AutoSwitch CLI] Failed:', err))
         }
+        // 把「当前该用哪个账号」传播到反代(运行中不用停服务)· RCA §6
+        // .archive/2026-07-28/proxy-hot-switch-single-account/
+        await get().syncActiveAccountToProxy(availableAccount.id)
       } else {
         console.log('[AutoSwitch] No available account to switch to')
       }
@@ -3465,6 +3531,43 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const msg = err instanceof Error ? err.message : String(err)
       console.error('[Store] syncPoolMembersToProxy error:', msg)
       return { success: false, error: msg }
+    }
+  },
+
+  // 唯一收口:把「active 账号变更」传播到主进程反代 · RCA §6
+  // .archive/2026-07-28/proxy-hot-switch-single-account/
+  syncActiveAccountToProxy: async (accountId) => {
+    try {
+      const status = await window.api.proxyGetStatus()
+      if (!status?.running) {
+        return { applied: false, reason: 'not_running' }
+      }
+
+      // 凭据只从 store 现读:切换成功分支刚把 OIDC 刷新后的 access/refresh 回写这里,
+      // 而调用方组件手里的 account prop 是渲染时快照(可能带已被 rotate 作废的 refresh v1)
+      const acc = get().accounts.get(accountId)
+      if (!acc?.credentials?.accessToken) {
+        return { applied: false, reason: 'no_credentials' }
+      }
+
+      // 1) 先入池/刷凭据 —— 单账号模式是严格模式,指定的账号不在池会直接 503
+      await window.api.updateProxyPoolMembers({ add: [toProxyAccount(acc)] } as never)
+
+      // 2) 单账号模式的真开关是 config.selectedAccountIds[0](currentIndex 在这条路不被消费)
+      const cfg = (status.config || {}) as { enableMultiAccount?: boolean }
+      const isSingle = cfg.enableMultiAccount === false
+      if (isSingle) {
+        await window.api.proxyUpdateConfig({ selectedAccountIds: [accountId] })
+      }
+
+      // 3) 指针 + 会话粘性失效(多账号轮询下“从此账号开始轮”)
+      await window.api.setActiveProxyAccount(accountId)
+
+      return { applied: true, mode: isSingle ? 'single' : 'multi' }
+    } catch (err) {
+      // 不得抛出:反代同步失败不应阻断已经成功的 IDE/CLI 切换
+      console.warn('[Store] syncActiveAccountToProxy error:', err instanceof Error ? err.message : String(err))
+      return { applied: false, reason: 'error' }
     }
   }
 }))

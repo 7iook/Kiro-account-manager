@@ -3878,6 +3878,29 @@ export class ProxyServer {
     lines.push(`kiro_proxy_tokens_total{type="input"} ${s.inputTokens}`)
     lines.push(`kiro_proxy_tokens_total{type="output"} ${s.outputTokens}`)
     lines.push(`kiro_proxy_tokens_total{type="cache_read"} ${s.cacheReadTokens}`)
+  /**
+   * 失效会话粘性(显式换账号时调用)
+   * 不传 accountId → 清全部;传了 → 只清指向该账号的条目。
+   * 语义:用户显式换账号后,旧会话不得继续粘在旧账号上(否则仍需重启服务才生效)。
+   * 详见 RCA §1.5 假设 D:.archive/2026-07-28/proxy-hot-switch-single-account/
+   * @returns 被清理的条目数
+   */
+  invalidateSessionAffinity(accountId?: string): number {
+    if (!accountId) {
+      const n = this.sessionAffinity.size
+      this.sessionAffinity.clear()
+      return n
+    }
+    let n = 0
+    for (const [key, entry] of this.sessionAffinity) {
+      if (entry.accountId === accountId) {
+        this.sessionAffinity.delete(key)
+        n++
+      }
+    }
+    return n
+  }
+
     lines.push(`kiro_proxy_tokens_total{type="cache_write"} ${s.cacheWriteTokens}`)
     lines.push('# HELP kiro_proxy_credits_total Total credits consumed')
     lines.push('# TYPE kiro_proxy_credits_total counter')

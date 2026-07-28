@@ -158,6 +158,38 @@ export class AccountPool {
 
       // 跳过当前请求已试过的账号
       if (excludeIds?.has(account.id)) continue
+    if (touchesAvailability) {
+      this.notifyIfBecameAvailable(apply)
+    } else {
+      apply()
+    }
+  }
+
+  // 热切换入池:已在池只覆盖凭据类字段,不在池等价 addAccount
+  // 为何不能直接 addAccount:它是重置式——按入参重算 isAvailable(前端 mapper 不带
+  // suspendedAt ⇒ 算出 true)并清零 errorCount/requestCount/统计,于是“切一下账号”会静默
+  // 解除运行期风控封禁,并让 proxy-set-active-account 的 ACCOUNT_NOT_AVAILABLE 守卫失效。
+  // 详见 RCA §4.2b:.archive/2026-07-28/proxy-hot-switch-single-account/
+  // @returns 'added' 新入池 | 'updated' 已在池仅刷新凭据
+  upsertAccount(account: ProxyAccount): 'added' | 'updated' {
+    if (!this.accounts.has(account.id)) {
+      this.addAccount(account)
+      return 'added'
+    }
+    // 剔除运行期状态字段,只把凭据/路由类字段覆盖进去
+    const {
+      isAvailable: _isAvailable,
+      suspendedAt: _suspendedAt,
+      suspendReason: _suspendReason,
+      suspendMessage: _suspendMessage,
+      requestCount: _requestCount,
+      errorCount: _errorCount,
+      lastUsed: _lastUsed,
+      ...mutable
+    } = account
+    this.updateAccount(account.id, mutable)
+    console.log(`[AccountPool] Refreshed credentials for: ${account.email || account.id}`)
+    return 'updated'
 
       // 检查账号是否可用（含断路器状态）
       if (this.isAccountAvailable(account, now)) {
