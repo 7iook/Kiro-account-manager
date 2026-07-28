@@ -249,6 +249,9 @@ export function isBannedAccountError(error?: string): boolean {
 // 自动换号定时器
 let autoSwitchTimer: ReturnType<typeof setInterval> | null = null
 
+// 批量测活中止标志：stopLivenessCheck 置 true，worker 循环检测后停止取新账号
+let livenessAbortFlag = false
+
 // 定时自动保存定时器（防止数据丢失）
 let autoSaveTimer: ReturnType<typeof setInterval> | null = null
 const AUTO_SAVE_INTERVAL = 30 * 1000 // 每 30 秒自动保存一次
@@ -278,6 +281,9 @@ interface AccountsState {
   // 加载状态
   isLoading: boolean
   isSyncing: boolean
+
+  // 批量测活(走反代真实发请求探活/探封禁)进度；null=未运行
+  livenessProgress: { done: number; total: number; ok: number; failed: number } | null
 
   // 自动刷新设置
   autoRefreshEnabled: boolean
@@ -401,6 +407,15 @@ interface AccountsActions {
   batchRefreshTokens: (ids: string[]) => Promise<BatchOperationResult>
   checkAccountStatus: (id: string) => Promise<void>
   batchCheckStatus: (ids: string[]) => Promise<BatchOperationResult>
+  /**
+   * 批量测活：走反代真实发一条轻量对话探活/探封禁（复用诊断页 diagnose:account-liveness 口径）。
+   * 与 batchCheckStatus 区别：后者查管理面接口(GetUsageLimits)，封禁号常仍返回成功而漏判；
+   * 本方法走真实对话路径，能抓到"额度还在但实际已封"的号。结果按封禁/掉线精确回写 lastError，
+   * 主界面卡片据 isBannedAccountError 渲染"已封禁"。可通过 stopLivenessCheck 中止。
+   */
+  batchLivenessCheck: (ids: string[]) => Promise<BatchOperationResult>
+  /** 中止进行中的批量测活 */
+  stopLivenessCheck: () => void
 
   // 统计
   getStats: () => AccountStats
@@ -643,6 +658,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   selectedIds: new Set(),
   isLoading: false,
   isSyncing: false,
+  livenessProgress: null,
   autoRefreshEnabled: true,
   autoRefreshInterval: 5,
   autoRefreshConcurrency: 100,
@@ -1523,7 +1539,13 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   batchRefreshTokens: async (ids) => {
     const { accounts, autoRefreshConcurrency } = get()
-    
+
+    // 网页 API Key(ksk_)账号：静态长凭证无 refreshToken，不能走 token 刷新，
+    // 但可委托 checkAccountStatus 拉最新额度/订阅（与单账号 refreshAccountToken 行为一致）。
+    // 若不单独处理，下面 `!refreshToken → continue` 会把它们静默跳过，
+    // 导致「分组里全是/多为 API Key 账号时，点批量刷新毫无反应」。
+    const apiKeyIds: string[] = []
+
     // 收集需要刷新的账号
     const accountsToRefresh: Array<{
       id: string
@@ -1546,7 +1568,15 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     for (const id of ids) {
       const account = accounts.get(id)
-      if (!account?.credentials.refreshToken) continue
+      if (!account) continue
+
+      // API Key(ksk_)账号：无 token 刷新概念，改走 checkAccountStatus 刷新额度
+      if (account.credentials.authMethod === 'api_key' || account.credentials.provider === 'ApiKey') {
+        apiKeyIds.push(id)
+        continue
+      }
+
+      if (!account.credentials.refreshToken) continue
       
       accountsToRefresh.push({
         id,
@@ -1569,19 +1599,51 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       })
     }
 
-    if (accountsToRefresh.length === 0) {
+    // API Key 账号并发刷新额度（走 checkAccountStatus）；与 token 刷新并行
+    const apiKeyConcurrency = Math.max(1, Math.min(autoRefreshConcurrency || 3, 5))
+    const runApiKeyRefresh = async (): Promise<{ ok: number; fail: number }> => {
+      let ok = 0
+      let fail = 0
+      const queue = [...apiKeyIds]
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          const id = queue.shift()
+          if (!id) break
+          try {
+            await get().checkAccountStatus(id)
+            ok++
+          } catch {
+            fail++
+          }
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(apiKeyConcurrency, apiKeyIds.length) }, () => worker())
+      )
+      return { ok, fail }
+    }
+
+    // 两类账号都没有 → 直接返回
+    if (accountsToRefresh.length === 0 && apiKeyIds.length === 0) {
       return { success: 0, failed: 0, errors: [] }
     }
 
-    console.log(`[BatchRefresh] Triggering background refresh for ${accountsToRefresh.length} accounts...`)
-    
-    // 使用后台刷新 API（不阻塞 UI）
-    const result = await window.api.backgroundBatchRefresh(accountsToRefresh, autoRefreshConcurrency)
-    
-    return { 
-      success: result.successCount, 
-      failed: result.failedCount, 
-      errors: [] 
+    console.log(
+      `[BatchRefresh] Triggering refresh: ${accountsToRefresh.length} token accounts + ${apiKeyIds.length} API Key accounts...`
+    )
+
+    // 后台 token 刷新 与 API Key 额度刷新 并行执行
+    const [tokenResult, apiKeyResult] = await Promise.all([
+      accountsToRefresh.length > 0
+        ? window.api.backgroundBatchRefresh(accountsToRefresh, autoRefreshConcurrency)
+        : Promise.resolve({ successCount: 0, failedCount: 0 }),
+      apiKeyIds.length > 0 ? runApiKeyRefresh() : Promise.resolve({ ok: 0, fail: 0 })
+    ])
+
+    return {
+      success: tokenResult.successCount + apiKeyResult.ok,
+      failed: tokenResult.failedCount + apiKeyResult.fail,
+      errors: []
     }
   },
 
@@ -1755,6 +1817,103 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       failed: result.failedCount, 
       errors: [] 
     }
+  },
+
+  stopLivenessCheck: () => {
+    livenessAbortFlag = true
+    set({ livenessProgress: null })
+  },
+
+  batchLivenessCheck: async (ids) => {
+    const { accounts, autoRefreshConcurrency, getAccountProxyUrl, updateAccountStatus } = get()
+
+    // 收集可测活的账号（必须有 accessToken）
+    const targets = ids
+      .map((id) => accounts.get(id))
+      .filter((a): a is Account => !!a?.credentials.accessToken)
+
+    if (targets.length === 0) {
+      return { success: 0, failed: 0, errors: [] }
+    }
+
+    // 测活模型：沿用诊断页持久化的选择，回退 claude-sonnet-4.5
+    let model = 'claude-sonnet-4.5'
+    try {
+      const saved = localStorage.getItem('kiro-liveness-model')
+      if (saved && saved.trim()) model = saved.trim()
+    } catch { /* ignore */ }
+
+    livenessAbortFlag = false
+    // 并发上限：测活走真实请求消耗额度，控制在较低并发（复用配置，封顶 5）
+    const concurrency = Math.max(1, Math.min(autoRefreshConcurrency || 3, 5))
+
+    const errors: { id: string; error: string }[] = []
+    let ok = 0
+    let failed = 0
+    let done = 0
+    set({ livenessProgress: { done: 0, total: targets.length, ok: 0, failed: 0 } })
+
+    const queue = [...targets]
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        if (livenessAbortFlag) break
+        const acc = queue.shift()
+        if (!acc) break
+
+        try {
+          const cred = acc.credentials
+          const res = await window.api.diagnoseAccountLiveness({
+            account: {
+              id: acc.id,
+              email: acc.email,
+              accessToken: cred.accessToken,
+              refreshToken: cred.refreshToken,
+              clientId: cred.clientId,
+              clientSecret: cred.clientSecret,
+              region: cred.region,
+              authMethod: cred.authMethod,
+              provider: cred.provider,
+              profileArn: acc.profileArn,
+              machineId: acc.machineId,
+              expiresAt: cred.expiresAt,
+              proxyUrl: getAccountProxyUrl(acc.id)
+            },
+            model
+          })
+
+          if (livenessAbortFlag) break
+
+          if (res.success) {
+            // 真实可用：置 active + 清除历史 lastError（顺带解除误标的封禁/错误）
+            updateAccountStatus(acc.id, 'active', undefined)
+            ok++
+          } else {
+            const errMsg = res.error || '测活失败'
+            // 精确区分封禁 vs 掉线：isBannedAccountError 命中才算封禁，
+            // 原始错误文案(含 423/AccountSuspended/TEMPORARILY_SUSPENDED)原样写入 lastError，
+            // 让主界面卡片的 isUnauthorized 匹配并渲染"已封禁"。
+            updateAccountStatus(acc.id, 'error', errMsg)
+            errors.push({ id: acc.id, error: errMsg })
+            failed++
+          }
+        } catch (err) {
+          if (livenessAbortFlag) break
+          const errMsg = err instanceof Error ? err.message : String(err)
+          updateAccountStatus(acc.id, 'error', errMsg)
+          errors.push({ id: acc.id, error: errMsg })
+          failed++
+        } finally {
+          done++
+          set({ livenessProgress: { done, total: targets.length, ok, failed } })
+        }
+      }
+    }
+
+    const workers = Array.from({ length: Math.min(concurrency, targets.length) }, () => worker())
+    await Promise.all(workers)
+
+    set({ livenessProgress: null })
+    return { success: ok, failed, errors }
   },
 
   // ==================== 统计 ====================

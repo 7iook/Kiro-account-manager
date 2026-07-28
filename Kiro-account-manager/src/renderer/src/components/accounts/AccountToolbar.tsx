@@ -31,7 +31,8 @@ import {
   ArrowRightLeft,
   Zap,
   Activity,
-  KeyRound
+  KeyRound,
+  ShieldCheck
 } from 'lucide-react'
 
 export type AccountViewMode = 'grid' | 'list'
@@ -68,6 +69,9 @@ export function AccountToolbar({
     removeAccounts,
     batchRefreshTokens,
     batchCheckStatus,
+    batchLivenessCheck,
+    stopLivenessCheck,
+    livenessProgress,
     getFilteredAccounts,
     getStats,
     privacyMode,
@@ -288,6 +292,25 @@ export function AccountToolbar({
     window.dispatchEvent(new CustomEvent('navigate-page', { detail: 'diagnose' }))
   }
 
+  // 一键检测全部：对当前筛选/分组可见的账号走反代真实测活，探活+探封禁并把状态回写主界面。
+  // 与"检查账户信息"(batchCheckStatus 查管理面额度接口)不同：真实对话路径能抓到"额度还在但已封"的号。
+  const isLivenessRunning = livenessProgress !== null
+  const handleBatchLivenessAll = async (): Promise<void> => {
+    if (isLivenessRunning) {
+      stopLivenessCheck()
+      return
+    }
+    const visibleAccounts = getFilteredAccounts()
+    if (visibleAccounts.length === 0) return
+    const ok = confirm(
+      isEn
+        ? `Run a real liveness test on ${visibleAccounts.length} visible accounts? Each account will send one lightweight request via the reverse proxy (consumes a tiny amount of credits) to detect ban / dead status.`
+        : `对当前可见的 ${visibleAccounts.length} 个账号执行真实测活？每个账号会走反代发一条轻量请求（消耗极少额度），用于检测封禁/掉线，结果直接刷新到列表。`
+    )
+    if (!ok) return
+    await batchLivenessCheck(visibleAccounts.map((a) => a.id))
+  }
+
   const handleBatchDelete = (): void => {
     if (selectedCount === 0) return
     if (confirm(isEn ? `Delete ${selectedCount} selected accounts?` : `确定要删除选中的 ${selectedCount} 个账号吗？`)) {
@@ -359,6 +382,30 @@ export function AccountToolbar({
           <Button variant="outline" onClick={onExport}>
             <Download className="h-4 w-4 mr-1" />
             {isEn ? 'Export' : '导出'}
+          </Button>
+          {/* 一键检测全部：走反代真实测活当前可见账号，探封禁/掉线并刷新主界面状态 */}
+          <Button
+            variant={isLivenessRunning ? 'destructive' : 'outline'}
+            onClick={handleBatchLivenessAll}
+            className={cn(!isLivenessRunning && 'text-emerald-600 hover:text-emerald-600 border-emerald-500/40 hover:bg-emerald-500/10')}
+            title={isEn
+              ? 'Real liveness test on all visible accounts (detect banned / dead, refresh status)'
+              : '对当前可见账号真实测活（检测封禁/掉线并刷新状态）'
+            }
+          >
+            {isLivenessRunning ? (
+              <>
+                <Square className="h-4 w-4 mr-1" />
+                {isEn
+                  ? `Stop (${livenessProgress!.done}/${livenessProgress!.total})`
+                  : `停止 (${livenessProgress!.done}/${livenessProgress!.total})`}
+              </>
+            ) : (
+              <>
+                <ShieldCheck className="h-4 w-4 mr-1" />
+                {isEn ? 'Check All' : '一键检测全部'}
+              </>
+            )}
           </Button>
         </div>
       </div>
