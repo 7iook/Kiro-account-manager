@@ -2604,7 +2604,23 @@ export class ProxyServer {
                 resolve()
                 return
               }
-              const finalChunk = { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: usage.inputTokens, candidatesTokenCount: usage.outputTokens, totalTokenCount: usage.inputTokens + usage.outputTokens } }
+              // 上游异常终止 → 不发 finishReason:'STOP'(伪装正常收尾),改发 error 让客户端明确失败。
+              // 见 /v1/messages 处同款注释(2026-08-01 RCA CONTENT_FILTERED 静默断流)。
+              if (usage.terminal?.shouldFail) {
+                const reason = usage.terminal.upstreamStopReason || usage.terminal.disposition
+                proxyLogger.warn('ProxyServer', `Gemini stream: upstream abnormal terminal → error`, {
+                  model: modelId, disposition: usage.terminal.disposition, upstreamStopReason: usage.terminal.upstreamStopReason
+                })
+                res.write(`data: ${JSON.stringify({ error: { message: usage.terminal.disposition === 'filtered' ? `上游内容过滤器截断了本次响应 (stopReason: ${reason})。这一轮输出不完整,请重试或调整措辞。` : `上游异常终止,响应不完整 (stopReason: ${reason})。请重试。`, code: `upstream_${usage.terminal.disposition}` } })}\n\n`)
+                res.end()
+                this.recordRequestFailed()
+                this.events.onResponse?.({ path: '/v1beta/models', model: modelId, status: 502, error: `upstream_${usage.terminal.disposition}: ${reason}` })
+                resolve()
+                return
+              }
+              // 上游命中输出上限 → Gemini 语义用 MAX_TOKENS,不伪装 STOP
+              const gFinish = usage.terminal?.disposition === 'length' ? 'MAX_TOKENS' : 'STOP'
+              const finalChunk = { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: gFinish }], usageMetadata: { promptTokenCount: usage.inputTokens, candidatesTokenCount: usage.outputTokens, totalTokenCount: usage.inputTokens + usage.outputTokens } }
               res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
               res.end()
               this.recordRequestSuccess()
@@ -3224,9 +3240,30 @@ export class ProxyServer {
             this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions')
           }
 
+          // 上游异常终止 → 发 SSE error 让客户端明确失败(同 Claude 路径,见 /v1/messages 处注释)。
+          // OpenAI 协议:错误以 data 里带 error 字段表达,随后照常 [DONE] 收尾。
+          if (usage.terminal?.shouldFail) {
+            const reason = usage.terminal.upstreamStopReason || usage.terminal.disposition
+            const humanMsg = usage.terminal.disposition === 'filtered'
+              ? `上游内容过滤器截断了本次响应 (stopReason: ${reason})。这一轮输出不完整,请重试或调整措辞。`
+              : `上游异常终止,响应不完整 (stopReason: ${reason})。请重试。`
+            proxyLogger.warn('ProxyServer', `OpenAI stream: upstream abnormal terminal → SSE error`, {
+              path: '/v1/chat/completions', model, disposition: usage.terminal.disposition,
+              upstreamStopReason: usage.terminal.upstreamStopReason
+            })
+            res.write(`data: ${JSON.stringify({ error: { message: humanMsg, type: 'upstream_error', code: `upstream_${usage.terminal.disposition}` } })}\n\n`)
+            res.write('data: [DONE]\n\n')
+            res.end()
+            this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 502, error: `upstream_${usage.terminal.disposition}: ${reason}` })
+            resolve()
+            return
+          }
           // 发送结束 chunk（包含完整 usage 信息）
           const hasToolCalls = pendingToolCalls.size > 0
-          const finishReason = hasToolCalls ? 'tool_calls' : 'stop'
+          // 上游 length(命中输出上限)如实映射为 OpenAI 'length',不伪装成 'stop'
+          const finishReason = usage.terminal?.disposition === 'length'
+            ? 'length'
+            : hasToolCalls ? 'tool_calls' : 'stop'
           const usageInfo: {
             prompt_tokens: number
             completion_tokens: number
@@ -3500,7 +3537,20 @@ export class ProxyServer {
           },
           (usage) => {
             if (signal?.aborted || this.isResponseClosed(res)) { if (!settled) { settled = true; resolveAttempt('done') } ; return }
-            const finalChunk = { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: usage.inputTokens, candidatesTokenCount: usage.outputTokens, totalTokenCount: usage.inputTokens + usage.outputTokens } }
+            // 上游异常终止 → 不伪装 STOP(同上,HoldGate 变体路径)
+            if (usage.terminal?.shouldFail) {
+              const reason = usage.terminal.upstreamStopReason || usage.terminal.disposition
+              proxyLogger.warn('ProxyServer', `Gemini stream (hold path): upstream abnormal terminal → error`, {
+                model, disposition: usage.terminal.disposition, upstreamStopReason: usage.terminal.upstreamStopReason
+              })
+              res.write(`data: ${JSON.stringify({ error: { message: usage.terminal.disposition === 'filtered' ? `上游内容过滤器截断了本次响应 (stopReason: ${reason})。这一轮输出不完整,请重试或调整措辞。` : `上游异常终止,响应不完整 (stopReason: ${reason})。请重试。`, code: `upstream_${usage.terminal.disposition}` } })}\n\n`)
+              res.end()
+              this.recordRequestFailed()
+              if (!settled) { settled = true; resolveAttempt('done') }
+              return
+            }
+            const gFinish2 = usage.terminal?.disposition === 'length' ? 'MAX_TOKENS' : 'STOP'
+            const finalChunk = { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: gFinish2 }], usageMetadata: { promptTokenCount: usage.inputTokens, candidatesTokenCount: usage.outputTokens, totalTokenCount: usage.inputTokens + usage.outputTokens } }
             res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
             res.end()
             this.recordRequestSuccess()
@@ -4271,9 +4321,36 @@ export class ProxyServer {
           if (simulatedCacheUsage?.cacheProfile && simulatedCacheUsage?.accountId) {
             promptCacheTracker.update(simulatedCacheUsage.accountId, simulatedCacheUsage.cacheProfile as any)
           }
+          // 上游异常终止(CONTENT_FILTERED 等)→ 发 SSE error 让客户端明确失败,不伪装成 end_turn。
+          // 2026-08-01 RCA:此前一律按 hasToolCalls 本地推断 stop_reason,被内容过滤掐断的半截响应
+          // 也被翻译成 end_turn("模型自然说完")→ 客户端不报错不重试,静默停止 = 用户看到的"跑一半自己断"。
+          // 注意:此时正文已经吐了一部分(content_block 已 stop),这里补一个 error 事件让客户端知道
+          // 这轮不完整 —— 比静默假装完成诚实。
+          if (usage.terminal?.shouldFail) {
+            const reason = usage.terminal.upstreamStopReason || usage.terminal.disposition
+            const humanMsg = usage.terminal.disposition === 'filtered'
+              ? `上游内容过滤器截断了本次响应 (stopReason: ${reason})。这一轮输出不完整,请重试或调整措辞。`
+              : `上游异常终止,响应不完整 (stopReason: ${reason})。请重试。`
+            proxyLogger.warn('ProxyServer', `Claude stream: upstream abnormal terminal → SSE error`, {
+              path: '/v1/messages', model, disposition: usage.terminal.disposition,
+              upstreamStopReason: usage.terminal.upstreamStopReason,
+              account: (account as { email?: string }).email || account.id?.slice(0, 8) || '?'
+            })
+            const errEvent = createClaudeStreamEvent('error', {
+              error: { type: 'api_error', message: humanMsg }
+            })
+            res.write(`event: error\ndata: ${JSON.stringify(errEvent)}\n\n`)
+            res.end()
+            this.events.onResponse?.({ path: '/v1/messages', model, status: 502, error: `upstream_${usage.terminal.disposition}: ${reason}` })
+            resolve()
+            return
+          }
           // 发送 message_delta（包含完整 usage 信息）
           const hasToolCalls = pendingToolCalls.size > 0
-          const stopReason = hasToolCalls ? 'tool_use' : 'end_turn'
+          // 上游真实 stopReason 优先(length = 命中输出上限,需如实告知客户端);无则回退本地推断
+          const stopReason = usage.terminal?.disposition === 'length'
+            ? 'max_tokens'
+            : hasToolCalls ? 'tool_use' : 'end_turn'
           const messageDelta = createClaudeStreamEvent('message_delta', {
             delta: { stop_reason: stopReason, stop_sequence: null } as any,
             usage: this.buildClaudeUsage(usage, simulatedCacheUsage)

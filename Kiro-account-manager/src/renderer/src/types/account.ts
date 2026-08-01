@@ -23,6 +23,11 @@ export interface AccountCredentials {
   authMethod?: 'IdC' | 'social' | 'external_idp' | 'api_key'  // 认证方式：IdC / social / external_idp (Azure AD) / api_key (网页 ksk_ 静态密钥)
   provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO' | 'AzureAD' | 'ExternalIdp' | 'ApiKey'  // 身份提供商
   profileArn?: string    // Enterprise/external_idp 真实 profileArn（从 ListAvailableProfiles 获取或导入文件自带）
+  // 凭据去重指纹(sha256(accessToken).slice(0,16)) —— 主要用于 API Key(ksk_)防止重复导入
+  //   RCA §6 A6-R2 语义降级 · 仅作凭据去重键 · 不承担账号身份真源
+  //   密钥轮换 ⇒ 新指纹 ⇒ 新账号入池(与用户预期一致)
+  //   老账号(无此字段的历史 ApiKey 账号)首次访问时按需补齐,不改身份
+  tokenFingerprint?: string
   // ===== external_idp (微软 Azure AD 等外部 IdP) 专用字段 =====
   tokenEndpoint?: string // 微软 OAuth2 token 端点（external_idp 刷新走这里，不走 AWS OIDC）
   issuerUrl?: string     // IdP issuer URL

@@ -386,6 +386,23 @@ function resolveProfileArn(account: ProxyAccount): string | undefined {
 // 兼容 SDK 部分调用仍想知道社交 ARN 的场景（极少；保留 export 不破坏外部 import）
 export { KIRO_SOCIAL_PROFILE_ARN }
 
+// ============================================================================
+// 网页 API Key(ksk_)凭据校验契约(RCA §2 责任分离)
+// ----------------------------------------------------------------------------
+// - 官方证据(github.com/aws/amazon-q-developer-cli#3805):
+//     STANDALONE 订阅类型的 ksk_ 调 GetProfile 一律返 AccessDenied,
+//     kiro-cli 输出 "This command is only available for IAM Identity Center or External IdP users"。
+//     反向条款:IdC/External IdP 类的 ksk_ 才能 GetProfile 200 拿真 arn。
+// - 因此 profileArn 对 ksk 是**可选元数据**,不是必需凭据。
+//   凭据有效性判定走 GetUsageLimits(REST · 200 = VALID);GetProfile 只作元数据附赠。
+// - 状态机决策表见 validateApiKeyCredential 内部注释。
+// ============================================================================
+
+// 状态机 / 探测结果类型的 SSOT 在 @shared/types/credential.ts,此处只 import 使用
+import type { CredentialProbeResult, SubscriptionSummary } from '../../shared/types/credential'
+import { sha256Fingerprint } from '../utils/tokenFingerprint'
+export type { CredentialProbeResult, SubscriptionSummary } from '../../shared/types/credential'
+
 /** 网页 API Key(ksk_)GetProfile 解析结果 */
 export interface ApiKeyProfile {
   profileArn: string
@@ -395,22 +412,28 @@ export interface ApiKeyProfile {
 }
 
 /**
- * 用网页 API Key(ksk_)调 GetProfile 解析其绑定的 profileArn。
- * 精确 wire 格式（2026-07 抓 kiro-cli headless 实测，200 验证通过）：
+ * 用网页 API Key(ksk_)调 GetProfile 尝试解析其绑定的 profileArn。
+ *
+ * 【重要契约变更(RCA §2 责任拆分)】
+ *   本函数现降级为**纯可选元数据解析器**:
+ *   - 拿不到 profileArn → 返回 undefined(不 throw · 400 AccessDenied 是 STANDALONE 的既定 feature gate)
+ *   - 拿到 → 返回 ApiKeyProfile
+ *   凭据有效性判定不再依赖本函数;请调用 validateApiKeyCredential。
+ *
+ * 精确 wire 格式(2026-07 抓 kiro-cli headless 实测,200 验证通过):
  *   POST https://management.{region}.kiro.dev/   (aws-json RPC 根路径)
  *   Headers: Content-Type: application/x-amz-json-1.0
  *            X-Amz-Target: AmazonCodeWhispererService.GetProfile
- *            TokenType: API_KEY   （关键！区别于 SSO_OIDC，服务据此做 key→profile 查找）
+ *            TokenType: API_KEY   (关键!区别于 SSO_OIDC,服务据此做 key→profile 查找)
  *            Authorization: Bearer ksk_...
  *            x-amzn-codewhisperer-optout: false
  *   Body: {}
  *   Resp: { "profile": { "arn": "arn:aws:codewhisperer:...:profile/xxx", "profileName", "status", "profileType" } }
- * ksk 无 refreshToken/expiry，profileArn 在导入时解析一次并持久化到账户，运行时不再重取。
  */
 export async function resolveApiKeyProfileArn(
   apiKey: string,
   region = 'us-east-1'
-): Promise<ApiKeyProfile> {
+): Promise<ApiKeyProfile | undefined> {
   const account: ProxyAccount = {
     id: 'apikey-probe',
     accessToken: apiKey,
@@ -430,28 +453,266 @@ export async function resolveApiKeyProfileArn(
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=1'
   }
-  const response = await fetchWithProxy(url, { method: 'POST', headers, body: '{}' }, account)
-  const text = await response.text().catch(() => '')
-  if (!response.ok) {
-    throw new Error(`GetProfile 失败: HTTP ${response.status} ${text.slice(0, 300)}`)
-  }
-  let data: { profile?: { arn?: string; profileName?: string; status?: string; profileType?: string } }
   try {
-    data = JSON.parse(text)
-  } catch {
-    throw new Error(`GetProfile 返回非 JSON: ${text.slice(0, 200)}`)
-  }
-  const arn = data.profile?.arn
-  if (!arn) {
-    throw new Error(`GetProfile 响应缺少 profile.arn: ${text.slice(0, 200)}`)
-  }
-  return {
-    profileArn: arn,
-    profileName: data.profile?.profileName,
-    status: data.profile?.status,
-    profileType: data.profile?.profileType
+    const response = await fetchWithProxy(url, { method: 'POST', headers, body: '{}' }, account)
+    const text = await response.text().catch(() => '')
+    if (!response.ok) {
+      // 400 AccessDenied 是 STANDALONE 类 ksk 的既定 feature gate;其他 HTTP 错误也一律降级
+      proxyLogger.debug('KiroAPI', `resolveApiKeyProfileArn: HTTP ${response.status} ${text.slice(0, 200)} (returning undefined · profileArn is optional metadata)`)
+      return undefined
+    }
+    let data: { profile?: { arn?: string; profileName?: string; status?: string; profileType?: string } }
+    try {
+      data = JSON.parse(text)
+    } catch {
+      proxyLogger.debug('KiroAPI', `resolveApiKeyProfileArn: non-JSON response ${text.slice(0, 200)} (returning undefined)`)
+      return undefined
+    }
+    const arn = data.profile?.arn
+    if (!arn) {
+      proxyLogger.debug('KiroAPI', `resolveApiKeyProfileArn: missing profile.arn (returning undefined)`)
+      return undefined
+    }
+    return {
+      profileArn: arn,
+      profileName: data.profile?.profileName,
+      status: data.profile?.status,
+      profileType: data.profile?.profileType
+    }
+  } catch (e) {
+    // 网络错误等:同样降级为 undefined,不 throw
+    proxyLogger.debug('KiroAPI', `resolveApiKeyProfileArn network error: ${e instanceof Error ? e.message : String(e)} (returning undefined)`)
+    return undefined
   }
 }
+
+/**
+ * 已知的 STANDALONE 订阅类型集合(GetProfile 会 400 AccessDenied · Step 2 跳过)。
+ * type 值来自 GetUsageLimits 响应的 subscriptionInfo.type,大小写敏感匹配 STANDALONE 关键字即可。
+ * 官方证据:kiro.dev/docs 与 aws/amazon-q-developer-cli#3805。
+ */
+function isKnownStandaloneSubscriptionType(type: string | undefined): boolean {
+  if (!type) return false
+  // 匹配任意含 STANDALONE 字段的 subscription type(Q_DEVELOPER_STANDALONE_POWER / _PRO / _FREE 等)
+  return /STANDALONE/i.test(type)
+}
+
+/**
+ * 验证网页 API Key(ksk_)的凭据有效性(RCA §2 责任拆分)。
+ *
+ * 只跑一次 GetUsageLimits(management.{region}.kiro.dev/getUsageLimits),按下方
+ * 互斥决策表(11 行)从上到下顺序判定,命中即出结果。
+ * 【一次响应 → 一个 state】不做跨请求投票 / fallback 链。
+ *
+ * 决策表(SSOT):
+ *   1. 网络错误 / 超时 / DNS 失败              → INDETERMINATE
+ *   2. HTTP 5xx                                   → INDETERMINATE
+ *   3. HTTP 429                                   → INDETERMINATE
+ *   4. HTTP 423                                   → SUSPENDED
+ *   5. HTTP 200 + body 含 SUSPENDED 结构字段    → SUSPENDED
+ *   6. HTTP 4xx + body 含 SUSPENDED 结构字段    → SUSPENDED
+ *   7. HTTP 401                                   → INVALID
+ *   8. HTTP 403 + body __type 明确 InvalidToken/Unauthorized → INVALID
+ *   8b. HTTP 403 + 裸 AccessDeniedException       → INDETERMINATE (feature gate 未知)
+ *   9. HTTP 200 + body 含 subscriptionInfo.type   → VALID
+ *   10. 其他 HTTP 200(结构不完整)                → INDETERMINATE
+ *   11. 其他 HTTP 4xx(未知拒绝语义)              → INDETERMINATE
+ *
+ * SUSPENDED 优先级高于 VALID(行 5 先命中,不进入行 9)。
+ * 5xx/429 一律归 INDETERMINATE(不解析 body,避免错误日志混入 SUSPENDED 字样)。
+ */
+export async function validateApiKeyCredential(
+  apiKey: string,
+  region = 'us-east-1'
+): Promise<CredentialProbeResult> {
+  const account: ProxyAccount = {
+    id: 'apikey-probe',
+    accessToken: apiKey,
+    authMethod: 'api_key',
+    provider: 'ApiKey',
+    region
+  }
+  // GetUsageLimits REST:探测阶段没有 profileArn,不传该参数(后端对 API_KEY 允许)
+  const params = new URLSearchParams({
+    origin: 'AI_EDITOR',
+    resourceType: 'AGENTIC_REQUEST',
+    isEmailRequired: 'true'
+  })
+  const url = `${getKiroManagementHost(region)}/getUsageLimits?${params.toString()}`
+  const headers: Record<string, string> = {
+    'Accept': 'application/json',
+    'Authorization': `Bearer ${apiKey}`,
+    'TokenType': TOKEN_TYPE_API_KEY,
+    'User-Agent': getKiroUserAgent(),
+    'x-amz-user-agent': getKiroAmzUserAgent()
+  }
+
+  // === Row 1: 网络错误 / 超时 / DNS 失败 → INDETERMINATE ===
+  let response: Response
+  try {
+    response = await fetchWithProxy(url, { method: 'GET', headers }, account)
+  } catch (e) {
+    return {
+      state: 'INDETERMINATE',
+      reason: `Network error: ${e instanceof Error ? e.message : String(e)}`
+    }
+  }
+  const httpStatus = response.status
+  const text = await response.text().catch(() => '')
+
+  // === Row 2 & 3: 5xx / 429 → INDETERMINATE(不解析 body) ===
+  if (httpStatus >= 500 && httpStatus <= 599) {
+    return { state: 'INDETERMINATE', httpStatus, reason: `HTTP ${httpStatus} server error` }
+  }
+  if (httpStatus === 429) {
+    return { state: 'INDETERMINATE', httpStatus, reason: 'HTTP 429 rate limited' }
+  }
+
+  // === Row 4: 423 Locked → SUSPENDED ===
+  if (httpStatus === 423) {
+    return { state: 'SUSPENDED', httpStatus, reason: 'HTTP 423 Locked · account suspended by Kiro' }
+  }
+
+  // 解析 body(供 Row 5-11 使用 · 失败时 body = 空对象)
+  let body: {
+    __type?: string
+    message?: string
+    subscriptionInfo?: {
+      type?: string
+      subscriptionTitle?: string
+      status?: string
+      subscriptionManagementTarget?: string
+    }
+    usageBreakdownList?: Array<{
+      resourceType?: string
+      currentUsage?: number
+      usageLimit?: number
+    }>
+  } = {}
+  try {
+    body = text ? JSON.parse(text) : {}
+  } catch {
+    body = {}
+  }
+
+  const bodyType = typeof body.__type === 'string' ? body.__type : ''
+  const bodyMessage = typeof body.message === 'string' ? body.message : ''
+  const subscriptionStatusIsSuspended =
+    typeof body.subscriptionInfo?.status === 'string' &&
+    /SUSPENDED/i.test(body.subscriptionInfo.status)
+  const hasSuspendedStructuralField =
+    /TEMPORARILY_SUSPENDED|AccountSuspended/i.test(bodyType) ||
+    subscriptionStatusIsSuspended
+
+  // === Row 5: HTTP 200 + body 含 SUSPENDED 结构字段 → SUSPENDED ===
+  if (httpStatus === 200 && hasSuspendedStructuralField) {
+    return {
+      state: 'SUSPENDED',
+      httpStatus,
+      reason: 'Subscription/account suspended (200 response body)'
+    }
+  }
+
+  // === Row 6: HTTP 4xx + body 含 SUSPENDED 结构字段 → SUSPENDED ===
+  if (httpStatus >= 400 && httpStatus < 500 && hasSuspendedStructuralField) {
+    return {
+      state: 'SUSPENDED',
+      httpStatus,
+      reason: `Account suspended (HTTP ${httpStatus})`
+    }
+  }
+
+  // === Row 7: HTTP 401 → INVALID ===
+  if (httpStatus === 401) {
+    return {
+      state: 'INVALID',
+      httpStatus,
+      reason: 'HTTP 401 · authentication failed · invalid or revoked API key'
+    }
+  }
+
+  // === Row 8 / 8b: HTTP 403 ===
+  if (httpStatus === 403) {
+    const isExplicitInvalidToken =
+      /InvalidTokenException|UnauthorizedException/i.test(bodyType) ||
+      /Invalid token/i.test(bodyMessage)
+    if (isExplicitInvalidToken) {
+      return {
+        state: 'INVALID',
+        httpStatus,
+        reason: 'HTTP 403 · invalid token'
+      }
+    }
+    // Row 8b: 裸 AccessDeniedException / 未知 403 → INDETERMINATE(可能是 feature gate)
+    return {
+      state: 'INDETERMINATE',
+      httpStatus,
+      reason: 'HTTP 403 · unclear whether feature-gated or invalid, retry recommended'
+    }
+  }
+
+  // === Row 9: HTTP 200 + body 含 subscriptionInfo.type → VALID ===
+  if (httpStatus === 200 && body.subscriptionInfo?.type) {
+    const subscription: SubscriptionSummary = {
+      type: body.subscriptionInfo.type,
+      title: body.subscriptionInfo.subscriptionTitle,
+      status: body.subscriptionInfo.status,
+      managementTarget: body.subscriptionInfo.subscriptionManagementTarget
+    }
+    // usageBreakdownList 中提取 AGENTIC_REQUEST 的 usage/limit(如有)
+    const agentic = body.usageBreakdownList?.find(
+      it => typeof it?.resourceType === 'string' && it.resourceType === 'AGENTIC_REQUEST'
+    )
+    if (agentic) {
+      subscription.currentUsage = agentic.currentUsage
+      subscription.usageLimit = agentic.usageLimit
+    }
+    return {
+      state: 'VALID',
+      httpStatus,
+      subscription,
+      // VALID 态立即在 main 内算 fingerprint(IPC 层直接透传给 renderer,renderer 不重算)
+      tokenFingerprint: sha256Fingerprint(apiKey)
+    }
+  }
+
+  // === Row 10: 其他 HTTP 200 (结构不完整) → INDETERMINATE ===
+  if (httpStatus === 200) {
+    return {
+      state: 'INDETERMINATE',
+      httpStatus,
+      reason: 'HTTP 200 but response lacks subscriptionInfo.type (cannot confirm active subscription)'
+    }
+  }
+
+  // === Row 11: 其他 HTTP 4xx(未知拒绝语义) → INDETERMINATE ===
+  return {
+    state: 'INDETERMINATE',
+    httpStatus,
+    reason: `HTTP ${httpStatus} · unknown rejection semantics`
+  }
+}
+
+/**
+ * Step 2 元数据附赠:仅对可能有 profile 的订阅类型调 GetProfile(RCA §6 A6-R4)。
+ * - STANDALONE 类 → 直接跳过(GetProfile 一定 400 AccessDenied · 减少无意义请求)
+ * - 未知 / IdC-managed 类 → 调 GetProfile · 拿不到 undefined(不改变 state)
+ */
+export async function resolveApiKeyProfileArnIfEligible(
+  apiKey: string,
+  region: string,
+  subscriptionType: string | undefined
+): Promise<ApiKeyProfile | undefined> {
+  if (isKnownStandaloneSubscriptionType(subscriptionType)) {
+    proxyLogger.debug(
+      'KiroAPI',
+      `Skipping GetProfile for known STANDALONE subscription type: ${subscriptionType}`
+    )
+    return undefined
+  }
+  return resolveApiKeyProfileArn(apiKey, region)
+}
+
 
 // Agentic 模式系统提示 - 防止大文件写入超时
 const AGENTIC_SYSTEM_PROMPT = `# CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)
@@ -1953,6 +2214,59 @@ export function getEstimateTokensCacheSize(): number {
   return tokenCountCache.size
 }
 
+/**
+ * 把上游 Kiro stopReason 归一化并分类成终止语义(2026-08-01)。
+ *
+ * 为什么必须有这一层:上游 stopReason 是**唯一**能区分「模型说完了」和「模型被掐断了」的信号。
+ * 实测日志分布 END_TURN:155 / TOOL_USE:367 / CONTENT_FILTERED:4 —— 那 4 次内容过滤截断,
+ * 此前被一律翻译成 Anthropic `end_turn`(语义 = 自然收尾)→ 客户端判定本轮正常完成 → 静默停止,
+ * 表现为用户看到的"跑到一半自己断了"。
+ *
+ * 判据参考 F:\9router\open-sse\executors\kiro.js 的 stopDisposition(生产验证过的六态分类),
+ * 此处收敛到本项目实际需要的五态,不引入用不上的分支。
+ */
+export function classifyKiroStopReason(
+  rawStopReason: string | undefined,
+  hasToolCalls: boolean
+): NonNullable<KiroUsage['terminal']> {
+  // 归一化:上游给大写下划线(CONTENT_FILTERED),也兼容驼峰/连字符写法
+  const norm = String(rawStopReason || '')
+    .trim()
+    .replace(/([a-z])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+
+  const mk = (
+    disposition: NonNullable<KiroUsage['terminal']>['disposition'],
+    shouldFail: boolean
+  ): NonNullable<KiroUsage['terminal']> => ({
+    upstreamStopReason: rawStopReason || undefined,
+    disposition,
+    shouldFail
+  })
+
+  // 内容过滤截断 —— 本次 RCA 确认的致断根因,必须让客户端明确失败(用户选择:发 SSE error)
+  if (norm === 'content_filtered' || norm === 'content_filter' || norm === 'refusal') {
+    return mk('filtered', true)
+  }
+  // 明确的非正常截断
+  if (['cancelled', 'canceled', 'pause_turn', 'model_context_window_exceeded',
+       'malformed_model_output', 'invalid_model_output'].includes(norm)) {
+    return mk('incomplete', true)
+  }
+  // 输出长度上限:无工具调用时是可接受的正常截断(客户端自己会续写);
+  // 但若已开了工具调用又被截断,工具入参极可能不完整 → 按 incomplete 处理
+  if (['max_tokens', 'max_output_tokens', 'length'].includes(norm)) {
+    return hasToolCalls ? mk('incomplete', true) : mk('length', false)
+  }
+  if (norm === 'tool_use' || (!norm && hasToolCalls)) return mk('tool_use', false)
+  if (!norm || norm === 'end_turn' || norm === 'stop' || norm === 'stop_sequence') {
+    return mk(hasToolCalls ? 'tool_use' : 'complete', false)
+  }
+  // 未知 stopReason:不假设它安全 —— 宁可让客户端看到错误,也不要静默截断
+  return mk('incomplete', true)
+}
+
 // 解析 AWS Event Stream 二进制格式
 async function parseEventStream(
   body: ReadableStream<Uint8Array>,
@@ -1986,6 +2300,18 @@ async function parseEventStream(
   let hasRealTokenUsage = false
   // 流式事件聚合计数（logStreamEvents 开启时，结束后输出摘要而非逐条输出）
   const streamEventCounts: Record<string, number> = {}
+  // ===== [STREAM-END] 取证埋点(2026-08-01 · RCA gpt-stream-premature-end)=====
+  // 目的:定位「GPT 系模型经反代跑到一半自断」的真实终止原因。纯观测,零行为改变。
+  // 覆盖 RCA §1.5 五条假设的判据:A 截断帧 / B 上游 stopReason 被丢弃 / C tool_call wrapper /
+  // D 客户端 abort / E 帧界错位。定主因后本段可保留(诊断可见性是一等公民)或收进正式门闸。
+  const diagEventCounts: Record<string, number> = {}
+  let diagUpstreamStopReason: string | undefined   // 上游真实 stopReason(当前转发逻辑从不消费它)
+  let diagStopReasonSource: string | undefined     // 来源:messageStopEvent / metadataEvent
+  let diagJsonSyntaxErrors = 0                     // 被静默吞掉的 JSON 语法错误数(截断信号)
+  const diagToolNames: string[] = []               // 见过的 toolUseEvent 名(判 tool_call wrapper)
+  let diagToolInputParseFailures = 0               // tool input JSON 解析失败次数
+  let diagFramesParsed = 0
+  let diagLastTotalLength = 0
   
   // 初始化 input tokens 估算（优先级链路：tokenUsage > contextUsage 反推 > tiktoken > 字符系数）
   // 这里只是兜底初值，后续真实事件会覆盖
@@ -2130,6 +2456,28 @@ async function parseEventStream(
       totalOutputChars += s.length
       collectedOutputText += s
     }
+    // ⚠️ 顺序关键(2026-08-01 修):本块必须在"提取内层工具"之前。
+    // 缺陷:若先提取内层,嵌套在幻觉外壳里的内层工具会先被捞进 leakedTools,
+    //       等外壳被整块丢弃时工具已经提取出去了 → 流结束时作为真实 tool_use 注入客户端
+    //       = 模型幻觉 / 散文里的示例标记被提升成真实工具调用。
+    // 实证:一次会话中模型在报告正文里写示例标记,反代真的向客户端发出了 toolUseId=toolleakfix_* 的
+    //       调用(客户端回 No such tool available)。若幻觉里的工具名恰好存在,就会执行一次
+    //       无人意图的调用 → 对话状态错乱(这是"跑到一半断了"的另一条路径)。
+    // 现在的顺序保证:外壳内的一切(含内层工具标记)整块丢弃,永不进 leakedTools。
+    // 2026-07-12 新增:提取所有已闭合的 <function_results>（Opus 4.8 幻觉的“假 tool result”）
+    // 背景:模型自己在文本里 emit `<function_results id="...">Error calling tool ...</function_results>` 假装 tool 已执行 →
+    //       客户端（Claude Code）收到会认为 tool 已完成一轮（尽管是幻觉）→ stop_reason=end_turn → 对话直接中断，后续 tool 全失败。
+    // 修法:直接剥离整块不 emit 到客户端（不 rescue，因为是幻觉不能重新执行）。
+    for (;;) {
+      const fi = leakCarry.indexOf('<function_results')
+      if (fi === -1) break
+      const ci = leakCarry.indexOf('</function_results>', fi)
+      if (ci === -1) break // 未闭合,等更多帧
+      const endIdx = ci + '</function_results>'.length
+      await emit(leakCarry.slice(0, fi))
+      if (toolLeakDebug) console.log(`[tool-leak-fix] 剥离幻觉 <function_results> block 不 emit, len=${endIdx - fi}, preview:`, leakCarry.slice(fi, Math.min(fi + 200, endIdx)).replace(/\s+/g, ' '))
+      leakCarry = leakCarry.slice(endIdx)
+    }
     // 提取所有已闭合的 <tool_use>(Anthropic 标准格式,Opus 4.8 常见泄漏)
     // 2026-07-12 升级:close tag 支持 3 种(</tool_use> / </invoke> / </function_calls>) model 混配时也能命中
     for (;;) {
@@ -2167,20 +2515,6 @@ async function parseEventStream(
         if (toolLeakDebug) console.log(`[tool-leak-fix] 剥离无 name 的 <tool_use> block 不 emit, len=${endIdx - fi}, raw preview:`, rawBlock.slice(0, 200).replace(/\s+/g, ' '))
         leakCarry = leakCarry.slice(endIdx)
       }
-    }
-    // 2026-07-12 新增:提取所有已闭合的 <function_results>（Opus 4.8 幻觉的“假 tool result”）
-    // 背景:模型自己在文本里 emit `<function_results id="...">Error calling tool ...</function_results>` 假装 tool 已执行 →
-    //       客户端（Claude Code）收到会认为 tool 已完成一轮（尽管是幻觉）→ stop_reason=end_turn → 对话直接中断，后续 tool 全失败。
-    // 修法:直接剥离整块不 emit 到客户端（不 rescue，因为是幻觉不能重新执行）。
-    for (;;) {
-      const fi = leakCarry.indexOf('<function_results')
-      if (fi === -1) break
-      const ci = leakCarry.indexOf('</function_results>', fi)
-      if (ci === -1) break // 未闭合,等更多帧
-      const endIdx = ci + '</function_results>'.length
-      await emit(leakCarry.slice(0, fi))
-      if (toolLeakDebug) console.log(`[tool-leak-fix] 剥离幻觉 <function_results> block 不 emit, len=${endIdx - fi}, preview:`, leakCarry.slice(fi, Math.min(fi + 200, endIdx)).replace(/\s+/g, ' '))
-      leakCarry = leakCarry.slice(endIdx)
     }
     // 2026-07-12 关键修复:跨帧分片时未闭合的 <tool_use / <function_results 必须 hold-back
     // Kiro backend 分帧极细,一帧 17 字节就可能仅到达 "\n\n<tool_use id=\"t";close tag 可能在 20+ 帧后才拼到。
@@ -2259,6 +2593,37 @@ async function parseEventStream(
   }
   // ===== 工具调用 XML 泄漏修复 end =====
 
+  // [STREAM-END] 取证输出:流终止时打一行结构化证据(dev 终端 + UI 日志双通道)。
+  // 异常态走 warn,使打包版用户也能在 UI 日志面板看到(打包版没有终端)。
+  const emitStreamEndDiag = (exitReason: string, errInfo?: string): void => {
+    const residual = buffer.length
+    let residualHead = ''
+    let claimedTotalLength = 0
+    if (residual > 0) {
+      residualHead = Array.from(buffer.slice(0, Math.min(16, residual)))
+        .map(b => b.toString(16).padStart(2, '0')).join(' ')
+      if (residual >= 4) {
+        claimedTotalLength = new DataView(buffer.buffer, buffer.byteOffset).getUint32(0, false)
+      }
+    }
+    const hasSemanticOutput = totalOutputChars > 0 || processedIds.size > 0 || leakedTools.length > 0
+    const line = `[STREAM-END] exit=${exitReason} residualBytes=${residual}`
+      + ` claimedTotalLength=${claimedTotalLength} framesParsed=${diagFramesParsed}`
+      + ` lastFrameLength=${diagLastTotalLength}`
+      + ` upstreamStopReason=${diagUpstreamStopReason ?? 'ABSENT'}(${diagStopReasonSource ?? 'none'})`
+      + ` semanticOutput=${hasSemanticOutput} outChars=${totalOutputChars} toolsDone=${processedIds.size}`
+      + ` toolNames=[${diagToolNames.join(',')}] toolInputParseFail=${diagToolInputParseFailures}`
+      + ` jsonSyntaxErrSwallowed=${diagJsonSyntaxErrors} leakCarryLeft=${leakCarry.length}`
+      + ` events=${JSON.stringify(diagEventCounts)}`
+      + (residual > 0 ? ` residualHead=${residualHead}` : '')
+      + (errInfo ? ` err=${errInfo}` : '')
+    console.log(line)
+    const suspicious = residual > 0 || !hasSemanticOutput || diagJsonSyntaxErrors > 0
+      || diagToolInputParseFailures > 0 || exitReason !== 'clean_eof'
+    if (suspicious) proxyLogger.warn('Kiro', line)
+    else proxyLogger.info('Kiro', line)
+  }
+
   try {
     throwIfAborted(signal)
     signal?.addEventListener('abort', abort, { once: true })
@@ -2311,6 +2676,28 @@ async function parseEventStream(
             const payloadText = new TextDecoder().decode(payloadBytes)
             const event = JSON.parse(payloadText)
             
+            // [STREAM-END] 取证:无条件统计事件类型(streamEventCounts 只在 logStreamEvents 开时统计,
+            // 断链现场往往没开)+ 观测上游真实 stopReason —— 当前转发逻辑完全不消费它(RCA §1.5 假设 B)。
+            diagEventCounts[eventType || 'unknown'] = (diagEventCounts[eventType || 'unknown'] || 0) + 1
+            if (eventType === 'messageStopEvent' || event.messageStopEvent) {
+              const stopPayload = (event.messageStopEvent || event) as { stopReason?: unknown; stop_reason?: unknown }
+              const rawReason = stopPayload.stopReason ?? stopPayload.stop_reason
+              if (rawReason !== undefined && rawReason !== null) {
+                diagUpstreamStopReason = String(rawReason)
+                diagStopReasonSource = 'messageStopEvent'
+              } else if (!diagUpstreamStopReason) {
+                diagUpstreamStopReason = 'PRESENT_BUT_EMPTY'
+                diagStopReasonSource = 'messageStopEvent'
+              }
+            }
+            if (!diagUpstreamStopReason) {
+              const metaForStop = (event.messageMetadataEvent || event.metadataEvent || event) as { stopReason?: unknown; stop_reason?: unknown }
+              const metaStopReason = metaForStop.stopReason ?? metaForStop.stop_reason
+              if (metaStopReason !== undefined && metaStopReason !== null) {
+                diagUpstreamStopReason = String(metaStopReason)
+                diagStopReasonSource = 'metadataEvent'
+              }
+            }
             // 根据 event type 处理不同类型的事件
             if (eventType === 'assistantResponseEvent' || event.assistantResponseEvent) {
               const assistantResp = event.assistantResponseEvent || event
@@ -2364,6 +2751,8 @@ async function parseEventStream(
               const toolUseData = event.toolUseEvent || event
               const toolUseId = toolUseData.toolUseId
               const toolName = toolUseData.name
+              // [STREAM-END] 取证:记录工具名,判 GPT 系是否走 tool_call wrapper(RCA §1.5 假设 C)
+              if (toolName && !diagToolNames.includes(String(toolName))) diagToolNames.push(String(toolName))
               const isStop = toolUseData.stop === true
               
               // 获取输入 - 可能是字符串片段或完整对象
@@ -2435,6 +2824,7 @@ async function parseEventStream(
                   }
                 } catch (e) {
                   parseError = true
+                  diagToolInputParseFailures++  // [STREAM-END] 取证:工具入参被上游截断的次数
                   console.error('[Kiro] Failed to parse tool input:', e, 'Buffer:', currentToolUse.inputBuffer?.substring(0, 100))
                   // 当 JSON 解析失败时，创建一个包含错误信息的 input
                   // 这样客户端可以看到工具调用失败的原因
@@ -2717,6 +3107,7 @@ async function parseEventStream(
           } catch (parseError) {
             if (parseError instanceof SyntaxError) {
               // JSON 解析错误，忽略
+              diagJsonSyntaxErrors++  // [STREAM-END] 取证:被静默吞掉的截断信号计数
               console.debug('[EventStream] JSON parse error:', parseError)
             } else {
               throw parseError
@@ -2724,6 +3115,9 @@ async function parseEventStream(
           }
         }
         
+        // [STREAM-END] 取证:帧计数 + 最后一帧声明长度(判帧界错位 / prelude 无 CRC 校验)
+        diagFramesParsed++
+        diagLastTotalLength = totalLength
         // 移动到下一条消息
         buffer = buffer.slice(totalLength)
       }
@@ -2789,6 +3183,25 @@ async function parseEventStream(
         usage.outputTokens = Math.max(1, Math.round(totalOutputChars * 0.4))
         proxyLogger.info('Kiro', `Estimated output tokens (fallback): ${totalOutputChars} chars -> ${usage.outputTokens} tokens`)
       }
+    } else if (collectedOutputText && usage.outputTokens > 0) {
+      // 修次生缺陷(2026-08-01):上游在被过滤/截断时给的 outputTokens 是**残值**。
+      // 实测:outChars=11397 却只记 38 tokens、outChars=3154 记个位数 —— 偏低两三个数量级,
+      // 使用量统计/计费全面失真。上游值只在明显不合理时纠正(取两者较大),
+      // 不无条件覆盖 —— 正常情况下上游真实值仍比本地 tiktoken 估算更权威。
+      const localEstimate = countTokens(collectedOutputText)
+      if (localEstimate > usage.outputTokens * 2 && localEstimate - usage.outputTokens > 50) {
+        proxyLogger.warn('Kiro', `Upstream outputTokens looks truncated: upstream=${usage.outputTokens} localTiktoken=${localEstimate} (chars=${totalOutputChars}, stopReason=${diagUpstreamStopReason ?? 'ABSENT'}) — using local estimate`)
+        usage.outputTokens = localEstimate
+      }
+    }
+
+    // 将上游真实终止语义带给转发层(2026-08-01 修 CONTENT_FILTERED 静默断流)。
+    // parseEventStream 只做分类不做处置 —— 具体怎么对客户端表现由各转发路径自己决定
+    // (四条路径的协议不同:Claude SSE error / OpenAI finish_reason / Gemini finishReason / 非流式 JSON)。
+    const hasAnyToolCall = processedIds.size > 0 || leakedTools.length > 0
+    usage.terminal = classifyKiroStopReason(diagUpstreamStopReason, hasAnyToolCall)
+    if (usage.terminal.shouldFail) {
+      proxyLogger.warn('Kiro', `Upstream terminated abnormally: stopReason=${usage.terminal.upstreamStopReason ?? 'ABSENT'} disposition=${usage.terminal.disposition} outChars=${totalOutputChars} tools=${processedIds.size}`)
     }
     
     // 流式事件聚合摘要
@@ -2798,11 +3211,17 @@ async function parseEventStream(
     }
     
     throwIfAborted(signal)
+    // [STREAM-END] 取证:residual>0 = 上游流在半截帧处断掉,但当前代码仍走 onComplete → 客户端收 end_turn
+    emitStreamEndDiag(buffer.length > 0 ? 'eof_with_truncated_frame' : 'clean_eof')
     proxyLogger.info('Kiro', 'Stream complete, final usage', usage)
     onComplete(usage)
   } catch (error) {
     // [STREAM-ERROR] 调试:看 stream 提前中断的根因(filterToolLeak 抛错 / event 解析异常 / abort)
     if (toolLeakDebug) console.log(`[tool-leak-fix] [STREAM-ERROR]`, error instanceof Error ? `${error.name}: ${error.message}` : String(error))
+    emitStreamEndDiag(
+      signal?.aborted ? 'client_abort' : 'reader_or_parse_error',
+      error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+    )
     onError(signal?.aborted ? getAbortError(signal) : error as Error)
   } finally {
     signal?.removeEventListener('abort', abort)
@@ -2846,6 +3265,20 @@ export async function callKiroApi(
       },
       (u) => {
         usage = u
+        // 非流式路径统一拦截上游异常终止(2026-08-01 修 CONTENT_FILTERED 静默断流)。
+        // 为什么在这里单点拦截而不是改各 caller:非流式有 9 个 callsite 散在多条路径的重试分支里
+        // (git grep 'callKiroApi(' -- proxyServer.ts),逐个改必漏;且它们全部已被 try/catch 或
+        // callWithRetry 包裹,reject 会被现成的错误处理接住 → 客户端拿到明确 HTTP 错误而非
+        // 一个 finishReason:'STOP' 的半截 JSON。SSOT:分类逻辑只有 classifyKiroStopReason 一处。
+        if (u.terminal?.shouldFail) {
+          const reason = u.terminal.upstreamStopReason || u.terminal.disposition
+          reject(new Error(
+            u.terminal.disposition === 'filtered'
+              ? `Upstream content filter truncated the response (stopReason: ${reason}). 输出不完整,请重试或调整措辞。`
+              : `Upstream terminated abnormally (stopReason: ${reason}). 响应不完整,请重试。`
+          ))
+          return
+        }
         if (reasoningText || redactedContent) {
           const rc: { text?: string; signature?: string; redactedContent?: string } = {}
           if (reasoningText) rc.text = reasoningText

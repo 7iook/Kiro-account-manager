@@ -16,7 +16,9 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setTokenRefreshCallbackForModelFetch, setAccountModelSyncCallback, setRateLimitRetryConfig, setAgentMode, KNOWN_SSO_OIDC_REGIONS, resolveApiKeyProfileArn, isKiroApiDebug, type KiroProfile } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setTokenRefreshCallbackForModelFetch, setAccountModelSyncCallback, setRateLimitRetryConfig, setAgentMode, KNOWN_SSO_OIDC_REGIONS, resolveApiKeyProfileArnIfEligible, validateApiKeyCredential, isKiroApiDebug, type KiroProfile } from './proxy/kiroApi'
+import { sha256Fingerprint } from './utils/tokenFingerprint'
+import type { VerifyApiKeyResult } from '../shared/types/credential'
 import { resolveProfileArnForVerify, buildCompleteLoginResult } from './proxy/profile-selection'
 import {
   writeKiroAuthTokenFile,
@@ -4949,31 +4951,82 @@ app.whenReady().then(async () => {
     }
   })
 
-  // IPC: 验证网页 API Key(ksk_)并解析其绑定的 profileArn（用于添加账号）
-  // ksk 是静态长凭证：调 GetProfile(TokenType: API_KEY) 拿 profileArn，通过即可导入。
-  ipcMain.handle('verify-api-key', async (_event, params: { apiKey: string; region?: string }) => {
+  // IPC: 验证网页 API Key(ksk_)凭据有效性 + 附赠尝试解析 profileArn(§6 Surgical Fix · RCA A2-R3 责任拆分)
+  //   Step 1: validateApiKeyCredential(GetUsageLimits) → state ∈ {VALID, INVALID, SUSPENDED, INDETERMINATE}
+  //   Step 2: state=VALID 且非 STANDALONE 类订阅 → resolveApiKeyProfileArn 附赠拿元数据(拿不到不改 state)
+  // 契约(SSOT):@shared/types/credential.ts VerifyApiKeyResult
+  //   renderer 唯一分类字段是 state · success 只作辅助
+  ipcMain.handle('verify-api-key', async (_event, params: { apiKey: string; region?: string }): Promise<VerifyApiKeyResult> => {
     const apiKey = (params?.apiKey || '').trim()
     const region = params?.region || 'us-east-1'
     console.log('[IPC] verify-api-key called')
     if (!apiKey.startsWith('ksk_')) {
-      return { success: false, error: 'API Key 格式错误：应以 ksk_ 开头' }
+      return {
+        state: 'INVALID',
+        success: false,
+        error: 'API Key 格式错误：应以 ksk_ 开头'
+      }
     }
     try {
-      const profile = await resolveApiKeyProfileArn(apiKey, region)
-      const dataPlaneRegion = parseRegionFromProfileArn(profile.profileArn) || region
+      // Step 1: 凭据有效性判定(唯一决策入口)
+      const probe = await validateApiKeyCredential(apiKey, region)
+
+      if (probe.state !== 'VALID') {
+        // state=INVALID / SUSPENDED / INDETERMINATE:一律不入池,给 renderer 展示原因
+        const reasonMap: Record<'INVALID' | 'SUSPENDED' | 'INDETERMINATE', string> = {
+          INVALID: '密钥无效或已吊销',
+          SUSPENDED: '账号已被 Kiro 暂停',
+          INDETERMINATE: '暂时无法验证，请稍后重新提交该密钥'
+        }
+        const humanReason = reasonMap[probe.state as 'INVALID' | 'SUSPENDED' | 'INDETERMINATE']
+        return {
+          state: probe.state,
+          success: false,
+          subscription: probe.subscription, // SUSPENDED 时后端可能仍返 type 供日志诊断
+          reason: probe.reason,
+          httpStatus: probe.httpStatus,
+          error: probe.reason ? `${humanReason}（${probe.reason}）` : humanReason
+        }
+      }
+
+      // Step 2: VALID 态 · 附赠尝试拿 profileArn(不改变 state · 失败静默)
+      const subscriptionType = probe.subscription?.type
+      const profile = await resolveApiKeyProfileArnIfEligible(apiKey, region, subscriptionType)
+
+      const dataPlaneRegion = profile
+        ? (parseRegionFromProfileArn(profile.profileArn) || region)
+        : region
+
       return {
+        state: 'VALID',
         success: true,
-        profileArn: profile.profileArn,
-        profileName: profile.profileName,
-        status: profile.status,
-        profileType: profile.profileType,
+        subscription: probe.subscription,
+        tokenFingerprint: probe.tokenFingerprint,
+        httpStatus: probe.httpStatus,
+        profileArn: profile?.profileArn,
+        profileName: profile?.profileName,
+        profileType: profile?.profileType,
         region: dataPlaneRegion
       }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error)
-      console.error('[IPC] verify-api-key failed:', msg)
-      return { success: false, error: `API Key 校验失败：${msg}` }
+      console.error('[IPC] verify-api-key unexpected error:', msg)
+      // 未预期的异常 → 归 INDETERMINATE(避免把偶发错误误判成 INVALID)
+      return {
+        state: 'INDETERMINATE',
+        success: false,
+        error: `API Key 校验失败（内部错误）：${msg}`
+      }
     }
+  })
+
+  // IPC: 计算 accessToken 的 sha256 hex 指纹(前 16 位) · 用于老账号 tokenFingerprint 补齐迁移
+  //   §6 Minimal Files #10 · RCA A2-R5 IPC 通道注册
+  ipcMain.handle('compute-token-fingerprint', async (_event, accessToken: string): Promise<string> => {
+    if (typeof accessToken !== 'string' || accessToken.length === 0) {
+      throw new Error('compute-token-fingerprint: accessToken must be a non-empty string')
+    }
+    return sha256Fingerprint(accessToken)
   })
 
   // IPC: 验证凭证并获取账号信息（用于添加账号）

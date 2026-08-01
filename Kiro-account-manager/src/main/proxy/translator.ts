@@ -891,7 +891,9 @@ export function createOpenaiStreamChunk(
   id: string,
   model: string,
   delta: { role?: 'assistant'; content?: string; reasoning_content?: string; tool_calls?: { index: number; id?: string; type?: 'function'; function?: { name?: string; arguments?: string } }[] },
-  finishReason: 'stop' | 'tool_calls' | null = null,
+  // 'length' = 上游命中输出 token 上限(MAX_TOKENS)。旧签名漏了这个合法值,
+  // 导致截断只能被伪装成 'stop'(正常收尾)—— 2026-08-01 补齐。
+  finishReason: 'stop' | 'tool_calls' | 'length' | null = null,
   usage?: OpenAIUsage
 ): OpenAIStreamChunk & { usage?: OpenAIUsage } {
   const chunk: OpenAIStreamChunk & { usage?: OpenAIUsage } = {

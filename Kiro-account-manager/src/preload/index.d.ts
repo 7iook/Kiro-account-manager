@@ -266,16 +266,31 @@ interface KiroApi {
   exportToFile: (data: string, filename: string) => Promise<boolean>
   importFromFile: () => Promise<{ content: string; format: string } | null>
 
-  // 验证网页 API Key(ksk_)并解析绑定的 profileArn
+  // 验证网页 API Key(ksk_)凭据有效性 + 附赠解析 profileArn
+  //   RCA §6 IPC 真值表 · A4-R3 契约 · state 是 renderer 唯一分类字段
   verifyApiKey: (params: { apiKey: string; region?: string }) => Promise<{
+    state: 'VALID' | 'INVALID' | 'SUSPENDED' | 'INDETERMINATE'
     success: boolean
+    subscription?: {
+      type: string
+      title?: string
+      status?: string
+      managementTarget?: string
+      currentUsage?: number
+      usageLimit?: number
+    }
+    tokenFingerprint?: string
     profileArn?: string
     profileName?: string
-    status?: string
     profileType?: string
     region?: string
+    reason?: string
+    httpStatus?: number
     error?: string
   }>
+
+  // 计算 accessToken 的 sha256 hex 指纹(前 16 位) · 老账号 tokenFingerprint 补齐用
+  computeTokenFingerprint: (accessToken: string) => Promise<string>
 
   // 验证凭证并获取账号信息
   verifyAccountCredentials: (credentials: {

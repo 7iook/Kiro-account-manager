@@ -207,17 +207,39 @@ const api = {
     return ipcRenderer.invoke('import-from-file')
   },
 
-  // 验证网页 API Key(ksk_)并解析绑定的 profileArn
-  verifyApiKey: (params: { apiKey: string; region?: string }): Promise<{
+  // 验证网页 API Key(ksk_)凭据有效性 + 附赠解析 profileArn(SSOT: @shared/types/credential.ts)
+  //   返回 state ∈ {VALID, INVALID, SUSPENDED, INDETERMINATE};renderer 按 state 分支处理
+  //   RCA §6 IPC 真值表 · A4-R3 契约
+  verifyApiKey: (params: {
+    apiKey: string
+    region?: string
+  }): Promise<{
+    state: 'VALID' | 'INVALID' | 'SUSPENDED' | 'INDETERMINATE'
     success: boolean
+    subscription?: {
+      type: string
+      title?: string
+      status?: string
+      managementTarget?: string
+      currentUsage?: number
+      usageLimit?: number
+    }
+    tokenFingerprint?: string
     profileArn?: string
     profileName?: string
-    status?: string
     profileType?: string
     region?: string
+    reason?: string
+    httpStatus?: number
     error?: string
   }> => {
     return ipcRenderer.invoke('verify-api-key', params)
+  },
+
+  // 计算 accessToken 的 sha256 hex 指纹(前 16 位) · 老账号 tokenFingerprint 补齐用
+  //   RCA §6 A3-R5 消除竞态:isAccountExists 命中缺 fingerprint 老账号时按需同步补算
+  computeTokenFingerprint: (accessToken: string): Promise<string> => {
+    return ipcRenderer.invoke('compute-token-fingerprint', accessToken)
   },
 
   // 验证凭证并获取账号信息

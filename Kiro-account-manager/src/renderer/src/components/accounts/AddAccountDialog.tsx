@@ -67,7 +67,7 @@ type ImportMode = 'oidc' | 'sso' | 'login' | 'apikey'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso' | 'externalidp'
 
 export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): React.ReactNode {
-  const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab, checkAccountStatus } = useAccountsStore()
+  const { addAccount, updateAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab, checkAccountStatus } = useAccountsStore()
 
   // 检查账户是否已存在
   //   主键: userId (强前提, 相同即重复)
@@ -90,6 +90,35 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       }
       return false
     })
+  }
+
+  // API Key 专用凭据去重(RCA §6 A6-R2 · A3-R5 竞态消除):
+  //   - 按 credentials.tokenFingerprint (sha256(accessToken).slice(0,16)) 命中即重复
+  //   - 老账号缺 fingerprint 但有 accessToken → 通过 IPC 同步补算并就地缓存(消除后台异步迁移竞态)
+  //   - IPC 失败该老账号本轮跳过,不阻止判定
+  const checkApiKeyFingerprintExists = async (fingerprint: string): Promise<boolean> => {
+    for (const acc of accounts.values()) {
+      if (acc.credentials.provider !== 'ApiKey') continue
+      // 已有 fingerprint 直接比
+      if (acc.credentials.tokenFingerprint) {
+        if (acc.credentials.tokenFingerprint === fingerprint) return true
+        continue
+      }
+      // 老账号 · 有 accessToken 就按需补算
+      if (acc.credentials.accessToken) {
+        try {
+          const fp = await window.api.computeTokenFingerprint(acc.credentials.accessToken)
+          // 就地缓存到 store(避免下次再算)
+          updateAccount(acc.id, {
+            credentials: { ...acc.credentials, tokenFingerprint: fp }
+          })
+          if (fp === fingerprint) return true
+        } catch {
+          // IPC 失败降级 · 该老账号本轮视为"无 fingerprint 可比" · 继续下一个
+        }
+      }
+    }
+    return false
   }
 
   // 导入模式
@@ -1359,13 +1388,23 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         }
         const t0 = Date.now()
         try {
-          // Step 1: GetProfile 校验 · 拿 profileArn
+          // Step 1: 凭据有效性判定(RCA §6 状态机决策 · A7-R2 强化)
+          //   renderer 唯一分类字段是 state · 严禁走正则回退
           const verify = await window.api.verifyApiKey({ apiKey: key, region: apiKeyRegion })
-          if (!verify.success) {
-            const msg = verify.error || 'verify failed'
-            const isSuspend = /TEMPORARILY_SUSPENDED|AccountSuspended|423 Locked|suspended/i.test(msg)
-            const isAuth = /401|Unauthorized|Invalid.*token/i.test(msg)
-            results.push({ key: label, status: isSuspend ? 'suspended' : isAuth ? 'unauthorized' : 'invalid', message: msg.slice(0, 200) })
+          if (verify.state === 'SUSPENDED') {
+            results.push({ key: label, status: 'suspended', message: verify.error || 'suspended' })
+            setApiKeyProbeResult([...results])
+            continue
+          }
+          if (verify.state === 'INVALID') {
+            results.push({ key: label, status: 'unauthorized', message: verify.error || 'invalid' })
+            setApiKeyProbeResult([...results])
+            continue
+          }
+          if (verify.state === 'INDETERMINATE') {
+            // 探测阶段暂时无法验证 · 归 error 让用户重试
+            results.push({ key: label, status: 'error', message: verify.error || 'indeterminate' })
+            setApiKeyProbeResult([...results])
             continue
           }
           // Step 2: 真实推理请求(model 用最便宜的 haiku · 单字回复)
@@ -1386,8 +1425,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             results.push({ key: label, status: 'alive', latencyMs: probe.latencyMs ?? ms, credits: probe.usage?.credits })
           } else {
             const err = probe.error || 'unknown'
+            // 推理端错误仍需正则分类(不同层的错误 · state 只覆盖凭据探测层)
             const isSuspend = /TEMPORARILY_SUSPENDED|AccountSuspended|423 Locked|suspended/i.test(err)
-            const isQuota = /402|429|quota|Throttling|rate limit|limit exceeded/i.test(err)
+            const isQuota = /402|429|quota|Throttling|rate limit|limit exceeded|MONTHLY_REQUEST_COUNT/i.test(err)
             const isAuth = /401|Unauthorized|Invalid.*token/i.test(err)
             results.push({
               key: label,
@@ -1433,27 +1473,45 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           continue
         }
         try {
+          // 凭据有效性判定 · state 是 renderer 唯一分类字段(RCA §6 A7-R2 · IPC 真值表)
           const result = await window.api.verifyApiKey({ apiKey: key, region: apiKeyRegion })
-          if (!result.success || !result.profileArn) {
+          if (result.state !== 'VALID') {
+            // INVALID / SUSPENDED / INDETERMINATE → 一律拒绝入池,不再依赖 profileArn 是否存在
+            //   INVALID: 密钥无效 → 展示"密钥无效或已吊销"
+            //   SUSPENDED: 账号被 Kiro 暂停 → 展示"账号已被 Kiro 暂停"
+            //   INDETERMINATE: 暂时无法验证 → 提示用户稍后重试(不静默入池)
             errors.push(`${short}: ${result.error || (isEn ? 'verification failed' : '校验失败')}`)
             continue
           }
+          // VALID 态 · 允许入池(即使 profileArn undefined · STANDALONE 类是 feature gate 不影响运行)
+          if (!result.tokenFingerprint) {
+            // 契约错误:VALID 一定带 tokenFingerprint · 保守拒绝防止污染池
+            errors.push(`${short}: ${isEn ? 'missing token fingerprint from main' : '主进程未返回 fingerprint'}`)
+            continue
+          }
           const dataRegion = result.region || apiKeyRegion
-          // profileArn 尾段作为稳定 userId；无 email，用 profileName 或 key 尾 6 位做展示名
-          const arnTail = result.profileArn.split('/').pop() || result.profileArn.slice(-12)
+          const profileArn = result.profileArn // 可能是 undefined(STANDALONE 类)
+          // 稳定 userId:优先用 profileArn 尾段(元数据可用时) · 否则用 tokenFingerprint(始终有值)
+          //   多 STANDALONE ksk_ 通常无 profileArn · 用 fingerprint 保证唯一
+          const arnTail = profileArn ? (profileArn.split('/').pop() || profileArn.slice(-12)) : undefined
+          const stableUserId = arnTail || result.tokenFingerprint
           const displayName = result.profileName || `API Key ${key.slice(-6)}`
-          if (isAccountExists('', arnTail, 'ApiKey', result.profileArn)) {
+          // 双重去重:userId + tokenFingerprint(A3-R5 竞态消除 · 老账号按需补 fingerprint)
+          if (
+            isAccountExists('', stableUserId, 'ApiKey', profileArn) ||
+            (await checkApiKeyFingerprintExists(result.tokenFingerprint))
+          ) {
             errors.push(`${short}: ${isEn ? 'already exists' : '账户已存在'}`)
             continue
           }
           const now = Date.now()
           const newId = addAccount({
             email: '',
-            userId: arnTail,
+            userId: stableUserId,
             nickname: displayName,
             idp: 'ApiKey',
             groupId: selectedGroupId,
-            profileArn: result.profileArn,
+            profileArn,
             credentials: {
               accessToken: key,
               csrfToken: '',
@@ -1463,17 +1521,23 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               expiresAt: now + 100 * 365 * 24 * 3600 * 1000,
               authMethod: 'api_key',
               provider: 'ApiKey',
-              profileArn: result.profileArn
+              profileArn,
+              tokenFingerprint: result.tokenFingerprint
             },
             subscription: {
-              type: 'Pro' as SubscriptionType,
-              title: result.profileType ? `API Key · ${result.profileType}` : 'API Key'
+              // 用 verify-api-key 返回的 subscription 覆盖占位值(RCA §6 A2-R3 副作用)
+              type: (result.subscription?.title || 'Pro') as SubscriptionType,
+              title: result.subscription?.title ||
+                (result.profileType ? `API Key · ${result.profileType}` : 'API Key'),
+              rawType: result.subscription?.type
             },
             // 额度占位；导入后立即触发 checkAccountStatus 拉真实额度/订阅/邮箱
             usage: {
-              current: 0,
-              limit: 0,
-              percentUsed: 0,
+              current: result.subscription?.currentUsage ?? 0,
+              limit: result.subscription?.usageLimit ?? 0,
+              percentUsed: result.subscription?.usageLimit
+                ? Math.round(((result.subscription.currentUsage ?? 0) / result.subscription.usageLimit) * 100)
+                : 0,
               lastUpdated: now
             },
             tags: [],

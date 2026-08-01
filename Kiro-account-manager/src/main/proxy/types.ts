@@ -370,6 +370,28 @@ export interface KiroUsage {
   cacheReadTokens?: number
   cacheWriteTokens?: number
   reasoningTokens?: number
+  /**
+   * 上游真实终止语义(2026-08-01 修 CONTENT_FILTERED 被伪装成 end_turn 致客户端静默断流)。
+   *
+   * 背景:Kiro 后端在 messageMetadataEvent/messageStopEvent 里给出真实 stopReason,
+   * 实测分布含 END_TURN / TOOL_USE / **CONTENT_FILTERED**。此前反代完全不消费该字段,
+   * 四条转发路径一律按 `hasToolCalls ? 'tool_use' : 'end_turn'` 本地推断 → 被内容过滤
+   * 掐断的半截响应也被翻译成 end_turn("模型自然说完")→ 客户端不报错不重试,静默停止。
+   *
+   * disposition 用于让各转发路径判断"这轮能不能算正常收尾":
+   * - complete    : 正常收尾(END_TURN / 无 stopReason)
+   * - tool_use    : 工具调用收尾
+   * - length      : 命中输出长度上限(MAX_TOKENS,无工具调用)
+   * - filtered    : 内容被上游过滤器截断(CONTENT_FILTERED)→ 必须让客户端明确失败
+   * - incomplete  : 其他非正常截断(CANCELLED / 上下文超限 / 未知 stopReason)
+   */
+  terminal?: {
+    /** 上游原始 stopReason 字符串,原样保留供日志/诊断(如 'CONTENT_FILTERED') */
+    upstreamStopReason?: string
+    disposition: 'complete' | 'tool_use' | 'length' | 'filtered' | 'incomplete'
+    /** 该 disposition 是否应让客户端明确失败(filtered/incomplete = true) */
+    shouldFail: boolean
+  }
   /** Context usage breakdown（来自后端 ContextUsageEvent） */
   contextUsage?: {
     percentage: number
