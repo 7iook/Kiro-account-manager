@@ -12,6 +12,7 @@ export default defineConfig({
       '@main': resolve(__dirname, 'src/main'),
       '@preload': resolve(__dirname, 'src/preload'),
       '@renderer': resolve(__dirname, 'src/renderer/src'),
+      '@shared': resolve(__dirname, 'src/shared'),
       // 与 electron.vite.config.ts renderer 段一致:renderer 代码大量使用 `@/xxx`
       '@': resolve(__dirname, 'src/renderer/src')
     }
