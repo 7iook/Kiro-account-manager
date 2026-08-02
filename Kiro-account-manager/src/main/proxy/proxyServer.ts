@@ -3315,7 +3315,9 @@ export class ProxyServer {
           }
 
           // ADR-0001 边界 2:仅在"尚未写出任何语义正文(bodyStartSent=false)"时,才允许挂起门闸接管。
-          if (!bodyStartSent && onPreBodyError?.(error)) {
+          // RCA 2026-08-02:额外要求错误「换号可能有用」(isSwitchWorthyError)——
+          //   400 Improperly formed request 这类请求级错误换号无用,以前会被误挂到客户端超时。
+          if (!bodyStartSent && this.isSwitchWorthyError(error.message) && onPreBodyError?.(error)) {
             this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 503, error: `held: ${error.message}` })
             resolve()
             return
@@ -3794,8 +3796,15 @@ export class ProxyServer {
     onTimeoutError: () => void
     /** 超时收尾 - graceful_stop:按端点格式发"干净结束"信号。 */
     onTimeoutGracefulStop: () => void
+    /**
+     * 不挂起放弃收尾(RCA 2026-08-02):所有号都试过、拿不到新号,但池里没有任何号
+     * 被封禁/额度耗尽(只是瞬时错误冷却)→ 不挂起,按端点格式原样报错。
+     * 缺省时回落 onTimeoutError(两者语义都是"发失败信号",格式一致)。
+     */
+    onNoHoldGiveUp?: () => void
   }): Promise<void> {
     const { res, startTime, signal, seedAccount, pickAccount, attempt, sendPing, onTimeoutError, onTimeoutGracefulStop } = opts
+    const onNoHoldGiveUp = opts.onNoHoldGiveUp ?? onTimeoutError
     // 本次请求已试过的账号(避免 resume/切号反复命中同一挂账号)。
     const triedIds = new Set<string>()
 
@@ -3831,6 +3840,15 @@ export class ProxyServer {
     for (;;) {
       if (this.isResponseClosed(res)) return
       if (!acc) {
+        // 挂起门槛(RCA 2026-08-02 hold-gate-false-positive):
+        //   只有池里确有账号被封禁/额度耗尽时,挂起等换号才有意义。
+        //   若所有号只是瞬时错误退避冷却中(429/5xx),挂起 10-20 分钟纯属误伤 → 原样报错。
+        if (!this.shouldHoldForNoAccount()) {
+          console.warn('[ProxyServer] No account available but none is suspended/quota-exhausted (transient errors only) — reporting error instead of holding')
+          onNoHoldGiveUp()
+          this.recordRequestFailed()
+          return
+        }
         const shouldRetry = await waitInHold()
         if (!shouldRetry) return // 超时/abort 终态
         acc = await pickFresh()
@@ -3846,12 +3864,15 @@ export class ProxyServer {
   }
 
   /**
-   * 判断一个上游错误是否"值得挂起"(账号级可恢复错误 —— 换个号/等配额恢复就能好)。
-   * 命中 = 401/403/Auth / 402/429/quota/throttle/limit / 5xx / suspended → 返回 true(可切号或挂起);
+   * 判断一个上游错误是否「值得换号重试」(账号级错误 —— 换个号可能就好)。
+   * 命中 = 401/403/Auth / 402/429/quota/throttle/limit / 5xx / suspended → 返回 true(可切下一个号);
    * 未命中(如 400 malformed、校验失败)= 请求本身有问题,换号无用,应原样报错 → false。
-   * 判据与 callWithRetry 的切号分支保持一致(SSOT:同一套"何时切号"的语义)。
+   * 判据与 callWithRetry 的切号分支保持一致(SSOT:同一套「何时切号」的语义)。
+   *
+   * ⚠️ 本判据**只管换号**,不再单独决定是否挂起 —— 挂起走 {@link shouldHoldForNoAccount}
+   * (RCA 2026-08-02 hold-gate-false-positive:两个语义混用导致瞬时 429/5xx 也被挂起 10-20 分钟)。
    */
-  private isHoldWorthyError(errMsg: string): boolean {
+  private isSwitchWorthyError(errMsg: string): boolean {
     if (!errMsg) return false
     if (this.detectSuspendedError(errMsg)) return true
     return (
@@ -3865,10 +3886,27 @@ export class ProxyServer {
   }
 
   /**
+   * 「所有号都试过了、拿不到新号」时,是否应该**挂起等换号**(而不是原样报错)。
+   *
+   * 判据是**池的权威状态**,不是错误字符串:池里确有账号被封禁 / 额度耗尽
+   * (accountPool.hasBlockedAccount)→ 挂起等人工换号或配额恢复才有意义。
+   *
+   * 反之,若池里所有号只是**瞬时错误退避冷却中**(429 限流 / 上游 5xx 触发 errorCount),
+   * 挂起 10-20 分钟毫无意义 → 返回 false,原样报错让客户端自己重试。
+   *
+   * 这条门槛是 RCA 2026-08-02 hold-gate-false-positive 的核心修复:
+   * 此前挂起判据混用了「换号判据」,任何 pre-body 错误(甚至 400 Improperly formed request)
+   * 在单账号模式下都会把请求挂死到客户端 API_TIMEOUT_MS(默认 600s)超时。
+   */
+  private shouldHoldForNoAccount(): boolean {
+    return this.accountPool.hasBlockedAccount()
+  }
+
+  /**
    * 非流式(JSON)请求的通用挂起编排(task#5 · 3 个 JSON 端点复用:Claude 非流式 / OpenAI chat 非流式 / responses 非流式)。
    * 复用 runWithHold 核心,attempt 内跑 callWithRetry(保留其端点切换/token 刷新/suspended 检测能力):
    *   - callWithRetry 成功 → writeSuccess 写响应 → 'done';
-   *   - 抛账号级可恢复错误(isHoldWorthyError)→ 'pre_body_failed'(runWithHold 切号,无号则挂起);
+   *   - 抛账号级可恢复错误(isSwitchWorthyError)→ 'pre_body_failed'(runWithHold 切号,无号且确有封禁/额度耗尽才挂起);
    *   - 抛请求本身错误(400 等)→ handleApiError 原样报错 → 'done'(换号无用,不挂起)。
    * 非流式无 SSE 心跳通道:挂起期间靠 HTTP keep-alive 硬等,受 holdTotalBudgetMs 约束(方案"实现约束");
    * 若客户端 HTTP 层超时早于此,连接断开触发 abort → 退化为原有报错(不比现状差)。
@@ -3899,7 +3937,7 @@ export class ProxyServer {
         if (this.isAbortError(error, opts.signal) || this.isResponseClosed(opts.res)) return 'done'
         const errMsg = (error as Error).message || String(error)
         // 账号级可恢复错误(callWithRetry 已把失败号记账/切号耗尽)→ 交给 runWithHold 切号或挂起。
-        if (this.isHoldWorthyError(errMsg)) return 'pre_body_failed'
+        if (this.isSwitchWorthyError(errMsg)) return 'pre_body_failed'
         // 请求本身错误(换号无用)→ 原样报错,不挂起。
         this.handleApiError(opts.res, acc, error as Error, opts.path, opts.model, opts.startTime, opts.signal)
         return 'done'
@@ -4386,7 +4424,9 @@ export class ProxyServer {
 
           // ADR-0001 边界 2:仅在"尚未发出 message_start(未吐任何语义正文)"时,才允许挂起门闸接管。
           // 接管成功 → 静默 resolve,不发 SSE error(交给 resume 用新号重放,客户端无感)。
-          if (!messageStartSent && onPreBodyError?.(error)) {
+          // RCA 2026-08-02:额外要求错误「换号可能有用」(isSwitchWorthyError)——
+          //   400 Improperly formed request 这类请求级错误换号无用,以前会被误挂到客户端超时。
+          if (!messageStartSent && this.isSwitchWorthyError(error.message) && onPreBodyError?.(error)) {
             this.events.onResponse?.({ path: '/v1/messages', model, status: 503, error: `held: ${error.message}` })
             resolve()
             return

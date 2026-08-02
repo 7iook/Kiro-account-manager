@@ -394,6 +394,25 @@ export class AccountPool {
     return false
   }
 
+  /**
+   * 池中是否存在「真·长期不可用」的账号 —— 挂起门闸(HoldGate)的权威判据。
+   *
+   * 只认两种池状态(需要人工换号 / 等配额自然恢复,挂起等放行才有意义):
+   *   - isSuspended:被 Kiro 后端封禁(suspendedAt > 0),需人工解封或换号
+   *   - isQuotaExhausted:额度耗尽(quotaExhaustedAt / quotaUsed >= quotaLimit),需等 quotaResetAt
+   *
+   * 明确**不认** errorCount 退避冷却(429 限流 / 上游 5xx 等瞬时错误触发)——
+   * 那类失败重试几秒就好,挂起 10-20 分钟纯属误伤(RCA 2026-08-02 hold-gate-false-positive)。
+   *
+   * @returns true = 确有账号被封禁/额度耗尽 → 挂起请求等换号才合理
+   */
+  hasBlockedAccount(now: number = Date.now()): boolean {
+    for (const account of this.accounts.values()) {
+      if (this.isSuspended(account) || this.isQuotaExhausted(account, now)) return true
+    }
+    return false
+  }
+
   // 获取冷却时间最短的账号
   private getAccountWithShortestCooldown(accounts: ProxyAccount[], now: number): ProxyAccount | null {
     let bestAccount: ProxyAccount | null = null
