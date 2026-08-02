@@ -4990,12 +4990,15 @@ app.whenReady().then(async () => {
       }
 
       // Step 2: VALID 态 · 附赠尝试拿 profileArn(不改变 state · 失败静默)
+      // probe.region 是 validateApiKeyCredential 跨区探测实际命中的 region(hint 猜错时会翻转),
+      // Step2 GetProfile 必须用该 region,否则同样打错端点空转。
+      const effectiveRegion = probe.region || region
       const subscriptionType = probe.subscription?.type
-      const profile = await resolveApiKeyProfileArnIfEligible(apiKey, region, subscriptionType)
+      const profile = await resolveApiKeyProfileArnIfEligible(apiKey, effectiveRegion, subscriptionType)
 
       const dataPlaneRegion = profile
-        ? (parseRegionFromProfileArn(profile.profileArn) || region)
-        : region
+        ? (parseRegionFromProfileArn(profile.profileArn) || effectiveRegion)
+        : effectiveRegion
 
       return {
         state: 'VALID',

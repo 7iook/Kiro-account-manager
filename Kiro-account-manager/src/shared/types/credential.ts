@@ -44,6 +44,14 @@ export interface CredentialProbeResult {
   subscription?: SubscriptionSummary
   /** 16 位 hex · sha256(accessToken) 前 16 位 · 仅 VALID 态填充 */
   tokenFingerprint?: string
+  /**
+   * 实际成功命中的数据面 region · 仅 state=VALID 时填充(其他 state 一律 undefined)。
+   *
+   * ksk_ 网页密钥归属特定 region(us-east-1 / eu-central-1),调用方可能在 hint region
+   * 猜错(默认 us-east-1)。validateApiKeyCredential 会跨 region 探测,该字段告知调用方
+   * 实际生效的 region,以便持久化到账户对象,后续 stream 直接命中正确端点。
+   */
+  region?: string
   /** 人类可读原因(用于结果面板展示) */
   reason?: string
   httpStatus?: number

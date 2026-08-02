@@ -525,6 +525,46 @@ export async function validateApiKeyCredential(
   apiKey: string,
   region = 'us-east-1'
 ): Promise<CredentialProbeResult> {
+  // 跨 region 探测(RCA 2026-08-02 · ksk-region-adaptation):
+  //   Kiro 数据面 REST 只在 us-east-1 / eu-central-1 提供服务,ksk 归属特定 region;
+  //   打到错 region 一律 403 {"message":"Invalid token"},与"密钥吊销"无法从响应体区分。
+  //   hint region → 若返 INVALID(401/403) 且还有另一区域候选,试下一个;
+  //   VALID / SUSPENDED / INDETERMINATE 均直接短路(网络错误/5xx/429 与 region 无关)。
+  //   参考 F:\kiro.rs-admin\src\kiro\token_manager.rs:461 rest_api_region_candidates。
+  const primary = region
+  const others = KNOWN_CW_DATA_REGIONS.filter(r => r !== primary)
+  const candidates = [primary, ...others]
+
+  let lastInvalid: CredentialProbeResult | null = null
+  for (const candidateRegion of candidates) {
+    const result = await probeApiKeyCredentialAtRegion(apiKey, candidateRegion)
+    if (result.state === 'INVALID') {
+      // 记住第一次 INVALID(hint region),继续试下一个 region
+      lastInvalid = lastInvalid ?? result
+      continue
+    }
+    // VALID → 附上实际成功 region(hint 猜错的场景,caller 用它做持久化)
+    if (result.state === 'VALID') {
+      return { ...result, region: candidateRegion }
+    }
+    // SUSPENDED / INDETERMINATE → 与 region 无关,直接短路
+    return result
+  }
+  // 所有候选都 INVALID → 密钥真的无效
+  return lastInvalid ?? {
+    state: 'INVALID',
+    reason: 'No CW data-plane region accepted this credential'
+  }
+}
+
+/**
+ * 单 region 探测 · validateApiKeyCredential 的内部实现。
+ * 决策表见 validateApiKeyCredential 头部注释。返回不带 region 字段(由外层填充)。
+ */
+async function probeApiKeyCredentialAtRegion(
+  apiKey: string,
+  region: string
+): Promise<CredentialProbeResult> {
   const account: ProxyAccount = {
     id: 'apikey-probe',
     accessToken: apiKey,
