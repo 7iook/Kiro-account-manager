@@ -87,6 +87,78 @@ function payloadBytes(payload: unknown): number {
   }
 }
 
+// ============ IPC 频次追踪(RCA 2026-08-03 UI 卡死诊断)============
+// 开关:环境变量 IPC_TRACE=1 启动,或代码里改 ipcTraceEnabled=true。
+// 输出两类日志(直接 process.stderr.write,不进 console → log store 循环):
+//   1. [IPC-TRACE] 60s 窗口 top10 通道调用次数 + 累计字节
+//   2. [IPC-TRACE][BURST] 单通道单秒 >= BURST_THRESHOLD 次 → 即时警告(每秒每通道最多告一次)
+// 用途:UI 卡死时后端日志里必有输出,秒查哪个通道被洪泛。
+const ipcTraceEnabled = process.env.IPC_TRACE === '1'
+const BURST_THRESHOLD_PER_SEC = 100
+
+interface ChannelStat {
+  count: number
+  bytes: number
+  maxBytes: number
+}
+const channelCounter = new Map<string, ChannelStat>()
+
+interface BurstWindow {
+  start: number
+  count: number
+  warned: boolean
+}
+const burstWindow = new Map<string, BurstWindow>()
+
+let ipcTraceTimer: NodeJS.Timeout | null = null
+
+function recordIpcTrace(channel: string, bytes: number): void {
+  if (!ipcTraceEnabled) return
+  // 60s 汇总
+  const st = channelCounter.get(channel) || { count: 0, bytes: 0, maxBytes: 0 }
+  st.count++
+  st.bytes += bytes
+  if (bytes > st.maxBytes) st.maxBytes = bytes
+  channelCounter.set(channel, st)
+
+  // 1s 爆发检测
+  const now = Date.now()
+  let w = burstWindow.get(channel)
+  if (!w || now - w.start >= 1000) {
+    w = { start: now, count: 0, warned: false }
+    burstWindow.set(channel, w)
+  }
+  w.count++
+  if (w.count >= BURST_THRESHOLD_PER_SEC && !w.warned) {
+    w.warned = true
+    try {
+      process.stderr.write(`[IPC-TRACE][BURST] channel=${channel} · ${w.count} calls in 1s (>= ${BURST_THRESHOLD_PER_SEC}) · payload bytes so far ~${(st.bytes / 1024).toFixed(1)}KB\n`)
+    } catch { /* ignore */ }
+  }
+}
+
+function startIpcTraceTimer(): void {
+  if (ipcTraceTimer || !ipcTraceEnabled) return
+  ipcTraceTimer = setInterval(() => {
+    if (channelCounter.size === 0) return
+    const entries = [...channelCounter.entries()].sort((a, b) => b[1].count - a[1].count)
+    const total = entries.reduce((s, [, v]) => s + v.count, 0)
+    const summary = entries.slice(0, 10).map(([c, v]) =>
+      `${c}=${v.count}(${(v.bytes / 1024).toFixed(1)}KB · max ${(v.maxBytes / 1024).toFixed(1)}KB)`
+    ).join(' · ')
+    try {
+      process.stderr.write(`[IPC-TRACE] 60s window: total=${total} · top10: ${summary}\n`)
+    } catch { /* ignore */ }
+    channelCounter.clear()
+    // 保留 burstWindow(每秒自然滚,不用清)
+  }, 60_000)
+  // 允许 Node 进程退出(不 keep process alive)
+  ipcTraceTimer.unref?.()
+  try {
+    process.stderr.write(`[IPC-TRACE] enabled · 60s top10 summary + per-channel burst warning (>= ${BURST_THRESHOLD_PER_SEC}/s)\n`)
+  } catch { /* ignore */ }
+}
+
 /**
  * 超限 payload 简化:
  *   - 若是对象,保留 SAFE_META_KEYS 里的定长短字段,其余字段折叠;
@@ -148,10 +220,19 @@ export function installIpcSizeGuard(webContents: WebContents): void {
   if (wc.__installedIpcSizeGuard) return
   wc.__installedIpcSizeGuard = true
 
+  // 首次安装时启动 IPC 频次追踪 timer(若 IPC_TRACE=1)
+  startIpcTraceTimer()
+
   const originalSend = webContents.send.bind(webContents)
   const isDev = !app.isPackaged
 
   webContents.send = (channel: string, ...args: unknown[]): void => {
+    // IPC 频次埋点(先算 bytes,便于爆发警告一起报出)
+    // 注意:所有通道都记(不只 LARGE/MEDIUM),便于发现意外通道的洪泛
+    if (ipcTraceEnabled) {
+      recordIpcTrace(channel, args.length > 0 ? payloadBytes(args[0]) : 0)
+    }
+
     // 单参数:典型情况(payload 为 args[0])
     // 多参数:直接透传第一个做判断(其余不动)
     if (args.length === 0) {
