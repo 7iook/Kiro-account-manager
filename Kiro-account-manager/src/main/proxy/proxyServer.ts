@@ -265,6 +265,24 @@ class BodyTooLargeError extends Error {
   }
 }
 
+// ============ 挂起决策调试开关(RCA 2026-08-03)============
+// 开启后在 runWithHold 每个决策分叉点(挂起 / 立即报错 / 换号 / attempt 上报错误)
+// 打印详细日志,便于「AI SUB 中途莫名中断」类问题追溯。
+//
+// 开启方式:
+//   ① 环境变量 HOLD_DEBUG=1 启动
+//   ② 运行时代码里调 setHoldDebug(true)(可接 IPC 从设置页开关)
+//
+// 默认关闭以避免生产日志噪音。
+let holdDebugEnabled = process.env.HOLD_DEBUG === '1'
+export function setHoldDebug(enabled: boolean): void {
+  holdDebugEnabled = enabled
+  console.log(`[HoldGate][DEBUG] holdDebugEnabled=${enabled}`)
+}
+export function isHoldDebug(): boolean {
+  return holdDebugEnabled
+}
+
 export class ProxyServer {
   private server: http.Server | https.Server | null = null
   private fallbackServer: http.Server | null = null  // HTTPS 启用时同时监听 HTTP（可选）
@@ -3364,12 +3382,12 @@ export class ProxyServer {
     if (stream) {
       // 先建 SSE 连接;initial chunk 由 handleOpenAIStream 惰性延迟到首字节。
       if (!this.isResponseClosed(res)) res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
-      const attempt = (acc: ProxyAccount): Promise<'done' | 'pre_body_failed'> => new Promise((resolveAttempt) => {
+      const attempt = (acc: ProxyAccount, recordError: (err: Error) => void): Promise<'done' | 'pre_body_failed'> => new Promise((resolveAttempt) => {
         const toolNameRegistry = new ToolNameRegistry()
         const kiroPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, thinkingConfig)
         this.events.onRequest?.({ path: '/v1/chat/completions', method: 'POST', accountId: acc.id })
         let settled = false
-        const onPreBodyError = (_e: Error): boolean => { if (!settled) { settled = true; resolveAttempt('pre_body_failed') } ; return true }
+        const onPreBodyError = (e: Error): boolean => { if (!settled) { settled = true; recordError(e); resolveAttempt('pre_body_failed') } ; return true }
         this.handleOpenAIStream(res, acc, kiroPayload, model, startTime, 0, undefined, true, matchedApiKey, toolNameRegistry, signal, onPreBodyError)
           .then(() => { if (!settled) { settled = true; resolveAttempt('done') } })
           .catch(() => { if (!settled) { settled = true; resolveAttempt('done') } })
@@ -3523,7 +3541,7 @@ export class ProxyServer {
 
     if (isStream) {
       if (!this.isResponseClosed(res)) res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
-      const attempt = (acc: ProxyAccount): Promise<'done' | 'pre_body_failed'> => new Promise((resolveAttempt) => {
+      const attempt = (acc: ProxyAccount, recordError: (err: Error) => void): Promise<'done' | 'pre_body_failed'> => new Promise((resolveAttempt) => {
         const toolNameRegistry = new ToolNameRegistry()
         const kiroPayload = openaiToKiro(openaiRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(model))
         this.events.onRequest?.({ path: '/v1beta', method: 'POST', accountId: acc.id })
@@ -3572,7 +3590,7 @@ export class ProxyServer {
             const susp = this.detectSuspendedError(error.message)
             if (susp) { const nm = this.accountPool.markSuspended(acc.id, susp.reason, susp.message); if (nm) this.events.onAccountSuspended?.({ accountId: acc.id, email: (acc as { email?: string }).email, reason: susp.reason, message: susp.message }) }
             // 首字节前失败 → 交给 runWithHold 切号/挂起;已吐正文 → 现状 error。
-            if (!bodyStarted) { if (!settled) { settled = true; resolveAttempt('pre_body_failed') } ; return }
+            if (!bodyStarted) { if (!settled) { settled = true; recordError(error); resolveAttempt('pre_body_failed') } ; return }
             res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
             res.end()
             if (!settled) { settled = true; resolveAttempt('done') }
@@ -3788,8 +3806,14 @@ export class ProxyServer {
     seedAccount: ProxyAccount | undefined
     /** 拿一个可用号(内部去重由 runWithHold 负责,回调只需返回池给的号或 null)。 */
     pickAccount: (triedIds: Set<string>) => Promise<ProxyAccount | null>
-    /** 用一个账号做一次完整转发。返回 'done' 或 'pre_body_failed'(可切号/挂起)。 */
-    attempt: (acc: ProxyAccount) => Promise<'done' | 'pre_body_failed'>
+    /**
+     * 用一个账号做一次完整转发。返回 'done' 或 'pre_body_failed'(可切号/挂起)。
+     *
+     * recordError:attempt 在决定返 'pre_body_failed' 前**必须调** —— 把 pre-body 错误
+     * 上报给主循环,主循环用它做「挂起 vs 立即报错」精细化决策(RCA 2026-08-03)。
+     * 遗漏调用不会崩,但会退化到"未知错误" fallback = 挂起(保守偏严侧)。
+     */
+    attempt: (acc: ProxyAccount, recordError: (err: Error) => void) => Promise<'done' | 'pre_body_failed'>
     /** 挂起态心跳(流式写 SSE ping / 注释行;非流式无通道则 no-op)。 */
     sendPing: () => void
     /** 超时收尾 - error(触及绝对 deadline 且 timeoutAction=error):按端点格式发失败信号。 */
@@ -3797,8 +3821,8 @@ export class ProxyServer {
     /** 超时收尾 - graceful_stop:按端点格式发"干净结束"信号。 */
     onTimeoutGracefulStop: () => void
     /**
-     * 不挂起放弃收尾(RCA 2026-08-02):所有号都试过、拿不到新号,但池里没有任何号
-     * 被封禁/额度耗尽(只是瞬时错误冷却)→ 不挂起,按端点格式原样报错。
+     * 不挂起放弃收尾(RCA 2026-08-02):所有号都试过、拿不到新号,但决策为 giveup
+     * (永久请求级错 / 无 pre-body 错误)→ 不挂起,按端点格式原样报错。
      * 缺省时回落 onTimeoutError(两者语义都是"发失败信号",格式一致)。
      */
     onNoHoldGiveUp?: () => void
@@ -3807,6 +3831,13 @@ export class ProxyServer {
     const onNoHoldGiveUp = opts.onNoHoldGiveUp ?? onTimeoutError
     // 本次请求已试过的账号(避免 resume/切号反复命中同一挂账号)。
     const triedIds = new Set<string>()
+    // 最近一次 pre-body 错误(attempt 通过 recordError 上报),用于挂起决策(§decideHoldAction)。
+    // 用 { current } ref 结构避开 TS「闭包外看不到写入 → 类型收窄成 never」的问题。
+    const preBodyErrorRef: { current: Error | null } = { current: null }
+    const recordError = (err: Error): void => {
+      preBodyErrorRef.current = err
+      if (holdDebugEnabled) console.log(`[HoldGate][DEBUG] attempt reported pre-body error: ${err.message?.slice(0, 200)}`)
+    }
 
     const pickFresh = async (): Promise<ProxyAccount | null> => {
       const acc = await pickAccount(triedIds)
@@ -3840,11 +3871,21 @@ export class ProxyServer {
     for (;;) {
       if (this.isResponseClosed(res)) return
       if (!acc) {
-        // 挂起门槛(RCA 2026-08-02 hold-gate-false-positive):
-        //   只有池里确有账号被封禁/额度耗尽时,挂起等换号才有意义。
-        //   若所有号只是瞬时错误退避冷却中(429/5xx),挂起 10-20 分钟纯属误伤 → 原样报错。
-        if (!this.shouldHoldForNoAccount()) {
-          console.warn('[ProxyServer] No account available but none is suspended/quota-exhausted (transient errors only) — reporting error instead of holding')
+        // 挂起决策(RCA 2026-08-03 hold-gate-fallback-cross-region · SSOT: decideHoldAction):
+        //   - 有号被封禁/额度耗尽 → 挂起
+        //   - 有 pre-body 错误但非永久请求级错(429/5xx/跨区/未知)→ 挂起等恢复
+        //   - 有永久请求级错(400 malformed / 明确密钥吊销)→ 立即报错
+        //   - 从未 attempt 过就无号可用 → 立即报错
+        const decision = this.decideHoldAction(preBodyErrorRef.current)
+        if (holdDebugEnabled) {
+          const poolBlocked = this.shouldHoldForNoAccount()
+          const errKind = preBodyErrorRef.current
+            ? (this.isAccountLevelAuthFailure(preBodyErrorRef.current) ? 'account-level-auth-failure' : 'non-account-level')
+            : 'none'
+          console.log(`[HoldGate][DEBUG] hold decision=${decision} · triedIds=${triedIds.size} · poolBlocked=${poolBlocked} · lastErrorKind=${errKind} · lastErrorMsg=${preBodyErrorRef.current?.message?.slice(0, 150) ?? 'null'}`)
+        }
+        if (decision === 'giveup') {
+          console.warn(`[ProxyServer] No account available · decision=giveup · reason=${preBodyErrorRef.current ? 'non-account-level error (429/5xx/malformed/net)' : 'no attempt made'} · errMsg=${preBodyErrorRef.current?.message?.slice(0, 200) ?? 'null'}`)
           onNoHoldGiveUp()
           this.recordRequestFailed()
           return
@@ -3856,9 +3897,11 @@ export class ProxyServer {
         continue
       }
       triedIds.add(acc.id)
-      const outcome = await attempt(acc)
+      if (holdDebugEnabled) console.log(`[HoldGate][DEBUG] attempt start · account=${acc.email || acc.id} · triedCount=${triedIds.size}`)
+      const outcome = await attempt(acc, recordError)
       if (outcome === 'done') return // 终态(成功 / 已吐正文失败 / abort)
       // 首字节前失败:先即时切下一个未试过的号,拿不到再挂起。
+      if (holdDebugEnabled) console.log(`[HoldGate][DEBUG] attempt returned pre_body_failed · trying next account`)
       acc = await pickFresh()
     }
   }
@@ -3875,13 +3918,16 @@ export class ProxyServer {
   private isSwitchWorthyError(errMsg: string): boolean {
     if (!errMsg) return false
     if (this.detectSuspendedError(errMsg)) return true
+    // 大小写不敏感匹配(RCA 2026-08-03):kiroApi 429 撞爆抛的错是 "Rate limited on ..."(R 大写),
+    // 之前用 String.includes 区分大小写 → 不命中 → 走原样报错 → 用户看到 AI SUB 莫名中断。
+    const lower = errMsg.toLowerCase()
     return (
-      errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('Auth') ||
-      errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') ||
-      errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') ||
-      errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') ||
-      errMsg.includes('rate limit') ||
-      errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504')
+      lower.includes('401') || lower.includes('403') || lower.includes('auth error') ||
+      lower.includes('402') || lower.includes('429') || lower.includes('quota') ||
+      lower.includes('throttlingexception') || lower.includes('reached the limit') ||
+      lower.includes('servicequotaexceededexception') || lower.includes('limit exceeded') ||
+      lower.includes('rate limit') || lower.includes('rate limited') ||   // 429 撞爆兜底
+      lower.includes('500') || lower.includes('502') || lower.includes('503') || lower.includes('504')
     )
   }
 
@@ -3900,6 +3946,61 @@ export class ProxyServer {
    */
   private shouldHoldForNoAccount(): boolean {
     return this.accountPool.hasBlockedAccount()
+  }
+
+  /**
+   * 上游 pre-body 错误是否属于**账号级授权失效**(该号真的不能用了,换号才是解 · 挂起等换号)。
+   *
+   * 命中 = 明确的账号级授权失败,不是瞬时错误也不是请求本身错:
+   *   - InvalidTokenException(明确密钥无效)
+   *   - UnauthorizedException(明确未授权)
+   *   - 401 + revoked/expired/invalid credentials 明确标识
+   *
+   * **不命中(默认)= 非账号级不可用** → 立即报错让客户端处理:
+   *   - 429(限流)· 5xx(上游抖动)· 网络错误 · 400 malformed · 未知错误
+   *
+   * RCA 2026-08-03 hold-gate-fallback-cross-region · 用户澄清:
+   *   「429 只需要重试就行了,不需要挂起。只有账号封禁/额度上限/账号未授权
+   *    这种账号级不可用才挂起。」
+   *   —— 挂起门闸的原始设计意图,不该被"临时错误"污染。
+   */
+  private isAccountLevelAuthFailure(err: Error | null): boolean {
+    if (!err) return false
+    const msg = err.message || ''
+    // 明确的账号级授权失败异常类型
+    if (/InvalidTokenException|UnauthorizedException/i.test(msg)) return true
+    // 401 + 明确密钥失效标识(不匹配裸 401 · 可能是别的短暂问题)
+    if (/\b401\b/.test(msg) && /revoked|expired|invalid credentials|Bad credentials/i.test(msg)) return true
+    return false
+  }
+
+  /**
+   * 挂起决策 SSOT(RCA 2026-08-03 · 用户澄清后的最终契约):
+   *
+   *   ┌────────────────────────────────────────────┬──────────┐
+   *   │ 池状态 / 最近错误                          │ 决策     │
+   *   ├────────────────────────────────────────────┼──────────┤
+   *   │ 有号被封禁/额度耗尽(hasBlockedAccount)   │ 挂起     │
+   *   │ 最近错误是账号级授权失败(InvalidToken 等) │ 挂起     │
+   *   │ 无 pre-body 错误(pool 空/seed 找不到)    │ 挂起     │
+   *   │ 429 / 5xx / 400 malformed / 网络错 / 其他  │ 立即报错 │
+   *   └────────────────────────────────────────────┴──────────┘
+   *
+   * 用户核心场景 = 挂起门闸只在**账号级真不可用**时触发:
+   *   - 账号封禁(TEMPORARILY_SUSPENDED)
+   *   - 额度上限(quotaExhausted)
+   *   - 账号未授权(密钥真无效 / 已吊销)
+   *   - **根本没号可用**(pool 空 / UI 指定的账号不在池里 / 池未同步)—— 这些都是账号问题
+   * 其他一切 —— 包括 429 撞爆 —— 都按"临时错误"报给客户端(有 attempt 错误但非账号级)。
+   *
+   * 2026-08-03 补:无 pre-body 错误 = 根本没进入 attempt 循环 = 池里没号能试。
+   * 门闸开关的用户直觉就是"没号就挂等换号",不该因为"没 attempt 过" fallback 到 giveup。
+   */
+  private decideHoldAction(lastPreBodyError: Error | null): 'hold' | 'giveup' {
+    if (this.shouldHoldForNoAccount()) return 'hold'
+    if (this.isAccountLevelAuthFailure(lastPreBodyError)) return 'hold'
+    if (!lastPreBodyError) return 'hold'  // 无 attempt = 账号问题(池空/指定号不在池)→ 挂起等换号
+    return 'giveup'  // 有 attempt 错误但非账号级(429/5xx/400/网络/未知)→ 立即报错
   }
 
   /**
@@ -3927,7 +4028,7 @@ export class ProxyServer {
     /** 超时收尾 - graceful_stop:按端点格式发"干净结束"响应。 */
     onTimeoutGracefulStop: () => void
   }): Promise<void> {
-    const attempt = async (acc: ProxyAccount): Promise<'done' | 'pre_body_failed'> => {
+    const attempt = async (acc: ProxyAccount, recordError: (err: Error) => void): Promise<'done' | 'pre_body_failed'> => {
       try {
         const { result, account: usedAccount } = await opts.doCall(acc)
         if (this.isResponseClosed(opts.res)) return 'done'
@@ -3937,7 +4038,7 @@ export class ProxyServer {
         if (this.isAbortError(error, opts.signal) || this.isResponseClosed(opts.res)) return 'done'
         const errMsg = (error as Error).message || String(error)
         // 账号级可恢复错误(callWithRetry 已把失败号记账/切号耗尽)→ 交给 runWithHold 切号或挂起。
-        if (this.isSwitchWorthyError(errMsg)) return 'pre_body_failed'
+        if (this.isSwitchWorthyError(errMsg)) { recordError(error as Error); return 'pre_body_failed' }
         // 请求本身错误(换号无用)→ 原样报错,不挂起。
         this.handleApiError(opts.res, acc, error as Error, opts.path, opts.model, opts.startTime, opts.signal)
         return 'done'
@@ -3988,7 +4089,7 @@ export class ProxyServer {
 
     // 用一个账号做一次完整流式转发。返回 'done'(终态:成功/已吐正文的失败/abort)
     // 或 'pre_body_failed'(首字节前失败,可切号或挂起)。
-    const attempt = (acc: ProxyAccount): Promise<'done' | 'pre_body_failed'> => {
+    const attempt = (acc: ProxyAccount, recordError: (err: Error) => void): Promise<'done' | 'pre_body_failed'> => {
       return new Promise<'done' | 'pre_body_failed'>((resolveAttempt) => {
         const toolNameRegistry = new ToolNameRegistry()
         const kiroPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, claudeThinkingConfig)
@@ -3999,9 +4100,9 @@ export class ProxyServer {
         const cacheUsage = promptCacheTracker.compute(acc.id, cacheProfile)
         this.events.onRequest?.({ path: '/v1/messages', method: 'POST', accountId: acc.id })
         let settled = false
-        const onPreBodyError = (_error: Error): boolean => {
+        const onPreBodyError = (error: Error): boolean => {
           // 首字节前失败:标记为可切号/挂起,接管(不发 SSE error)。
-          if (!settled) { settled = true; resolveAttempt('pre_body_failed') }
+          if (!settled) { settled = true; recordError(error); resolveAttempt('pre_body_failed') }
           return true
         }
         // headersSent=true:响应头已发;currentRound=0:message_start 由 handleClaudeStream 惰性延迟到首字节。

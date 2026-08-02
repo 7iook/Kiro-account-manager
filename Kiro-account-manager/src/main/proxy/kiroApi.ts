@@ -1800,19 +1800,26 @@ function getSortedEndpoints(
   }
 
   // V2 端点按 region 分发(eu account → EU host, us/其它 account → US host)
-  // V1 端点历史上全是 us,不按 region 过滤;eu account 若 V2 失败仍可尝试 V1 us 作最后 fallback
   const wantEuRegion = region?.startsWith('eu-')
   const v2Endpoints = KIRO_ENDPOINTS.filter(ep => {
     if (!ep.name.startsWith('KiroRuntime')) return false
     return wantEuRegion ? ep.name === 'KiroRuntime-EU' : ep.name === 'KiroRuntime-US'
   })
 
-  const v1Endpoints = KIRO_ENDPOINTS.filter(ep =>
+  // V1 端点(CodeWhisperer / AmazonQ)全部硬编码 us-east-1:
+  //   - US 账户 V2 失败可 fallback 到 V1(US token 认可 V1 us 端点,有价值)
+  //   - EU 账户 V2 失败 fallback 到 V1 us **必 403 Invalid token**(跨区认证不通),
+  //     反而消耗 errorCount 冷却时间、污染日志、误触发挂起门槛(RCA 2026-08-03
+  //     hold-gate-fallback-cross-region 现场证据:EU 账户 KiroRuntime-EU 429 撞爆
+  //     10 次 → fallback CodeWhisperer(us-east-1) → 403 → 单账号池 shouldHold=false
+  //     → 立即报错 → 用户看到 AI SUB 莫名中断)。
+  //   故 EU 账户不加 V1 fallback,让 429 撞爆直接进入上层挂起决策。
+  const v1Endpoints = wantEuRegion ? [] : KIRO_ENDPOINTS.filter(ep =>
     ep.name !== 'AmazonQCLI' && !ep.name.startsWith('KiroRuntime')
   )
 
   // V1 内部按 preferredEndpoint 排序(codewhisperer/amazonq 二选一优先)
-  if (preferredEndpoint) {
+  if (preferredEndpoint && v1Endpoints.length > 0) {
     const preferredName = preferredEndpoint === 'codewhisperer' ? 'CodeWhisperer' : 'AmazonQ'
     v1Endpoints.sort((a, b) => {
       if (a.name === preferredName) return -1

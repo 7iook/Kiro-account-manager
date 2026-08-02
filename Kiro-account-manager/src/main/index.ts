@@ -1479,9 +1479,17 @@ async function getUsageLimitsRest(
     const fallbackArn = getEnterpriseFallbackArn(ssoRegion)
     console.log(`[Kiro REST API] Legacy V1 profileArn detected, using V2 fallback: ${fallbackArn}`)
     profileArn = fallbackArn
-  } else if (!profileArn && ssoRegion?.startsWith('eu-')) {
+  } else if (!profileArn && ssoRegion?.startsWith('eu-') && authMethod !== 'api_key') {
     // EU management API 后端强制要求 profileArn(2026-07),不传直接 400 Invalid profileArn
     // 无存量时自动 fallback 到本 region V2 真实值(实测 316704942615:H3A4HCGR4WEC 在任一 EU Enterprise account 下都接受)
+    //
+    // ⚠️ 必须排除网页 API Key(ksk_)账户(RCA 2026-08-02 ksk-eu-fallback-arn):
+    //   ksk 天生无 profileArn(STANDALONE 订阅 GetProfile 返 400 = 既定 feature gate),
+    //   注入这个属于别人 AWS 账号(316704942615)的 ARN → ksk 无权使用 → 403 "Invalid token"。
+    //   受控对照(同一 ksk + management.eu-central-1 + TokenType:API_KEY,只改 profileArn 一个变量):
+    //     无 profileArn → 200 完整额度 / 带该 fallback ARN → 403。
+    //   即「EU 强制要求 profileArn」这个前提对 api_key 不成立 —— ksk 不带 ARN 就是合法请求。
+    //   与 kiroApi.resolveProfileArn 的 api_key 分支同一语义(SSOT:ksk 绝不回退占位/固定 ARN)。
     profileArn = getEnterpriseFallbackArn(ssoRegion)
     console.log(`[Kiro REST API] EU account missing profileArn, using V2 EU fallback: ${profileArn}`)
   }
@@ -1607,9 +1615,17 @@ async function getUsageAndLimits(
   if (isSocial && !profileArn) {
     profileArn = KIRO_SOCIAL_PROFILE_ARN
   }
+  // 网页 API Key(ksk_)账户:与 isSocial 相反 —— 绝不能注入任何固定/兜底 ARN。
+  // ksk 天生无 profileArn(STANDALONE 订阅 GetProfile 返 400 = 既定 feature gate),
+  // 下游 getUsageLimitsRest 的「EU 账户无 ARN → 注入 Enterprise fallback」分支若命中,
+  // 会塞一个属于别人 AWS 账号的 ARN → 403 Invalid token(RCA 2026-08-02 ksk-eu-fallback-arn)。
+  // 历史账户 authMethod 可能为 undefined(仅 provider='ApiKey' → idp='ApiKey'),
+  // 故与 isSocial 同款双判据归一化,确保 authMethod 一定以 'api_key' 传到下游。
+  const isApiKey = authMethod === 'api_key' || idp === 'ApiKey'
+  const effectiveAuthMethod = isApiKey ? 'api_key' : authMethod
   if (currentUsageApiType === 'rest') {
     // 使用 REST API (GetUsageLimits)
-    const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email, authMethod)
+    const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email, effectiveAuthMethod)
     // REST API 返回的字段名和 CBOR API 相同，直接返回
     return {
       usageBreakdownList: result.usageBreakdownList?.map(b => ({
@@ -1676,7 +1692,7 @@ async function getUsageAndLimits(
       // CBOR 401/403 时自动 fallback 到 REST API
       if (errorMsg.includes('401') || errorMsg.includes('403')) {
         console.log(`[API] CBOR API failed (${errorMsg}), falling back to REST API...`)
-        const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email, authMethod)
+        const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email, effectiveAuthMethod)
         return {
           usageBreakdownList: result.usageBreakdownList?.map(b => ({
             resourceType: b.resourceType || b.type,

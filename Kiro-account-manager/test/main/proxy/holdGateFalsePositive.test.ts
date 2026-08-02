@@ -232,7 +232,9 @@ describe('HoldGate 误伤防护(端到端 · 单账号模式)', () => {
     server.releaseHeldRequests()
   })
 
-  it('🔴 瞬时上游 502(池内无号封禁/额度耗尽)→ 不挂起,原样报错', async () => {
+  it('🔴 瞬时上游 502 → 立即报错(临时错误挂起门闸不管这个 · 用户明说)', async () => {
+    // 用户澄清(RCA 2026-08-03):「429 只需要重试就行了,不需要挂起。只有账号封禁/
+    //   额度上限/账号未授权这种账号级不可用才挂起。」502 同理,归入临时错误。
     const server = mkSingleAccountServer()
     mockPreBodyError('Kiro API error 502: Bad Gateway')
 
