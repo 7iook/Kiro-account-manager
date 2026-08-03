@@ -39,6 +39,12 @@ import { installIpcSizeGuard } from './utils/emitToRenderer'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
+  applyAccountDataMutation,
+  setStoreRef as setAccountStoreRef,
+  setLastSavedDataSetter as setAccountLastSavedSetter,
+  type AccountsBlob
+} from './accountService/state'
+import {
   createTray,
   destroyTray,
   updateTrayMenu,
@@ -1790,7 +1796,10 @@ async function initStore(): Promise<void> {
         const backupData = await readSecureBackup(path.dirname(storeInstance.path)) as { accounts?: unknown } | null
         if (backupData && backupData.accounts) {
           console.log('[Store] Restoring data from backup...')
-          storeInstance.set('accountData', backupData)
+          // initStore bootstrap 阶段:store 引用尚未注入 accountService/state,
+          // 无法走 applyAccountDataMutation。保持直写,但显式初始化 revision=0,
+          // 让后续第一次 applyAccountDataMutation 从 1 起递增（保证乐观锁语义完整）。
+          storeInstance.set('accountData', { ...(backupData as Record<string, unknown>), revision: 0 })
           console.log('[Store] Data restored from backup successfully')
         }
       } catch {
@@ -1816,6 +1825,11 @@ async function initStore(): Promise<void> {
   } catch (e) {
     console.warn('[ProactiveRenewal] Failed to load setting:', e)
   }
+
+  // 注入 store 引用给 accountService/state（applyAccountDataMutation 收口函数需要）
+  // 决策卡 §1 不变量 2:所有 accountData 写入必须过 revision 仲裁
+  setAccountStoreRef(store!)
+  setAccountLastSavedSetter((data) => { lastSavedData = data })
 }
 
 // ============ Kiro IDE Auth Token 反向同步 ============
@@ -1942,7 +1956,8 @@ async function syncIdeTokenChangeToStore(token: {
     expiresAt: Date.parse(token.expiresAt) || Date.now() + 3600 * 1000
   }
 
-  store!.set('accountData', accountData)
+  // 走收口:main 侧自动同步是权威源,不传 expectedRevision（无仲裁直写 + 递增 revision）
+  await applyAccountDataMutation(() => accountData as unknown as AccountsBlob)
   console.log(
     `[KiroAuthSync] Synced IDE-refreshed token back to account ${accountToUpdate.email || matchedId} (${matchedReason})`
   )
@@ -2079,7 +2094,7 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
     console.warn('[ProactiveRenewal] Failed to write IDE token file (will still try store sync):', e)
   }
 
-  // 2. 写 store（同步反代/UI）
+  // 2. 写 store（同步反代/UI）· 走收口:main 侧自动续期是权威源,不传 expectedRevision
   if (store) {
     account.credentials = {
       ...creds,
@@ -2087,7 +2102,7 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
       refreshToken: newRefresh,
       expiresAt: newExpiresAt
     }
-    store.set('accountData', accountData)
+    await applyAccountDataMutation(() => accountData as unknown as AccountsBlob)
   }
 
   // 3. 通知 renderer reload
@@ -2760,11 +2775,13 @@ function createWindow(): void {
       // closeAction === 'quit' 时继续关闭流程
     }
 
-    // 窗口关闭前保存数据（同步保存，不等待备份）
+    // 窗口关闭前保存数据（同步保存，不等待备份）· 走收口
     if (lastSavedData && store) {
       try {
         console.log('[Window] Saving data before close...')
-        store.set('accountData', lastSavedData)
+        // 关窗 flush 语义:把内存里的 lastSavedData 落盘。走收口保持 revision 单调递增,
+        // main 侧是权威源,不传 expectedRevision。收口会在 mutator 返回值上 +1 revision。
+        void applyAccountDataMutation(() => lastSavedData as AccountsBlob)
         // 备份异步进行，不阻塞关闭
         createBackup(lastSavedData).then(() => {
           console.log('[Window] Backup created')
@@ -3517,11 +3534,15 @@ app.whenReady().then(async () => {
   ipcMain.handle('save-accounts', async (_event, data) => {
     try {
       await initStore()
-      store!.set('accountData', data)
-      
-      // 保存最后的数据（用于崩溃恢复）
+      // 走收口:本轮 T7 尚未落地,renderer 未传 expectedRevision → 降级为无仲裁直写。
+      // 收口内部会把 revision +1 写回,为 T7/T8（renderer 拿 revision + 广播）打基础。
+      // 契约签名保持不变（返回 void）,T7 落地时再改为 { ok, code, revision }。
+      await applyAccountDataMutation(() => data as AccountsBlob)
+
+      // 保存最后的数据（用于崩溃恢复）· lastSavedData 由收口内部同步（setLastSavedDataSetter）
+      // 这里保留显式赋值以保证语义与老代码一致（防收口未注入时也能兜底,虽然理论上装配完成才会走到这里）
       lastSavedData = data
-      
+
       // 每次保存时也创建备份
       await createBackup(data)
     } catch (error) {
@@ -7771,12 +7792,12 @@ app.whenReady().then(async () => {
   // IPC: 手动解除账号封禁标记（用户确认账号已恢复后调用）
   // 1) 清除反代池中的 suspended 状态
   // 2) 同步清除 store.accountData[id].lastError，状态回到 active
-  ipcMain.handle('proxy-clear-account-suspended', (_event, accountId: string) => {
+  ipcMain.handle('proxy-clear-account-suspended', async (_event, accountId: string) => {
     try {
       if (proxyServer) {
         proxyServer.getAccountPool().clearSuspended(accountId)
       }
-      // 持久化清除 lastError
+      // 持久化清除 lastError · 走收口
       if (store) {
         const accountData = store.get('accountData') as { accounts?: Record<string, Record<string, unknown>> } | undefined
         if (accountData?.accounts?.[accountId]) {
@@ -7787,7 +7808,9 @@ app.whenReady().then(async () => {
             lastError: undefined,
             lastCheckedAt: Date.now()
           }
-          store.set('accountData', accountData)
+          // main 侧清封禁标记是权威操作,不传 expectedRevision
+          await applyAccountDataMutation(() => accountData as unknown as AccountsBlob)
+          // lastSavedData 由收口内部同步,此处保留显式赋值兼容老语义
           lastSavedData = accountData
         }
       }
@@ -8486,7 +8509,8 @@ app.on('will-quit', async (event) => {
       console.log('[Exit] Saving data before quit...')
       // 刷新待写入的防抖数据
       flushStoreWrites()
-      store.set('accountData', lastSavedData)
+      // 退出前 flush 语义:走收口保持 revision 单调递增。main 侧退出流程是权威源,不传 expectedRevision。
+      await applyAccountDataMutation(() => lastSavedData as AccountsBlob)
       // 退出场景跳过节流，确保备份立即落盘
       await createBackup(lastSavedData)
       await flushBackupNow()
