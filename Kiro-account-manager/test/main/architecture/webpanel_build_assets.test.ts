@@ -22,7 +22,7 @@
  * `dist/win-unpacked/resources/app.asar` 能证明。本轮已实测（见任务报告），
  * 但那不适合放进单测。L3 是它在单测层的**弱替身**，不是等价物。
  */
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { describe, it, expect } from 'vitest'
 import {
@@ -77,6 +77,47 @@ describe('webPanel 构建产物（L1/L2 · 需已 build）', () => {
         new RegExp(`^${WEB_PANEL_URL_PREFIX}`)
       )
     }
+  })
+
+  it.skipIf(!built)('产物不得旧于面板源码（改了 src/webPanel 必须重跑 build:webpanel）', () => {
+    // 治的是一个已经踩了**两次**的坑（2026-08-05，两个不同的人各一次）：
+    // 面板是独立 Vite 产物，服务端直接托管 `out/webPanel/` —— 改了 `src/webPanel/`
+    // 却不重建，手机端刷新也拿不到修复，而且现象是「源码看着完全对、行为就是不对」，
+    // 排查时极容易往错方向找（实测：一次花了一轮诊断才发现是产物陈旧）。
+    // 上面三条 L1 只能证明「产物存在且自洽」，它们对「产物比源码旧」完全失明。
+    //
+    // 判据用入口 HTML 的 mtime（每次 build 必重写）vs `src/webPanel/**` 的最新 mtime。
+    // 已知 tradeoff：`git checkout` 会把源码 mtime 刷成当前时间而 `out/` 是 ignored
+    // 不被触碰，所以切完分支可能要重 build 一次。这个噪音是故意接受的 ——
+    // 换来的是「改完没 build 当场被拓住」，而后者的代价是用户报障 + 一轮误导排查。
+    const SRC_ROOT = resolve(REPO_ROOT, 'src', 'webPanel')
+
+    const newestMtime = (dir: string): { ms: number; file: string } => {
+      let best = { ms: 0, file: '' }
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name)
+        if (entry.isDirectory()) {
+          const sub = newestMtime(full)
+          if (sub.ms > best.ms) best = sub
+        } else {
+          const ms = statSync(full).mtimeMs
+          if (ms > best.ms) best = { ms, file: full }
+        }
+      }
+      return best
+    }
+
+    const newest = newestMtime(SRC_ROOT)
+    const builtAt = statSync(BUILT_ENTRY).mtimeMs
+
+    expect(
+      builtAt,
+      `面板产物旧于源码 —— 手机端拿到的仍是旧代码。\n` +
+        `  最新源码: ${newest.file}\n` +
+        `           ${new Date(newest.ms).toISOString()}\n` +
+        `  产物构建: ${new Date(builtAt).toISOString()}\n` +
+        `  修法: npm run build:webpanel`
+    ).toBeGreaterThanOrEqual(newest.ms)
   })
 
   it.skipIf(!built)('运行时解析器指向的就是真实产物目录(dev 姿态)', () => {
