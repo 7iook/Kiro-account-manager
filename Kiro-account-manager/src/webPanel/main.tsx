@@ -1,31 +1,27 @@
 /**
- * 局域网 Web 面板浏览器端入口 —— **占位实现,待 W6 UI 包替换**。
+ * 局域网 Web 面板浏览器端入口。
  *
- * 本文件当前唯一职责:让构建管线(HTML entry → tsx → React → tailwind → out/webPanel/)
- * 端到端可验证。渲染一个可被断言识别的标记(见 WEBPANEL_BUILD_MARKER),
- * 打包产物校验测试靠它确认 bundle 真的被构建进去了。
- *
- * 替换本文件时请保留:
- *   - 挂载点 id `webpanel-root`(index.html 中定义)
- *   - `./styles.css` 的导入(tailwind entry)
+ * 挂载点 id `webpanel-root`（`index.html` 中定义）与 `./styles.css` 的导入
+ * 都必须保留 —— 前者是 HTML 契约，后者是 tailwind entry。
  */
 import { createRoot } from 'react-dom/client'
 import './styles.css'
+import { App } from './App'
 
-/** 打包产物校验测试据此断言 bundle 真实存在,勿随意改动字面量。 */
+/**
+ * 打包产物校验测试据此断言 bundle 真实存在，勿改动字面量。
+ *
+ * 占位页被真实 UI 替换后仍保留它：`test/main/architecture/webpanel_build_assets.test.ts`
+ * 校验的是「入口 HTML 引用的 JS/CSS 真的在盘上」，而这个常量是 bundle 内容里
+ * 唯一一个稳定可 grep 的锚点 —— 若哪天需要断言「产物里确有面板代码而非空 chunk」，
+ * 靠的就是它。导出而非内联，避免被 tree-shaking 判成死代码删掉。
+ */
 export const WEBPANEL_BUILD_MARKER = 'kiro-webpanel-bundle-ok'
-
-function PlaceholderApp(): React.JSX.Element {
-  return (
-    <div className="p-6 font-sans text-sm">
-      <h1 className="text-lg font-semibold">Kiro 账号管理 · 局域网面板</h1>
-      <p data-testid="webpanel-placeholder">{WEBPANEL_BUILD_MARKER}</p>
-      <p>构建管线占位页,UI 实现由 W6 提供。</p>
-    </div>
-  )
-}
 
 const container = document.getElementById('webpanel-root')
 if (container) {
-  createRoot(container).render(<PlaceholderApp />)
+  // 标记写进挂载点的 data 属性：既保证常量被真实引用（不被 tree-shake），
+  // 又不在界面上显示一串对用户无意义的字符。
+  container.dataset.webpanelBuild = WEBPANEL_BUILD_MARKER
+  createRoot(container).render(<App />)
 }
