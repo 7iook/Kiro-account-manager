@@ -1,9 +1,10 @@
-import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
+﻿import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
 import { join, resolve } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { writeFile, readFile } from 'fs/promises'
+import { homedir as nodeHomedir } from 'node:os'
 import { encode, decode } from 'cbor-x'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import icon from '../../resources/icon.png?asset'
@@ -16,9 +17,13 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setTokenRefreshCallbackForModelFetch, setAccountModelSyncCallback, setRateLimitRetryConfig, setAgentMode, KNOWN_SSO_OIDC_REGIONS, resolveApiKeyProfileArnIfEligible, validateApiKeyCredential, isKiroApiDebug, type KiroProfile } from './proxy/kiroApi'
-import { sha256Fingerprint } from './utils/tokenFingerprint'
+// 说明:resolveApiKeyProfileArnIfEligible / validateApiKeyCredential / sha256Fingerprint /
+// resolveProfileArnForVerify 的消费点已随 verify-api-key / compute-token-fingerprint /
+// verify-account-credentials 剥离到 accountService/verify.ts(W2),本文件不再直接引用。
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setTokenRefreshCallbackForModelFetch, setAccountModelSyncCallback, setRateLimitRetryConfig, setAgentMode, KNOWN_SSO_OIDC_REGIONS, isKiroApiDebug, type KiroProfile } from './proxy/kiroApi'
 // 账号业务函数(IPC 与将来的 web 面板 HTTP 共用同一实现;业务层不依赖 preload / IpcMainInvokeEvent)
+// 两个 deps 接口的分工见 accountService/types.ts:AccountStoreDeps 注释 ——
+// 前者模块级即可装配,后者要等 app.whenReady 后 proxyServer / mainWindow / api 就位。
 import type { AccountRuntimeDeps } from './accountService/types'
 import { refreshAccountToken } from './accountService/refresh'
 import {
@@ -29,7 +34,7 @@ import {
 // 用量/订阅解析 SSOT(原先在本文件内联三份,分歧见 parseUsage.ts 头部注释)
 import { parseCreditUsage, parseSubscription } from './accountService/parseUsage'
 import type { VerifyApiKeyResult } from '../shared/types/credential'
-import { resolveProfileArnForVerify, buildCompleteLoginResult } from './proxy/profile-selection'
+import { buildCompleteLoginResult } from './proxy/profile-selection'
 import {
   writeKiroAuthTokenFile,
   readKiroAuthTokenFile,
@@ -75,6 +80,22 @@ import {
   setAccountOverage
 } from './accountService/subscription'
 import { exportToFile, importFromFile } from './accountService/transfer'
+// 账号读写 / 凭证验证（W2 剥离 · 同一 barrel 出口）
+import {
+  loadAccounts as svcLoadAccounts,
+  saveAccounts as svcSaveAccounts,
+  getLocalActiveAccount as svcGetLocalActiveAccount,
+  loadKiroCredentials as svcLoadKiroCredentials,
+  computeTokenFingerprint as svcComputeTokenFingerprint,
+  verifyApiKey as svcVerifyApiKey,
+  importFromSsoToken as svcImportFromSsoToken,
+  verifyAccountCredentials as svcVerifyAccountCredentials,
+  type AccountStoreDeps,
+  type AccountStoreRef,
+  type CredentialFsDeps,
+  type VerifyApiDeps,
+  type VerifyCredentialsInput
+} from './accountService'
 import {
   createTray,
   destroyTray,
@@ -1804,6 +1825,54 @@ let store: {
 
 // 最后保存的数据（用于崩溃恢复）
 let lastSavedData: unknown = null
+
+// ============ accountService 依赖装配 ============
+//
+// 剥离到 src/main/accountService/ 的业务函数不再闭包引用本文件的模块级变量，
+// 而是通过下面两个 deps 对象显式接收。web 面板（HTTP 通道）复用同一对象。
+//
+// ⚠️ store 用 getter 而非直接传值：`store` 是惰性初始化的（initStore 跑完才有值），
+// 而 handler 注册发生在 app.whenReady 内、首次 initStore 之前 —— 直接传值会永久捕获 null。
+const accountDeps: AccountStoreDeps = {
+  getStore: (): AccountStoreRef => {
+    if (!store) {
+      // 装配次序 bug（initStore 未先跑）→ 抛错让上层立刻看见，不静默 no-op
+      throw new Error('[accountService] store not initialized. Call initStore() first.')
+    }
+    return store
+  },
+  ensureStore: () => initStore(),
+  createBackup: (data: unknown) => createBackup(data),
+  setLastSavedData: (data: unknown) => {
+    lastSavedData = data
+  }
+}
+
+// 本机凭证读取的磁盘副作用注入点（~/.aws/sso/cache）。
+// 原 handler 内是 `await import('os'|'fs/promises')` 动态导入，这里收口成一处装配。
+// homedir 保持同步签名（业务函数用它拼路径），故用 node:os 的静态命名空间导入方式：
+// 本文件其余位置沿用动态 import('os') 的历史风格，此处不改动它们。
+const credentialFsDeps: CredentialFsDeps = {
+  homedir: () => nodeHomedir(),
+  readTextFile: (p: string) => readFile(p, 'utf-8'),
+  readDir: async (p: string) => {
+    const fsp = await import('fs/promises')
+    return fsp.readdir(p)
+  }
+}
+
+// 验证/导入路径依赖的 Kiro API 函数。它们是本文件的模块级私有函数
+// （闭包引用 currentUsageApiType / inFlightRefreshByToken 等模块级可变状态），
+// 故以函数引用注入，而不是搬移实现（搬移会与并行修改这些函数的工作撞车）。
+const verifyApiDeps: VerifyApiDeps = {
+  ssoDeviceAuth: (bearerToken, region) => ssoDeviceAuth(bearerToken, region),
+  getUserInfo: (accessToken, idp, accountMachineId, email) =>
+    getUserInfo(accessToken, idp, accountMachineId, email),
+  getUsageAndLimits: (accessToken, idp, profileArn, accountMachineId, ssoRegion, email, authMethod) =>
+    getUsageAndLimits(accessToken, idp, profileArn, accountMachineId, ssoRegion, email, authMethod),
+  refreshTokenByMethod: (token, clientId, clientSecret, region, authMethod, proxyUrl, externalIdp) =>
+    refreshTokenByMethod(token, clientId, clientSecret, region, authMethod, proxyUrl, externalIdp)
+}
 
 async function initStore(): Promise<void> {
   if (store) return
@@ -3566,49 +3635,18 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 加载账号数据
-  ipcMain.handle('load-accounts', async () => {
-    try {
-      await initStore()
-      return store!.get('accountData', null)
-    } catch (error) {
-      console.error('Failed to load accounts:', error)
-      return null
-    }
-  })
+  // 实现在 accountService/accounts.ts（IPC 与 web 面板共用）
+  ipcMain.handle('load-accounts', async () => svcLoadAccounts(accountDeps))
 
   // IPC: 保存账号数据
   // 返回契约（T7 升级）:
   //   成功 → { ok: true, revision: number }
   //   过期 → { ok: false, code: 'STALE_REVISION', currentRevision: number }
   // 客户端未传 expectedRevision 时降级为无仲裁直写（向后兼容,同 W1 骨架语义）,仍返回 { ok: true, revision }。
-  ipcMain.handle('save-accounts', async (_event, data: { expectedRevision?: number; originId?: string; [k: string]: unknown }) => {
-    try {
-      await initStore()
-      // 从 payload 里剥离仲裁参数（expectedRevision / originId 不入盘）;其余整表作为 mutator 返回值
-      const { expectedRevision, originId, ...blob } = data ?? {}
-      const result = await applyAccountDataMutation(() => blob as AccountsBlob, {
-        ...(typeof expectedRevision === 'number' ? { expectedRevision } : {}),
-        ...(typeof originId === 'string' ? { originId } : {})
-      })
-
-      // 保存最后的数据（用于崩溃恢复）· lastSavedData 由收口内部同步（setLastSavedDataSetter）,
-      // 这里的显式赋值仅在装配未完成 / 未来 STALE 分支不进 setter 时兜底。
-      // 说明:M1 评审指出这行冗余,当前保留是为了不改动"handler 里 lastSavedData=data"的历史信号语义
-      // （避免装配次序 bug 时 lastSavedData 永远为 null）。收口成功时 setter 已把 toPersist（带新 revision）
-      // 覆盖过了,这里的 data（无 revision）会瞬间被覆盖,不影响功能。
-      if (result.ok) {
-        lastSavedData = blob
-
-        // 每次保存时也创建备份（仅在成功写入后,STALE 时不备份陈旧快照）
-        await createBackup(blob)
-      }
-
-      return result
-    } catch (error) {
-      console.error('Failed to save accounts:', error)
-      throw error
-    }
-  })
+  // 实现在 accountService/accounts.ts（IPC 与 web 面板共用）
+  ipcMain.handle('save-accounts', async (_event, data: { expectedRevision?: number; originId?: string; [k: string]: unknown }) =>
+    svcSaveAccounts(accountDeps, data)
+  )
 
   // ============ accountService 依赖装配 ============
   // 账号业务逻辑已抽到 src/main/accountService/(IPC 与将来的 web 面板 HTTP 共用同一实现)。
@@ -3711,153 +3749,10 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 从 SSO Token 导入账号 (x-amz-sso_authn)
-  ipcMain.handle('import-from-sso-token', async (_event, bearerToken: string, region: string = 'us-east-1') => {
-    console.log('[IPC] import-from-sso-token called')
-    
-    try {
-      // 执行 SSO 设备授权流程
-      const ssoResult = await ssoDeviceAuth(bearerToken, region)
-      
-      if (!ssoResult.success || !ssoResult.accessToken) {
-        return { success: false, error: { message: ssoResult.error || 'SSO 授权失败' } }
-      }
-
-      // 并行获取用户信息和使用量
-      interface UsageBreakdownItem {
-        resourceType?: string
-        currentUsage?: number
-        currentUsageWithPrecision?: number
-        usageLimit?: number
-        usageLimitWithPrecision?: number
-        displayName?: string
-        displayNamePlural?: string
-        currency?: string
-        unit?: string
-        overageRate?: number
-        overageCap?: number
-        freeTrialInfo?: { currentUsage?: number; currentUsageWithPrecision?: number; usageLimit?: number; usageLimitWithPrecision?: number; freeTrialExpiry?: string; freeTrialStatus?: string }
-        bonuses?: Array<{ bonusCode?: string; displayName?: string; currentUsage?: number; currentUsageWithPrecision?: number; usageLimit?: number; usageLimitWithPrecision?: number; expiresAt?: string }>
-      }
-      interface UsageApiResponse {
-        userInfo?: { email?: string; userId?: string }
-        subscriptionInfo?: { type?: string; subscriptionTitle?: string; upgradeCapability?: string; overageCapability?: string; subscriptionManagementTarget?: string }
-        usageBreakdownList?: UsageBreakdownItem[]
-        nextDateReset?: string
-        overageConfiguration?: { overageEnabled?: boolean; overageStatus?: string }
-      }
-
-      let userInfo: UserInfoResponse | undefined
-      let usageData: UsageApiResponse | undefined
-
-      try {
-        console.log('[SSO] Fetching user info and usage data...')
-        const [userInfoResult, usageResult] = await Promise.all([
-          getUserInfo(ssoResult.accessToken).catch(e => { console.error('[SSO] getUserInfo failed:', e); return undefined }),
-          getUsageAndLimits(ssoResult.accessToken, 'BuilderId', undefined, undefined, region).catch(e => { console.error('[SSO] getUsageAndLimits failed:', e); return undefined })
-        ])
-        userInfo = userInfoResult
-        usageData = usageResult
-        console.log('[SSO] userInfo:', userInfo?.email)
-        console.log('[SSO] usageData:', usageData?.subscriptionInfo?.subscriptionTitle)
-      } catch (e) {
-        console.error('[IPC] API calls failed:', e)
-      }
-
-      // 解析使用量数据
-      const creditUsage = usageData?.usageBreakdownList?.find(b => b.resourceType === 'CREDIT')
-      const subscriptionTitle = usageData?.subscriptionInfo?.subscriptionTitle || 'KIRO'
-      
-      // 规范化订阅类型（注意检查顺序：先检查更具体的类型）
-      let subscriptionType = 'Free'
-      const titleUpper = subscriptionTitle.toUpperCase()
-      if (titleUpper.includes('PRO+') || titleUpper.includes('PRO_PLUS') || titleUpper.includes('PROPLUS')) {
-        subscriptionType = 'Pro_Plus'
-      } else if (titleUpper.includes('POWER')) {
-        subscriptionType = 'Enterprise'
-      } else if (titleUpper.includes('PRO')) {
-        subscriptionType = 'Pro'
-      } else if (titleUpper.includes('ENTERPRISE')) {
-        subscriptionType = 'Enterprise'
-      } else if (titleUpper.includes('TEAMS')) {
-        subscriptionType = 'Teams'
-      }
-
-      // 基础额度（使用精确小数）
-      const baseLimit = creditUsage?.usageLimitWithPrecision ?? creditUsage?.usageLimit ?? 0
-      const baseCurrent = creditUsage?.currentUsageWithPrecision ?? creditUsage?.currentUsage ?? 0
-
-      // 试用额度（使用精确小数）
-      let freeTrialLimit = 0, freeTrialCurrent = 0, freeTrialExpiry: string | undefined
-      if (creditUsage?.freeTrialInfo?.freeTrialStatus === 'ACTIVE') {
-        freeTrialLimit = creditUsage.freeTrialInfo.usageLimitWithPrecision ?? creditUsage.freeTrialInfo.usageLimit ?? 0
-        freeTrialCurrent = creditUsage.freeTrialInfo.currentUsageWithPrecision ?? creditUsage.freeTrialInfo.currentUsage ?? 0
-        freeTrialExpiry = creditUsage.freeTrialInfo.freeTrialExpiry
-      }
-
-      // 奖励额度（使用精确小数）
-      const bonuses = (creditUsage?.bonuses || []).map(b => ({
-        code: b.bonusCode || '',
-        name: b.displayName || '',
-        current: b.currentUsageWithPrecision ?? b.currentUsage ?? 0,
-        limit: b.usageLimitWithPrecision ?? b.usageLimit ?? 0,
-        expiresAt: b.expiresAt
-      }))
-
-      const totalLimit = baseLimit + freeTrialLimit + bonuses.reduce((s, b) => s + b.limit, 0)
-      const totalCurrent = baseCurrent + freeTrialCurrent + bonuses.reduce((s, b) => s + b.current, 0)
-
-      return {
-        success: true,
-        data: {
-          accessToken: ssoResult.accessToken,
-          refreshToken: ssoResult.refreshToken,
-          clientId: ssoResult.clientId,
-          clientSecret: ssoResult.clientSecret,
-          region: ssoResult.region,
-          expiresIn: ssoResult.expiresIn,
-          email: usageData?.userInfo?.email || userInfo?.email,
-          userId: usageData?.userInfo?.userId || userInfo?.userId,
-          idp: userInfo?.idp || 'BuilderId',
-          status: userInfo?.status,
-          subscriptionType,
-          subscriptionTitle,
-          subscription: {
-            managementTarget: usageData?.subscriptionInfo?.subscriptionManagementTarget,
-            upgradeCapability: usageData?.subscriptionInfo?.upgradeCapability,
-            overageCapability: usageData?.subscriptionInfo?.overageCapability
-          },
-          usage: {
-            current: totalCurrent,
-            limit: totalLimit,
-            baseLimit,
-            baseCurrent,
-            freeTrialLimit,
-            freeTrialCurrent,
-            freeTrialExpiry,
-            bonuses,
-            nextResetDate: usageData?.nextDateReset,
-            resourceDetail: creditUsage ? {
-              displayName: creditUsage.displayName,
-              displayNamePlural: creditUsage.displayNamePlural,
-              resourceType: creditUsage.resourceType,
-              currency: creditUsage.currency,
-              unit: creditUsage.unit,
-              overageRate: creditUsage.overageRate,
-              overageCap: creditUsage.overageCap,
-              overageEnabled: usageData?.overageConfiguration?.overageStatus === 'ENABLED' || usageData?.overageConfiguration?.overageEnabled === true
-            } : undefined
-          },
-          daysRemaining: usageData?.nextDateReset ? Math.max(0, Math.ceil((new Date(usageData.nextDateReset).getTime() - Date.now()) / 86400000)) : undefined
-        }
-      }
-    } catch (error) {
-      console.error('[IPC] import-from-sso-token error:', error)
-      return {
-        success: false,
-        error: { message: error instanceof Error ? error.message : 'Unknown error' }
-      }
-    }
-  })
+  // 实现在 accountService/verify.ts（IPC 与 web 面板共用）
+  ipcMain.handle('import-from-sso-token', async (_event, bearerToken: string, region: string = 'us-east-1') =>
+    svcImportFromSsoToken(verifyApiDeps, bearerToken, region)
+  )
 
   // IPC: 检查账号状态（用量/订阅/封禁）—— 用户日常的"刷新额度"
   ipcMain.handle('check-account-status', async (_event, account) =>
@@ -4238,495 +4133,32 @@ app.whenReady().then(async () => {
     })
   })
 
-  // IPC: 验证网页 API Key(ksk_)凭据有效性 + 附赠尝试解析 profileArn(§6 Surgical Fix · RCA A2-R3 责任拆分)
-  //   Step 1: validateApiKeyCredential(GetUsageLimits) → state ∈ {VALID, INVALID, SUSPENDED, INDETERMINATE}
-  //   Step 2: state=VALID 且非 STANDALONE 类订阅 → resolveApiKeyProfileArn 附赠拿元数据(拿不到不改 state)
-  // 契约(SSOT):@shared/types/credential.ts VerifyApiKeyResult
-  //   renderer 唯一分类字段是 state · success 只作辅助
-  ipcMain.handle('verify-api-key', async (_event, params: { apiKey: string; region?: string }): Promise<VerifyApiKeyResult> => {
-    const apiKey = (params?.apiKey || '').trim()
-    const region = params?.region || 'us-east-1'
-    console.log('[IPC] verify-api-key called')
-    if (!apiKey.startsWith('ksk_')) {
-      return {
-        state: 'INVALID',
-        success: false,
-        error: 'API Key 格式错误：应以 ksk_ 开头'
-      }
-    }
-    try {
-      // Step 1: 凭据有效性判定(唯一决策入口)
-      const probe = await validateApiKeyCredential(apiKey, region)
-
-      if (probe.state !== 'VALID') {
-        // state=INVALID / SUSPENDED / INDETERMINATE:一律不入池,给 renderer 展示原因
-        const reasonMap: Record<'INVALID' | 'SUSPENDED' | 'INDETERMINATE', string> = {
-          INVALID: '密钥无效或已吊销',
-          SUSPENDED: '账号已被 Kiro 暂停',
-          INDETERMINATE: '暂时无法验证，请稍后重新提交该密钥'
-        }
-        const humanReason = reasonMap[probe.state as 'INVALID' | 'SUSPENDED' | 'INDETERMINATE']
-        return {
-          state: probe.state,
-          success: false,
-          subscription: probe.subscription, // SUSPENDED 时后端可能仍返 type 供日志诊断
-          reason: probe.reason,
-          httpStatus: probe.httpStatus,
-          error: probe.reason ? `${humanReason}（${probe.reason}）` : humanReason
-        }
-      }
-
-      // Step 2: VALID 态 · 附赠尝试拿 profileArn(不改变 state · 失败静默)
-      // probe.region 是 validateApiKeyCredential 跨区探测实际命中的 region(hint 猜错时会翻转),
-      // Step2 GetProfile 必须用该 region,否则同样打错端点空转。
-      const effectiveRegion = probe.region || region
-      const subscriptionType = probe.subscription?.type
-      const profile = await resolveApiKeyProfileArnIfEligible(apiKey, effectiveRegion, subscriptionType)
-
-      const dataPlaneRegion = profile
-        ? (parseRegionFromProfileArn(profile.profileArn) || effectiveRegion)
-        : effectiveRegion
-
-      return {
-        state: 'VALID',
-        success: true,
-        subscription: probe.subscription,
-        tokenFingerprint: probe.tokenFingerprint,
-        httpStatus: probe.httpStatus,
-        profileArn: profile?.profileArn,
-        profileName: profile?.profileName,
-        profileType: profile?.profileType,
-        region: dataPlaneRegion
-      }
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error)
-      console.error('[IPC] verify-api-key unexpected error:', msg)
-      // 未预期的异常 → 归 INDETERMINATE(避免把偶发错误误判成 INVALID)
-      return {
-        state: 'INDETERMINATE',
-        success: false,
-        error: `API Key 校验失败（内部错误）：${msg}`
-      }
-    }
-  })
+  // IPC: 验证网页 API Key(ksk_)凭据有效性 + 附赠尝试解析 profileArn
+  //   实现在 accountService/verify.ts（IPC 与 web 面板共用）
+  //   契约(SSOT):@shared/types/credential.ts VerifyApiKeyResult —— renderer 唯一分类字段是 state · success 只作辅助
+  ipcMain.handle('verify-api-key', async (_event, params: { apiKey: string; region?: string }): Promise<VerifyApiKeyResult> =>
+    svcVerifyApiKey(params)
+  )
 
   // IPC: 计算 accessToken 的 sha256 hex 指纹(前 16 位) · 用于老账号 tokenFingerprint 补齐迁移
-  //   §6 Minimal Files #10 · RCA A2-R5 IPC 通道注册
-  ipcMain.handle('compute-token-fingerprint', async (_event, accessToken: string): Promise<string> => {
-    if (typeof accessToken !== 'string' || accessToken.length === 0) {
-      throw new Error('compute-token-fingerprint: accessToken must be a non-empty string')
-    }
-    return sha256Fingerprint(accessToken)
-  })
+  //   实现在 accountService/verify.ts（IPC 与 web 面板共用）
+  ipcMain.handle('compute-token-fingerprint', async (_event, accessToken: string): Promise<string> =>
+    svcComputeTokenFingerprint(accessToken)
+  )
 
   // IPC: 验证凭证并获取账号信息（用于添加账号）
-  ipcMain.handle('verify-account-credentials', async (_event, credentials: {
-    refreshToken: string
-    clientId: string
-    clientSecret: string
-    region?: string
-    authMethod?: string
-    provider?: string  // 'BuilderId', 'Github', 'Google' 等
-    accessToken?: string
-    tokenEndpoint?: string
-    issuerUrl?: string
-    scopes?: string
-    profileArn?: string
-  }) => {
-    console.log('[IPC] verify-account-credentials called')
-    
-    try {
-      const { refreshToken, clientId, clientSecret, region = 'us-east-1', authMethod, provider, tokenEndpoint, scopes } = credentials
-      // 确定 idp：社交登录使用 provider，IdC 也需要根据 provider 区分 BuilderId 和 Enterprise
-      // 注：external_idp (AzureAD/ExternalIdp) 刻意 fallback 到 'BuilderId'，避免把非标准 idp 值拼进
-      // kiroApiRequest 的 cookie (`Idp=${idp}`) 触发服务端非 401/403 错误绕过 REST fallback。
-      // external_idp 靠 CBOR 401 → REST fallback (accessToken+profileArn) 查用量，与 idp 值无关。
-      const idp = provider && (provider === 'Enterprise' || provider === 'Github' || provider === 'Google') 
-        ? provider 
-        : 'BuilderId'
-      
-      // 社交登录只需要 refreshToken，IdC 需要 clientId 和 clientSecret
-      if (!refreshToken) {
-        return { success: false, error: '请填写 Refresh Token' }
-      }
-      if (authMethod !== 'social' && authMethod !== 'external_idp' && (!clientId || !clientSecret)) {
-        return { success: false, error: '请填写 Client ID 和 Client Secret' }
-      }
-      
-      // Step 1: 使用合适的方式刷新获取 accessToken
-      console.log(`[Verify] Step 1: Refreshing token (authMethod: ${authMethod || 'IdC'})...`)
-      const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod, undefined, { tokenEndpoint, scopes })
-      
-      if (!refreshResult.success || !refreshResult.accessToken) {
-        return { success: false, error: `Token 刷新失败: ${refreshResult.error}` }
-      }
-
-      console.log('[Verify] Step 2: Getting user info...')
-
-      // Step 1.5: 先 resolve 真实 profileArn(§4.8 sweep · 修 profileArn 归属根因)
-      // - 用户传入 profileArn → 直接用(renderer 多 profile 场景 M 次 verify)
-      // - 未传 + Enterprise/IdC/external_idp → 调 fetchEnterpriseProfileArn(ListAvailableProfiles)拿组织真实值
-      // - 未传 + BuilderId/Social → undefined(不需要)
-      // 修根因:老 handler 先跑 usage 用 fallback ARN(不属于用户组织)→ 403 "Invalid token"
-      //         新顺序在 usage 前 resolve 真值,避免硬 fallback 到外域 profile 被后端拒 token
-      const isEntPre = provider === 'Enterprise' || authMethod === 'external_idp'
-      const resolvedProfileArn = await resolveProfileArnForVerify(
-        {
-          providedProfileArn: credentials.profileArn,
-          isEnterprise: isEntPre,
-          accessToken: refreshResult.accessToken!,
-          region: region || 'us-east-1',
-          provider,
-          authMethod
-        },
-        (acc) => fetchEnterpriseProfileArn(acc)
-      )
-      console.log('[Verify] Step 1.5: resolvedProfileArn:', resolvedProfileArn || '(undefined · non-Enterprise or fetch failed)')
-
-      // Step 1.6: 从 profileArn 解析真实数据面 region(跨 region 用户支持 · 2026-07-14)
-      // 用户 SSO region(refresh 用)可能 ≠ profile region(数据面 API 用)
-      // 例:身份 SSO 在 eu-central-1 · 但组织 profile 挂在 us-east-1 · usage/models/stream 必须用 profile region
-      const parsedProfileRegion = parseRegionFromProfileArn(resolvedProfileArn)
-      const dataPlaneRegion = parsedProfileRegion || region || 'us-east-1'
-      if (parsedProfileRegion && parsedProfileRegion !== region) {
-        console.log(`[Verify] Cross-region user: SSO=${region} · profile=${parsedProfileRegion} · using profile region for data-plane API`)
-      }
-
-      // Step 2: 调用 GetUserUsageAndLimits 获取用户信息
-      interface Bonus {
-        bonusCode?: string
-        displayName?: string
-        usageLimit?: number
-        usageLimitWithPrecision?: number
-        currentUsage?: number
-        currentUsageWithPrecision?: number
-        status?: string
-        expiresAt?: string  // API 返回的是 expiresAt
-      }
-      
-      interface FreeTrialInfo {
-        usageLimit?: number
-        usageLimitWithPrecision?: number
-        currentUsage?: number
-        currentUsageWithPrecision?: number
-        freeTrialStatus?: string
-        freeTrialExpiry?: string
-      }
-      
-      interface UsageBreakdown {
-        usageLimit?: number
-        usageLimitWithPrecision?: number
-        currentUsage?: number
-        currentUsageWithPrecision?: number
-        resourceType?: string
-        displayName?: string
-        displayNamePlural?: string
-        currency?: string
-        unit?: string
-        overageRate?: number
-        overageCap?: number
-        bonuses?: Bonus[]
-        freeTrialInfo?: FreeTrialInfo
-      }
-      
-      interface UsageResponse {
-        nextDateReset?: string
-        usageBreakdownList?: UsageBreakdown[]
-        subscriptionInfo?: { 
-          subscriptionTitle?: string
-          type?: string
-          subscriptionManagementTarget?: string
-          upgradeCapability?: string
-          overageCapability?: string
-        }
-        overageConfiguration?: { overageEnabled?: boolean; overageStatus?: string }
-        userInfo?: { email?: string; userId?: string }
-      }
-      
-      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, resolvedProfileArn, undefined, dataPlaneRegion, undefined, authMethod) as UsageResponse
-      
-      // 解析用户信息
-      const email = usageResult.userInfo?.email || ''
-      const userId = usageResult.userInfo?.userId || ''
-      
-      // 解析订阅类型（注意检查顺序：先检查更具体的类型）
-      const subscriptionTitle = usageResult.subscriptionInfo?.subscriptionTitle || 'Free'
-      let subscriptionType = 'Free'
-      const titleUpper = subscriptionTitle.toUpperCase()
-      if (titleUpper.includes('PRO+') || titleUpper.includes('PRO_PLUS') || titleUpper.includes('PROPLUS')) {
-        subscriptionType = 'Pro_Plus'
-      } else if (titleUpper.includes('POWER')) {
-        subscriptionType = 'Enterprise'
-      } else if (titleUpper.includes('PRO')) {
-        subscriptionType = 'Pro'
-      } else if (titleUpper.includes('ENTERPRISE')) {
-        subscriptionType = 'Enterprise'
-      } else if (titleUpper.includes('TEAMS')) {
-        subscriptionType = 'Teams'
-      }
-      
-      // 解析使用量（详细，使用精确小数）
-      const creditUsage = usageResult.usageBreakdownList?.find(b => b.resourceType === 'CREDIT')
-      
-      // 基础额度
-      const baseLimit = creditUsage?.usageLimitWithPrecision ?? creditUsage?.usageLimit ?? 0
-      const baseCurrent = creditUsage?.currentUsageWithPrecision ?? creditUsage?.currentUsage ?? 0
-      
-      // 试用额度
-      let freeTrialLimit = 0
-      let freeTrialCurrent = 0
-      let freeTrialExpiry: string | undefined
-      if (creditUsage?.freeTrialInfo?.freeTrialStatus === 'ACTIVE') {
-        freeTrialLimit = creditUsage.freeTrialInfo.usageLimitWithPrecision ?? creditUsage.freeTrialInfo.usageLimit ?? 0
-        freeTrialCurrent = creditUsage.freeTrialInfo.currentUsageWithPrecision ?? creditUsage.freeTrialInfo.currentUsage ?? 0
-        freeTrialExpiry = creditUsage.freeTrialInfo.freeTrialExpiry
-      }
-      
-      // 奖励额度
-      const bonuses: { code: string; name: string; current: number; limit: number; expiresAt?: string }[] = []
-      if (creditUsage?.bonuses) {
-        for (const bonus of creditUsage.bonuses) {
-          if (bonus.status === 'ACTIVE') {
-            bonuses.push({
-              code: bonus.bonusCode || '',
-              name: bonus.displayName || '',
-              current: bonus.currentUsageWithPrecision ?? bonus.currentUsage ?? 0,
-              limit: bonus.usageLimitWithPrecision ?? bonus.usageLimit ?? 0,
-              expiresAt: bonus.expiresAt
-            })
-          }
-        }
-      }
-      
-      // 计算总额度
-      const totalLimit = baseLimit + freeTrialLimit + bonuses.reduce((sum, b) => sum + b.limit, 0)
-      const totalUsed = baseCurrent + freeTrialCurrent + bonuses.reduce((sum, b) => sum + b.current, 0)
-      
-      // 计算重置剩余天数
-      let daysRemaining: number | undefined
-      let expiresAt: number | undefined
-      const nextResetDate = usageResult.nextDateReset
-      if (nextResetDate) {
-        expiresAt = new Date(nextResetDate).getTime()
-        daysRemaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / (1000 * 60 * 60 * 24)))
-      }
-      
-      console.log('[Verify] Success! Email:', email)
-
-      // Enterprise 账号：验证时决定 profileArn(v2 SSOT · resolveProfileArnForVerify)
-      // - credentials.profileArn 传入(renderer 多 profile 场景已选定)→ 优先使用不再调 fetch
-      // - 未传入 + isEnterprise → fetchEnterpriseProfileArn 兜底(向后兼容原行为)
-      // - 未传入 + 非 Enterprise → undefined(BuilderId / Social 不需要)
-      const isEnt = provider === 'Enterprise' || authMethod === 'external_idp'
-      const enterpriseProfileArn = await resolveProfileArnForVerify(
-        {
-          providedProfileArn: credentials.profileArn,
-          isEnterprise: isEnt,
-          accessToken: refreshResult.accessToken!,
-          region: region || 'us-east-1',
-          provider,
-          authMethod
-        },
-        (acc) => fetchEnterpriseProfileArn(acc)
-      )
-      if (enterpriseProfileArn) {
-        console.log(`[Verify] Enterprise profileArn resolved: ${enterpriseProfileArn}`)
-      }
-      
-      return {
-        success: true,
-        data: {
-          email,
-          userId,
-          accessToken: refreshResult.accessToken,
-          refreshToken: refreshResult.refreshToken || refreshToken,
-          expiresIn: refreshResult.expiresIn,
-          profileArn: enterpriseProfileArn || undefined,
-          subscriptionType,
-          subscriptionTitle,
-          subscription: {
-            rawType: usageResult.subscriptionInfo?.type,
-            managementTarget: usageResult.subscriptionInfo?.subscriptionManagementTarget,
-            upgradeCapability: usageResult.subscriptionInfo?.upgradeCapability,
-            overageCapability: usageResult.subscriptionInfo?.overageCapability
-          },
-          usage: {
-            current: totalUsed,
-            limit: totalLimit,
-            baseLimit,
-            baseCurrent,
-            freeTrialLimit,
-            freeTrialCurrent,
-            freeTrialExpiry,
-            bonuses,
-            nextResetDate,
-            resourceDetail: creditUsage ? {
-              displayName: creditUsage.displayName,
-              displayNamePlural: creditUsage.displayNamePlural,
-              resourceType: creditUsage.resourceType,
-              currency: creditUsage.currency,
-              unit: creditUsage.unit,
-              overageRate: creditUsage.overageRate,
-              overageCap: creditUsage.overageCap,
-              overageEnabled: usageResult.overageConfiguration?.overageStatus === 'ENABLED' || usageResult.overageConfiguration?.overageEnabled === true
-            } : undefined
-          },
-          daysRemaining,
-          expiresAt
-        }
-      }
-    } catch (error) {
-      console.error('[Verify] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '验证失败' }
-    }
-  })
+  //   实现在 accountService/verify.ts（IPC 与 web 面板共用）
+  ipcMain.handle('verify-account-credentials', async (_event, credentials: VerifyCredentialsInput) =>
+    svcVerifyAccountCredentials(verifyApiDeps, credentials)
+  )
 
   // IPC: 获取本地 SSO 缓存中当前使用的账号信息
-  ipcMain.handle('get-local-active-account', async () => {
-    const os = await import('os')
-    const path = await import('path')
-    
-    try {
-      const ssoCache = path.join(os.homedir(), '.aws', 'sso', 'cache')
-      const tokenPath = path.join(ssoCache, 'kiro-auth-token.json')
-      
-      const tokenContent = await readFile(tokenPath, 'utf-8')
-      const tokenData = JSON.parse(tokenContent)
-      
-      if (!tokenData.refreshToken) {
-        return { success: false, error: '本地缓存中没有 refreshToken' }
-      }
-      
-      return {
-        success: true,
-        data: {
-          refreshToken: tokenData.refreshToken,
-          accessToken: tokenData.accessToken,
-          authMethod: tokenData.authMethod,
-          provider: tokenData.provider
-        }
-      }
-    } catch {
-      return { success: false, error: '无法读取本地 SSO 缓存' }
-    }
-  })
+  //   实现在 accountService/credentials.ts（IPC 与 web 面板共用）
+  ipcMain.handle('get-local-active-account', async () => svcGetLocalActiveAccount(credentialFsDeps))
 
   // IPC: 从 Kiro 本地配置导入凭证
-  ipcMain.handle('load-kiro-credentials', async () => {
-    const os = await import('os')
-    const path = await import('path')
-    const crypto = await import('crypto')
-    const fs = await import('fs/promises')
-    
-    try {
-      // 从 ~/.aws/sso/cache/kiro-auth-token.json 读取 token
-      const ssoCache = path.join(os.homedir(), '.aws', 'sso', 'cache')
-      const tokenPath = path.join(ssoCache, 'kiro-auth-token.json')
-      console.log('[Kiro Credentials] Reading token from:', tokenPath)
-      
-      let tokenData: {
-        accessToken?: string
-        refreshToken?: string
-        clientIdHash?: string
-        region?: string
-        authMethod?: string
-        provider?: string
-        profileArn?: string
-        tokenEndpoint?: string
-        issuerUrl?: string
-        scopes?: string
-      }
-      
-      try {
-        const tokenContent = await readFile(tokenPath, 'utf-8')
-        tokenData = JSON.parse(tokenContent)
-      } catch {
-        return { success: false, error: '找不到 kiro-auth-token.json 文件，请先在 Kiro IDE 中登录' }
-      }
-      
-      if (!tokenData.refreshToken) {
-        return { success: false, error: 'kiro-auth-token.json 中缺少 refreshToken' }
-      }
-      
-      // 确定 clientIdHash：优先使用文件中的，否则计算默认值
-      let clientIdHash = tokenData.clientIdHash
-      if (!clientIdHash) {
-        // 使用标准的 startUrl 计算 hash（与 Kiro 客户端一致）
-        const startUrl = 'https://view.awsapps.com/start'
-        clientIdHash = crypto.createHash('sha1')
-          .update(JSON.stringify({ startUrl }))
-          .digest('hex')
-        console.log('[Kiro Credentials] Calculated clientIdHash:', clientIdHash)
-      }
-      
-      // 读取客户端注册信息
-      let clientRegPath = path.join(ssoCache, `${clientIdHash}.json`)
-      console.log('[Kiro Credentials] Trying client registration from:', clientRegPath)
-      
-      let clientData: {
-        clientId?: string
-        clientSecret?: string
-      } | null = null
-      
-      try {
-        const clientContent = await readFile(clientRegPath, 'utf-8')
-        clientData = JSON.parse(clientContent)
-      } catch {
-        // 如果找不到，尝试搜索目录中的其他 .json 文件（排除 kiro-auth-token.json）
-        console.log('[Kiro Credentials] Client file not found, searching cache directory...')
-        try {
-          const files = await fs.readdir(ssoCache)
-          for (const file of files) {
-            if (file.endsWith('.json') && file !== 'kiro-auth-token.json') {
-              try {
-                const content = await readFile(path.join(ssoCache, file), 'utf-8')
-                const data = JSON.parse(content)
-                if (data.clientId && data.clientSecret) {
-                  clientData = data
-                  console.log('[Kiro Credentials] Found client registration in:', file)
-                  break
-                }
-              } catch {
-                // 忽略无法解析的文件
-              }
-            }
-          }
-        } catch {
-          // 忽略目录读取错误
-        }
-      }
-      
-      // 社交登录不需要 clientId/clientSecret
-      const isSocialAuth = tokenData.authMethod === 'social'
-      const isExternalIdp = tokenData.authMethod === 'external_idp' || tokenData.provider === 'ExternalIdp'
-      
-      if (!isSocialAuth && !isExternalIdp && (!clientData || !clientData.clientId || !clientData.clientSecret)) {
-        return { success: false, error: '找不到客户端注册文件，请确保已在 Kiro IDE 中完成登录' }
-      }
-      
-      console.log(`[Kiro Credentials] Successfully loaded credentials (authMethod: ${tokenData.authMethod || 'IdC'})`)
-      
-      return {
-        success: true,
-        data: {
-          accessToken: tokenData.accessToken || '',
-          refreshToken: tokenData.refreshToken,
-          clientId: clientData?.clientId || '',
-          clientSecret: clientData?.clientSecret || '',
-          region: tokenData.region || 'us-east-1',
-          authMethod: tokenData.authMethod || 'IdC',
-          provider: tokenData.provider || 'BuilderId',
-          tokenEndpoint: tokenData.tokenEndpoint,
-          issuerUrl: tokenData.issuerUrl,
-          scopes: tokenData.scopes,
-          profileArn: tokenData.profileArn
-        }
-      }
-    } catch (error) {
-      console.error('[Kiro Credentials] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '未知错误' }
-    }
-  })
+  //   实现在 accountService/credentials.ts（IPC 与 web 面板共用）
+  ipcMain.handle('load-kiro-credentials', async () => svcLoadKiroCredentials(credentialFsDeps))
 
   // IPC: 切换账号 - 写入凭证到本地 SSO 缓存
   //

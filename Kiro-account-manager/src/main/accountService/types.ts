@@ -157,6 +157,31 @@ export interface AccountRuntimeDeps {
    * 对同一 refreshToken 并发刷新会让其中一个用到被 rotate 作废的旧 token。
    */
   refreshInFlightIds: Set<string>
+
+}
+
+/**
+ * store 读写依赖（W2 剥离引入 · accounts / credentials / verify 路径使用）。
+ *
+ * 独立于 `AccountRuntimeDeps` 而非并入其中，因为这一组的装配时机不同：
+ * 它在**模块级**就能装配（只依赖 store / createBackup / lastSavedData），
+ * 而 `AccountRuntimeDeps` 里的 proxyServer / mainWindow / api 必须等到
+ * `app.whenReady` 之后才有值。硬塞成一个接口会迫使模块级那处装配去引用
+ * 尚不存在的运行时对象。
+ *
+ * ⚠️ store 用 getter 而非直接传值：`store` 是惰性初始化的（initStore 跑完才有值），
+ * 而 handler 注册发生在首次 initStore 之前 —— 直接传值会永久捕获 null。
+ * 也不在业务函数里 `await initStore()`，那会让 accountService 反向依赖 index.ts 形成环。
+ */
+export interface AccountStoreDeps {
+  /** 取已就绪的 store 实例；未 init 时抛错（不静默 no-op，见 §4.4 精准错误） */
+  getStore: () => AccountStoreRef
+  /** 确保 store 已初始化（index.ts:initStore 的引用；幂等） */
+  ensureStore: () => Promise<void>
+  /** 写盘成功后的崩溃恢复备份（index.ts:createBackup 的引用，含节流） */
+  createBackup: (data: unknown) => Promise<void>
+  /** 记录「最后成功写盘的 blob」，供崩溃恢复读取（index.ts 模块级 lastSavedData 的 setter） */
+  setLastSavedData: (data: unknown) => void
 }
 
 /** 账号凭证(各字段均可缺失,由 authMethod 决定哪些必需) */
@@ -203,4 +228,91 @@ export interface BatchSummary {
   completed: number
   successCount: number
   failedCount: number
+}
+
+// ============ store 读写依赖（W2 剥离引入，与上面 AccountRuntimeDeps 合并为一份并集）============
+
+/** electron-store 实例的最小读接口（与 index.ts 的 `store` 声明一致） */
+export type AccountStoreRef = {
+  get: (key: string, defaultValue?: unknown) => unknown
+  set: (key: string, value: unknown) => void
+  path: string
+}
+
+// ============ Kiro 用量 API 的响应形状 ============
+// 说明：index.ts 里同一份 API 响应被 4 个 handler 各自用局部 interface 声明了一遍
+// （:3811 UsageApiResponse / :5177 UsageResponse / batch 与 check 内各一份）。
+// 本轮把「本目录内使用的两份」合并到下面一组类型；index.ts 中另两份属并行 executor 行区间。
+
+export interface UsageBonus {
+  bonusCode?: string
+  displayName?: string
+  usageLimit?: number
+  usageLimitWithPrecision?: number
+  currentUsage?: number
+  currentUsageWithPrecision?: number
+  /** ⚠️ verify 路径按 status==='ACTIVE' 过滤，sso-import 路径不过滤 —— 差异是既有行为，见各调用点注释 */
+  status?: string
+  expiresAt?: string
+}
+
+export interface UsageFreeTrialInfo {
+  usageLimit?: number
+  usageLimitWithPrecision?: number
+  currentUsage?: number
+  currentUsageWithPrecision?: number
+  freeTrialStatus?: string
+  freeTrialExpiry?: string
+}
+
+export interface UsageBreakdownItem {
+  resourceType?: string
+  displayName?: string
+  displayNamePlural?: string
+  currency?: string
+  unit?: string
+  overageRate?: number
+  overageCap?: number
+  usageLimit?: number
+  usageLimitWithPrecision?: number
+  currentUsage?: number
+  currentUsageWithPrecision?: number
+  freeTrialInfo?: UsageFreeTrialInfo
+  bonuses?: UsageBonus[]
+}
+
+export interface UsageApiShape {
+  userInfo?: { email?: string; userId?: string }
+  subscriptionInfo?: {
+    type?: string
+    subscriptionTitle?: string
+    upgradeCapability?: string
+    overageCapability?: string
+    subscriptionManagementTarget?: string
+  }
+  usageBreakdownList?: UsageBreakdownItem[]
+  nextDateReset?: string
+  overageConfiguration?: { overageEnabled?: boolean; overageStatus?: string }
+}
+
+/** 归一化后的额度明细（两条导入路径共用的输出形状） */
+export interface NormalizedUsage {
+  current: number
+  limit: number
+  baseLimit: number
+  baseCurrent: number
+  freeTrialLimit: number
+  freeTrialCurrent: number
+  freeTrialExpiry?: string
+  bonuses: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
+  resourceDetail?: {
+    displayName?: string
+    displayNamePlural?: string
+    resourceType?: string
+    currency?: string
+    unit?: string
+    overageRate?: number
+    overageCap?: number
+    overageEnabled: boolean
+  }
 }
