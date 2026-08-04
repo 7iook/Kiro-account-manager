@@ -53,6 +53,11 @@ import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { installIpcSizeGuard } from './utils/emitToRenderer'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
+// 局域网 web 面板装配(W6)。装配逻辑收在 ipc/webPanelWiring.ts:
+//   本文件只留三个调用点 —— IPC 注册 / ready-to-show 自启动 / will-quit 清理。
+//   webPanel/ 目录本身不得 import electron(架构闸门 webpanel_auth_constraints.test.ts),
+//   故 electron 依赖留在 wiring 一侧。
+import { WebPanelWiring, buildPanelRouteDeps } from './ipc/webPanelWiring'
 import {
   applyAccountDataMutation,
   setStoreRef as setAccountStoreRef,
@@ -444,6 +449,15 @@ function debouncedUpdateTrayMenu(): void {
 
 // ============ Kiro API 反代服务器 ============
 let proxyServer: ProxyServer | null = null
+
+/**
+ * 局域网 web 面板装配实例(W6)。
+ *
+ * 在 `registerIPCHandlers` 内赋值(需要 accountDeps / accountServiceDeps 已就绪),
+ * 由 `ready-to-show` 的自启动分支与 `will-quit` 的清理分支读取。
+ * 与 proxyServer 同为模块级单例 —— 面板独立端口,可开面板而不开反代。
+ */
+let webPanelWiring: WebPanelWiring | null = null
 
 function initProxyServer(): ProxyServer {
   if (proxyServer) return proxyServer
@@ -2835,6 +2849,10 @@ function createWindow(): void {
         console.error('[ProxyServer] Auto-start failed:', error)
       }
 
+      // 局域网 web 面板自启动(W6)。照反代 autoStart 先例:配置里 enabled + autoStart
+      // 双开才拉起;失败不阻断应用启动(原因记入 lastError,设置页显示真实结果)。
+      await webPanelWiring?.autoStartIfConfigured()
+
       // K-Proxy MITM 自启动
       try {
         const savedKProxyConfig = store?.get('kproxyConfig') as KProxyConfig | undefined
@@ -4199,9 +4217,10 @@ app.whenReady().then(async () => {
   // 业务实现在 accountService/switchCli.ts:switchAccountToCli。
   // 此处只注入宿主机能力:解析本机 kiro-cli 数据目录 + 执行 SQLite 语句(含 sqlite3 命令行
   // → Node 内置 SQLite 的降级链)。
-  ipcMain.handle('switch-account-cli', async (_event, credentials: SwitchAccountCliCredentials) => {
-    return switchAccountToCli(
-      {
+  //
+  // ⚠️ deps 抽成 buildSwitchCliDeps() 而非内联:web 面板(W6)的同名端点必须复用**同一份**
+  //    宿主机能力注入。内联会产生第二份副本,将来改降级链只改一处 = 两个通道行为分叉。
+  const buildSwitchCliDeps = (): Parameters<typeof switchAccountToCli>[0] => ({
         refreshTokenByMethod,
         resolveProfileArnForWrite,
         resolveCliDbPath: async () => {
@@ -4246,16 +4265,18 @@ app.whenReady().then(async () => {
             }
           }
         }
-      },
-      credentials
-    )
+  })
+
+  ipcMain.handle('switch-account-cli', async (_event, credentials: SwitchAccountCliCredentials) => {
+    return switchAccountToCli(buildSwitchCliDeps(), credentials)
   })
 
 
   // IPC: 退出登录 - 清除本地 SSO 缓存
   //   业务实现在 accountService/switch.ts:logoutAccount;此处注入本机 SSO 缓存目录的读写。
-  ipcMain.handle('logout-account', async () => {
-    return logoutAccount({
+  //
+  // ⚠️ 与 buildSwitchCliDeps 同一理由抽成函数:web 面板的 /api/local/logout 复用同一份注入。
+  const buildLogoutDeps = (): Parameters<typeof logoutAccount>[0] => ({
       clearProactiveRenewal,
       setLastSwitchedAccountId: (id) => {
         lastSwitchedAccountId = id
@@ -4277,8 +4298,58 @@ app.whenReady().then(async () => {
         const { unlink } = await import('fs/promises')
         await unlink(filePath)
       }
+  })
+
+  ipcMain.handle('logout-account', async () => {
+    return logoutAccount(buildLogoutDeps())
+  })
+
+  // ============ 局域网 web 面板装配(W6) ============
+  //
+  // 决策卡 §1 不变量 1「web 面板不得包含任何业务逻辑」的落点:面板的每个端点
+  // 复用**上面这些 handler 背后的同一份 accountService 实现**,只是换了传输通道。
+  // 下面的 routeDeps 里没有一行业务逻辑,全是把已装配好的调用原样转交。
+  //
+  // 决策卡 §3 第二处豁免:桌面端 `account-get-*` / `account-set-overage` 把 accessToken
+  // 当第一个入参(:6108 起)。面板端点**按 accountId 寻址**,token 由 routes.ts 从 store
+  // 内部取出后组装进 identity —— 绝不让浏览器把 token 经局域网发过来。
+  webPanelWiring = new WebPanelWiring({
+    getStore: () => store ?? null,
+    ensureStore: () => initStore(),
+    routeDeps: buildPanelRouteDeps({
+      loadAccountsBlob: () => svcLoadAccounts(accountDeps),
+      checkAccountStatus: (account) => checkAccountStatus(accountServiceDeps, account as never),
+      refreshAccountToken: (account) => refreshAccountToken(accountServiceDeps, account as never),
+      switchAccountToIde: (credentials) =>
+        switchAccountToIde(
+          {
+            refreshTokenByMethod,
+            writeKiroAuthTokenFile,
+            resolveProfileArnForWrite,
+            setLastSwitchedAccountId: (id) => {
+              lastSwitchedAccountId = id
+            },
+            setLastWrittenTokenSignature: (sig) => {
+              lastWrittenTokenSignature = sig
+            },
+            isProactiveRenewalEnabled: () => proactiveRenewalEnabled,
+            scheduleProactiveRenewal
+          },
+          credentials as SwitchAccountCredentials
+        ),
+      switchAccountToCli: (credentials) =>
+        switchAccountToCli(buildSwitchCliDeps(), credentials as SwitchAccountCliCredentials),
+      logoutFromIde: () => logoutAccount(buildLogoutDeps()),
+      getAccountModels: (identity) => getAccountModels({ fetchKiroModels }, identity),
+      getAccountSubscriptions: (identity) =>
+        getAccountSubscriptions({ fetchAvailableSubscriptions }, identity),
+      getAccountSubscriptionUrl: (identity, subscriptionType) =>
+        getAccountSubscriptionUrl({ fetchSubscriptionToken }, identity, subscriptionType),
+      setAccountOverage: (identity, enabled) =>
+        setAccountOverage({ setUserPreference }, identity, enabled ? 'ENABLED' : 'DISABLED')
     })
   })
+  webPanelWiring.registerIpcHandlers()
 
   // ============ 手动登录相关 IPC ============
 
@@ -6910,6 +6981,12 @@ app.on('will-quit', async (event) => {
   
   // 停止主进程池 token 刷新调度器
   stopMainPoolTokenRefresh()
+
+  // 局域网 web 面板清理(W6):关 HTTP server + 停会话清扫 + 停限流清扫 timer。
+  // 放在 preventDefault 分支**之外** —— 下面的 `lastSavedData && store` 分支不成立时
+  // 也必须收干净,否则「从未保存过数据」的那次退出会漏掉面板的 timer 与监听端口。
+  // 不 await:will-quit 是同步事件,await 会让后面的 preventDefault 错过时机。
+  void webPanelWiring?.dispose()
 
   // 服务仍在运行时，退出前先归档本次会话（正常退出可救；进程崩溃无法救）
   if (proxyServer?.isRunning()) {
