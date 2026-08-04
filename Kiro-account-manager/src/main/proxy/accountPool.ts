@@ -10,6 +10,33 @@ export enum ErrorType {
 }
 
 // 根据 HTTP 状态码和错误原因分类错误
+/**
+ * 从错误消息里提取 HTTP 状态码 —— 只认 HTTP 语义位置,绝不裸抓「第一个 3 位数字」。
+ *
+ * 状态码提取与 {@link classifyError} 同属一个语义域(状态码 → 处置),故收口在这里(SSOT):
+ * 此前 proxyServer 有 4 处各自写 `error.message.match(/(\d{3})/)`,散落且判据一致地错。
+ *
+ * RCA 2026-08-04 hold-gate-429-quota-false-positive · 旧实现会把任意 3 位数字当状态码:
+ *   - `Connect Timeout Error (... kiro.dev:443, timeout: 10000ms)` → 抓成 443(端口号)
+ *   - `Payload size: 402913 bytes`                                → 抓成 402 → 被判额度耗尽
+ *     → hasBlockedAccount → HoldGate 挂起后续请求(账号其实完全正常)
+ *   - `read ECONNRESET errno -4077`                               → 抓成 407
+ *
+ * 认可的位置(kiroApi 的抛错格式 + 常见 SDK 措辞):
+ *   `API error NNN:` / `Auth error NNN:` / `status=NNN` / `statusCode: NNN` / `HTTP NNN`
+ *
+ * @returns 100-599 范围内的状态码;提取不到返回 undefined(调用方按 RECOVERABLE 兜底)
+ */
+export function extractHttpStatusCode(message: string): number | undefined {
+  if (!message) return undefined
+  const m = message.match(/\b(?:API|Auth) error (\d{3})\b/)
+    || message.match(/\bstatus(?:Code)?\s*[=:]\s*(\d{3})\b/i)
+    || message.match(/\bHTTP\/?\s*(\d{3})\b/i)
+  if (!m) return undefined
+  const code = parseInt(m[1], 10)
+  return code >= 100 && code <= 599 ? code : undefined
+}
+
 export function classifyError(statusCode: number, reason?: string): ErrorType {
   // RECOVERABLE: 配额/计费问题
   if (statusCode === 402) return ErrorType.RECOVERABLE
@@ -413,6 +440,38 @@ export class AccountPool {
     return false
   }
 
+  /**
+   * 解释「池里哪些号被判长期不可用、各自为什么」—— HoldGate 挂起日志的可观测性出口。
+   *
+   * 与 {@link hasBlockedAccount} 共用同一套判据(SSOT),保证日志说的和决策做的是同一件事。
+   *
+   * RCA 2026-08-04:此前 holdGate.ts 一行日志都没有、决策日志又只在 HOLD_DEBUG=1 下走
+   * console(不进 proxyLogger),用户报「账号明明正常却被闸门拦住」时后端查不到任何现场,
+   * 只能靠翻源码反推。挂起是用户可感知的强干预(请求被冻结等换号),必须能自证原因。
+   *
+   * @returns 形如 `['a@x.com: quotaExhausted(markedAt=... resetAt=...)']`;无则空数组
+   */
+  describeBlockedAccounts(now: number = Date.now()): string[] {
+    const out: string[] = []
+    for (const a of this.accounts.values()) {
+      const who = a.email || a.id?.slice(0, 8) || '?'
+      if (this.isSuspended(a)) {
+        out.push(`${who}: suspended(${a.suspendReason || '?'})`)
+        continue
+      }
+      if (this.isQuotaExhausted(a, now)) {
+        // 区分两种来源:真实额度数据用尽(权威) vs 仅有耗尽标记(可能是误标)
+        const byRealData = !!a.quotaLimit && a.quotaLimit > 0 && (a.quotaUsed ?? 0) >= a.quotaLimit
+        const why = byRealData
+          ? `quotaUsed=${a.quotaUsed}/${a.quotaLimit}`
+          : `markedAt=${a.quotaExhaustedAt ? new Date(a.quotaExhaustedAt).toISOString() : '?'}` +
+            ` resetAt=${a.quotaResetAt ? new Date(a.quotaResetAt).toISOString() : 'none'}`
+        out.push(`${who}: quotaExhausted(${why})`)
+      }
+    }
+    return out
+  }
+
   // 获取冷却时间最短的账号
   private getAccountWithShortestCooldown(accounts: ProxyAccount[], now: number): ProxyAccount | null {
     let bestAccount: ProxyAccount | null = null
@@ -431,14 +490,29 @@ export class AccountPool {
     return bestAccount
   }
 
-  // 记录请求成功（重置断路器 + 粘滞到当前账号）
+  // 记录请求成功（重置断路器 + 清除额度耗尽误标 + 粘滞到当前账号）
   recordSuccess(accountId: string, tokens: number = 0): void {
     const account = this.accounts.get(accountId)
     if (account) {
+      // 成功 = 上游确实放行了这个账号,是「账号可用」的最硬证据 → 清除 quotaExhausted 误标。
+      //
+      // RCA 2026-08-04:此前只重置 errorCount,quotaExhaustedAt 原封不动 —— 于是一次误标
+      // 之后即使同账号连续请求成功,也要干等 quotaResetMs(1h)走完才恢复,期间
+      // hasBlockedAccount 恒为 true → HoldGate 持续误伤。用户原话:「同一个账号下一秒
+      // 能够请求成功,多次请求成功应该自动放行」。
+      //
+      // 但**不动**这两样 —— 它们不是误标,一次成功不该抹掉:
+      //   - quotaUsed/quotaLimit:updateQuota 从上游权威写入的真实额度数据
+      //   - suspendedAt:封禁需人工或后端解除(clearSuspended)
+      //   - quotaResetAt:上游给的真实配额重置时刻,保留供 isQuotaExhausted 第一条判据用
+      const realQuotaUsedUp = !!account.quotaLimit && account.quotaLimit > 0
+        && (account.quotaUsed ?? 0) >= account.quotaLimit
       this.accounts.set(accountId, {
         ...account,
         requestCount: (account.requestCount || 0) + 1,
         errorCount: 0, // 重置断路器失败计数
+        // 真实额度数据仍显示用尽 → 保留标记;否则认定为误标并清除
+        quotaExhaustedAt: realQuotaUsedUp ? account.quotaExhaustedAt : undefined,
         lastUsed: Date.now(),
         isAvailable: true
       })
@@ -489,7 +563,16 @@ export class AccountPool {
     // 配额类错误额外标记耗尽，并按配置的 quotaResetMs 设定自动恢复时间。
     // 否则 quotaExhaustedAt 一直 > 0，isQuotaExhausted 永远为 true，
     // 该账号会被永久跳过（直到 updateQuota/reset 被显式调用）。
-    const isQuotaError = statusCode === 402 || statusCode === 429
+    //
+    // ⚠️ 只认 402,**绝不认 429**(RCA 2026-08-04 hold-gate-429-quota-false-positive):
+    // 429 是 Kiro 后端的概率式限流窗口(见 kiroApi 429 重试段注释:「不是真 QPS 上限,
+    // 窗口随机开关」),不是额度问题。实测 proxy-logs UTC 10:30-11:07 单账号 147 次 429,
+    // 其中 146 次(99.3%)在 60 秒内同一账号就有 200 成功。
+    // 把 429 标成 quotaExhausted 会让 isQuotaExhausted 真 1 小时(quotaResetMs),
+    // 进而 hasBlockedAccount → true → decideHoldAction 第一条命中 → 此后任何 pre-body
+    // 错误(哪怕 400 malformed)都被 HoldGate 挂起 = 用户看到「账号明明正常却被拦住」。
+    // 429 的正确处置是下面的 errorCount 指数退避,几秒级,而非池级 1 小时封锁。
+    const isQuotaError = statusCode === 402
     if (isQuotaError) {
       quotaExhaustedAt = now
       // 仅在没有更明确的重置时间，或已有重置时间已过期时，按冷却窗口顺延

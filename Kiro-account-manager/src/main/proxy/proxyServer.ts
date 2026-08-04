@@ -18,7 +18,7 @@ import type {
   TokenRefreshCallback,
   ProxySessionRecord
 } from './types'
-import { AccountPool, ErrorType, classifyError } from './accountPool'
+import { AccountPool, ErrorType, classifyError, extractHttpStatusCode } from './accountPool'
 import { SmoothWeightedRoundRobin } from '../utils/smoothWeightedRoundRobin'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
@@ -1777,10 +1777,22 @@ export class ProxyServer {
           }
         }
 
-        // 402/429: 额度耗尽，切换端点或账号
+        // 402(额度耗尽) / 429(限流): 切换端点或账号
         if (errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') || errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') || errMsg.includes('rate limit')) {
-          console.log('[ProxyServer] Quota/throttle error, switching endpoint or account')
-          this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
+          // ⚠️ 必须按真实语义分流上报(RCA 2026-08-04 hold-gate-429-quota-false-positive):
+          // 此前无论 402 还是 429 都硬编码传 429,而 accountPool 又把 429 当额度耗尽标记
+          // 1 小时 → HoldGate 误伤。现在 accountPool 只认 402,故这里必须把真实的额度类
+          // 错误如实传 402,否则真额度耗尽会永远标不上(回归风险)。
+          //   402 语义(需等配额恢复):402 / quota / reached the limit /
+          //                            ServiceQuotaExceededException / limit exceeded
+          //   429 语义(重试即可):    429 / ThrottlingException / rate limit
+          const isRealQuotaExhausted = errMsg.includes('402')
+            || errMsg.includes('quota')
+            || errMsg.includes('reached the limit')
+            || errMsg.includes('ServiceQuotaExceededException')
+            || errMsg.includes('limit exceeded')
+          console.log(`[ProxyServer] ${isRealQuotaExhausted ? 'Quota exhausted' : 'Throttle'} error, switching endpoint or account`)
+          this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, isRealQuotaExhausted ? 402 : 429)
           endpointIndex = (endpointIndex + 1) % 2 // 切换端点
           if (endpointIndex === 0) {
             // 已尝试所有端点，切换到没试过的下个账号
@@ -3227,8 +3239,8 @@ export class ProxyServer {
 
           // Hold Gate 接线(task#5):先记账失败账号(recordError + suspended 检测),使 resume 拿号跳过它。
           this.recordRequestFailed()
-          const errStatusCode = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+          const errStatusCode = extractHttpStatusCode(error.message)
+          this.accountPool.recordError(account.id, errStatusCode !== undefined ? classifyError(errStatusCode) : ErrorType.RECOVERABLE, errStatusCode)
           const suspendInfoOai = this.detectSuspendedError(error.message)
           if (suspendInfoOai) {
             const newlyMarked = this.accountPool.markSuspended(account.id, suspendInfoOai.reason, suspendInfoOai.message)
@@ -3488,8 +3500,8 @@ export class ProxyServer {
             if (this.isAbortError(error, signal) || this.isResponseClosed(res)) { if (!settled) { settled = true; resolveAttempt('done') } ; return }
             // 记账失败账号(recordError + suspended 检测),使 resume 跳过它。
             this.recordRequestFailed()
-            const sc = error.message.match(/(\d{3})/)?.[1]
-            this.accountPool.recordError(acc.id, sc ? classifyError(parseInt(sc)) : ErrorType.RECOVERABLE, sc ? parseInt(sc) : undefined)
+            const sc = extractHttpStatusCode(error.message)
+            this.accountPool.recordError(acc.id, sc !== undefined ? classifyError(sc) : ErrorType.RECOVERABLE, sc)
             const susp = this.detectSuspendedError(error.message)
             if (susp) { const nm = this.accountPool.markSuspended(acc.id, susp.reason, susp.message); if (nm) this.events.onAccountSuspended?.({ accountId: acc.id, email: (acc as { email?: string }).email, reason: susp.reason, message: susp.message }) }
             // 首字节前失败 → 交给 runWithHold 切号/挂起;已吐正文 → 现状 error。
@@ -3755,7 +3767,7 @@ export class ProxyServer {
         const settleHold = (retry: boolean): void => { this.emitHeldRequestsChanged(); resolveHold(retry) }
         const hooks: HeldRequestHooks = {
           sendPing,
-          resume: () => settleHold(true),
+          resume: () => { proxyLogger.info('HoldGate', '挂起请求被放行 · 用新号重试'); settleHold(true) },
           sendError: () => { onTimeoutError(); this.recordRequestFailed(); settleHold(false) },
           sendGracefulStop: () => { onTimeoutGracefulStop(); this.recordRequestFailed(); settleHold(false) }
         }
@@ -3780,12 +3792,28 @@ export class ProxyServer {
         //   - 有永久请求级错(400 malformed / 明确密钥吊销)→ 立即报错
         //   - 从未 attempt 过就无号可用 → 立即报错
         const decision = this.decideHoldAction(preBodyErrorRef.current)
+        const poolBlocked = this.shouldHoldForNoAccount()
+        const errKind = preBodyErrorRef.current
+          ? (this.isAccountLevelAuthFailure(preBodyErrorRef.current) ? 'account-level-auth-failure' : 'non-account-level')
+          : 'none'
         if (holdDebugEnabled) {
-          const poolBlocked = this.shouldHoldForNoAccount()
-          const errKind = preBodyErrorRef.current
-            ? (this.isAccountLevelAuthFailure(preBodyErrorRef.current) ? 'account-level-auth-failure' : 'non-account-level')
-            : 'none'
           console.log(`[HoldGate][DEBUG] hold decision=${decision} · triedIds=${triedIds.size} · poolBlocked=${poolBlocked} · lastErrorKind=${errKind} · lastErrorMsg=${preBodyErrorRef.current?.message?.slice(0, 150) ?? 'null'}`)
+        }
+        // 挂起是用户可感知的强干预(请求被冻结等换号)→ 无条件留痕到 proxyLogger(UI 可见)。
+        // RCA 2026-08-04:此前 holdGate.ts 零日志 + 决策日志只在 HOLD_DEBUG=1 下走 console,
+        // 用户报「账号明明正常却被闸门拦住」时后端查不到任何现场,只能翻源码反推。
+        if (decision === 'hold') {
+          const blockedList = this.accountPool.describeBlockedAccounts()
+          const why = poolBlocked ? '池内有号被封禁/额度耗尽'
+            : errKind === 'account-level-auth-failure' ? '最近错误是账号级授权失效'
+            : '池内无号可试(池空 / UI 指定号不在池 / 池未同步)'
+          proxyLogger.warn('HoldGate', `请求被挂起 · ${why}`, {
+            triedAccounts: triedIds.size,
+            poolBlocked,
+            blockedAccounts: blockedList.length ? blockedList : ['(none)'],
+            lastErrorKind: errKind,
+            lastError: preBodyErrorRef.current?.message?.slice(0, 200) ?? null
+          })
         }
         if (decision === 'giveup') {
           console.warn(`[ProxyServer] No account available · decision=giveup · reason=${preBodyErrorRef.current ? 'non-account-level error (429/5xx/malformed/net)' : 'no attempt made'} · errMsg=${preBodyErrorRef.current?.message?.slice(0, 200) ?? 'null'}`)
@@ -4414,8 +4442,8 @@ export class ProxyServer {
           // Hold Gate 接线(task#3):先按现状把失败账号的状态记账(suspended/quota/冷却),
           // 使随后的 resume 拿号能跳过这个刚挂的账号。
           this.recordRequestFailed()
-          const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+          const errStatusCode2 = extractHttpStatusCode(error.message)
+          this.accountPool.recordError(account.id, errStatusCode2 !== undefined ? classifyError(errStatusCode2) : ErrorType.RECOVERABLE, errStatusCode2)
           // 单账号被 403 suspended 时 recordError 不足以标记长期封禁,补一道 detect+markSuspended,
           // 否则 resume 会再次选中同一挂账号死循环。
           const suspendInfo2 = this.detectSuspendedError(error.message)
@@ -4474,8 +4502,7 @@ export class ProxyServer {
   private handleApiError(res: http.ServerResponse, account: { id: string }, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
     if (this.isAbortError(error, signal) || this.isResponseClosed(res)) return
     this.recordRequestFailed()
-    const errCode = error.message.match(/(\d{3})/)?.[1]
-    const parsedCode = errCode ? parseInt(errCode) : 500
+    const parsedCode = extractHttpStatusCode(error.message) ?? 500
     const errorType = classifyError(parsedCode)
     const isAuthError = error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth')
 

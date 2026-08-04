@@ -10,9 +10,11 @@
 //
 // 修复后的契约(本测试锁定):
 //   1. 请求级错误(400 malformed)→ 不进 hold,原样报错(换号无用)
-//   2. 瞬时错误(429 / 502)且池里无号被封禁/额度耗尽 → 不进 hold,原样报错
+//   2. 瞬时错误(429 / 502)→ 不进 hold,原样报错
+//      (2026-08-04 更新:429 此前会经 recordError 把账号标成 quotaExhausted 1 小时,
+//       从而自己把池变成「有号额度耗尽」再触发挂起 —— 那条后门已封,见本文件 429 用例)
 //   3. 真·封禁(403 TEMPORARILY_SUSPENDED)→ 进 hold(用户的核心场景不能被削弱)
-//   4. 额度耗尽 → 进 hold
+//   4. 额度耗尽(402)→ 进 hold
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Readable } from 'node:stream'
 import type { ProxyAccount } from '@main/proxy/types'
@@ -198,17 +200,36 @@ describe('HoldGate 误伤防护(端到端 · 单账号模式)', () => {
     server.releaseHeldRequests()
   })
 
-  it('⚠️ 429 → 被 accountPool 归类为「额度耗尽」→ 挂起(既有契约 · 见 recordError isQuotaError)', async () => {
-    // 注意这不是本轮修复的目标行为,而是**既有设计**的忠实反映:
-    //   accountPool.recordError() 把 `statusCode === 402 || statusCode === 429` 判为 isQuotaError,
-    //   设 quotaExhaustedAt + quotaResetAt(见 accountPool.ts recordError 注释)。
-    //   → hasBlockedAccount() = true → 挂起等配额恢复,由 quotaResetAt 到点后兜底轮询自动放行。
-    // 前置事实:429 在到达这里之前已经过 rateLimitRetryConfig 的 10 次内部重试(~2s),
-    //   即「撑过 10 次重试的 429」被视为真实配额问题而非瞬时抖动。
-    // 若后续判定 2 秒 429 突发不该标记额度耗尽,应改 accountPool.recordError 的 isQuotaError 判据
-    //   (影响面更广:也影响账号可用性轮询),不在本轮 RCA 范围内。
+  it('🔴 429 → 不挂起,原样报错(限流不是额度耗尽 · 2026-08-04 实证推翻旧契约)', async () => {
+    // 旧契约(2026-08-02 立,2026-08-04 推翻):accountPool.recordError 把
+    //   `statusCode === 402 || statusCode === 429` 判为 isQuotaError → quotaExhaustedAt
+    //   → hasBlockedAccount()=true → 挂起。当时的立论是「撑过 10 次内部重试(~2s)的 429
+    //   属于真实配额问题而非瞬时抖动」,并在本用例注释里登记为待决策项。
+    //
+    // 实证推翻(proxy-logs.json UTC 10:30-11:07 单账号 u623f5f2c):471 次请求 / 147 次 429
+    //   (全部撑过 10 次重试),其中 **146 次(99.3%)在 60 秒内同一账号就有 200 成功** ——
+    //   撑过重试也不代表额度真耗尽,Kiro 后端的 429 是概率式限流窗口(kiroApi 429 重试段
+    //   注释自己写了「不是真 QPS 上限,窗口随机开关」)。
+    //   用户实报:「账号我看到是正常的,闸门却拦起来了」「同一个账号下一秒就能请求成功」。
+    //
+    // 现契约:isQuotaError 只认 402;429 走 errorCount 指数退避(几秒级),绝不挂起。
+    // RCA: .agent-workspace/.archive/2026-08-04/hold-gate-429-quota-false-positive/
     const server = mkSingleAccountServer()
     mockPreBodyError('Kiro API error 429: ThrottlingException rate limit exceeded')
+
+    const { res } = await fireClaudeStream(server)
+
+    expect(server.getHeldRequestsCount()).toBe(0)
+    expect(res.writableEnded).toBe(true)
+
+    server.releaseHeldRequests()
+  })
+
+  it('🟢 402 额度耗尽 → 仍然挂起(修 429 不能把真额度问题一起放过)', async () => {
+    // 与上一条构成受控对照:同样是 pre-body 错误、同样单账号模式,只改状态码语义,
+    // 挂起与否必须翻转。402 = 真的没额度了,挂起等配额恢复/换号才有意义。
+    const server = mkSingleAccountServer()
+    mockPreBodyError('Kiro API error 402: Payment required')
 
     const { res } = await fireClaudeStream(server)
 
