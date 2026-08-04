@@ -1,4 +1,19 @@
 import { ElectronAPI } from '@electron-toolkit/preload'
+/**
+ * Web 面板契约 —— **不在此处重新定义**，一律从主进程侧的权威定义 re-export。
+ *
+ * 为什么这样接：`tsconfig.web.json` 只 include `src/preload/*.d.ts`，**不** include
+ * `src/main/**`，所以 renderer 无法直接 import 主进程类型；而 `tsconfig.node.json`
+ * 同时 include main 与 preload。于是 preload 的 `.d.ts` 是唯一能同时被两侧看见的
+ * 中间层 —— 在这里 re-export，renderer 就能拿到与主进程**同一份**类型。
+ *
+ * 绝不在 renderer 侧另写一份结构相同的 interface：那会造出第二个 SSOT，
+ * 主进程改字段时 renderer 编译照旧通过，运行时才炸。
+ */
+import type { WebPanelStatus } from '../main/ipc/webPanelWiring'
+import type { WebPanelConfig } from '../main/webPanel/server'
+
+export type { WebPanelStatus, WebPanelConfig }
 
 interface AccountData {
   accounts: Record<string, unknown>
@@ -841,6 +856,62 @@ interface KiroApi {
 
   // 监听挂起请求数变化事件(驱动挂起数徐标 + 放行按钮启用态)
   onProxyHeldRequestsChanged: (callback: (info: { count: number }) => void) => () => void
+
+  // ============ Web 管理面板（局域网访问） ============
+  // 契约权威源 = `src/main/ipc/webPanelWiring.ts`（7 条通道，兄弟包已合入 main）。
+  // ⚠️ `enabled`(用户意图 · 持久化配置) 与 `running`(真实监听态) 是两个字段，绝不合并 ——
+  //    端口被占 / 外网绑定无 adminKey 时 enabled 仍为 true 而服务器没在监听，
+  //    合并成一个布尔就会显示「已开启」而手机根本连不上（决策卡 §5 场景 S3）。
+
+  /** 取面板真实状态（running / listeningPort / addresses / hasAdminKey / lastError） */
+  webPanelGetStatus: () => Promise<{ success: boolean; status: WebPanelStatus }>
+
+  /** 取面板配置（enabled / port / host / autoStart / IP 名单） */
+  webPanelGetConfig: () => Promise<{ success: boolean; config: WebPanelConfig }>
+
+  /**
+   * 改配置（patch 合并）。**只改配置，不启停服务器** ——
+   * 「启用开关」= set-config({enabled}) + start/stop 两步，由调用方编排。
+   */
+  webPanelSetConfig: (
+    patch: Partial<WebPanelConfig>
+  ) => Promise<
+    | { success: true; config: WebPanelConfig; status: WebPanelStatus }
+    | { success: false; error: string }
+  >
+
+  /**
+   * 启动面板（首次启动时内部 `ensureAdminKey()` 生成密钥，不设默认密码）。
+   * 失败时返回 `{ success:false, error, status }` —— `error` 是**真实**失败原因
+   * （端口被占 / 外网绑定无 adminKey 被安全红线拒绝），UI 必须显示它。
+   */
+  webPanelStart: () => Promise<
+    | { success: true; status: WebPanelStatus }
+    | { success: false; error: string; status: WebPanelStatus }
+  >
+
+  /** 停止面板（关闭 HTTP server 并释放端口） */
+  webPanelStop: () => Promise<
+    | { success: true; status: WebPanelStatus }
+    | { success: false; error: string; status: WebPanelStatus }
+  >
+
+  /**
+   * 读 adminKey 供设置页显示。**首次调用时生成** —— 故仅在用户主动要看时才调，
+   * 不在页面加载时预取（否则「从未生成」这个状态永远看不到）。
+   * 走 IPC 不经网络，明文回传桌面端是必需的（用户要抄到手机上）。
+   */
+  webPanelGetAdminKey: () => Promise<
+    { success: true; adminKey: string } | { success: false; error: string }
+  >
+
+  /**
+   * 重新生成 adminKey ——⚠️ 内部走 `rotateAdminKey()`，
+   * **立即失效所有既存会话**，所有已连接设备被登出。调用前必须向用户确认。
+   */
+  webPanelRotateAdminKey: () => Promise<
+    { success: true; adminKey: string } | { success: false; error: string }
+  >
 
   // ============ Usage API 类型设置 ============
 

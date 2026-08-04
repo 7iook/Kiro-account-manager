@@ -308,6 +308,39 @@ const en = {
       concurrency: 'Import Concurrency',
       concurrencyDesc: 'Number of accounts to import simultaneously'
     },
+    webPanel: {
+      title: 'Web Admin Panel',
+      description: 'Manage accounts from your phone or another computer on the same network',
+      enabled: 'Enable Web Panel',
+      enabledDesc: 'Allows access from other devices on your local network; disabled by default',
+      // Real run state — shown separately from the toggle (switch on != server listening)
+      stateListening: 'Listening',
+      stateStopped: 'Stopped',
+      stateError: 'Failed to start',
+      // The real reason comes from the main process `lastError` (free text); this is just a prefix
+      startFailed: 'Failed to start: ',
+      // LAN address
+      address: 'Address',
+      addressDesc: 'Type this into the browser on your phone',
+      addressNone: 'Not listening — no reachable address yet',
+      addressLoopbackOnly: 'Currently bound to this machine only (127.0.0.1), so other devices cannot reach it. To allow phone access, change the bind address to 0.0.0.0.',
+      copy: 'Copy',
+      copied: 'Copied',
+      // Port
+      port: 'Port',
+      portDesc: 'Port the panel listens on, independent of the proxy port',
+      portInvalid: 'Port must be a number between 1 and 65535',
+      // adminKey
+      adminKey: 'Access Key',
+      adminKeyDesc: 'You enter this after opening the panel on your phone. Generated on first enable — there is no default password.',
+      adminKeyNone: 'Not generated yet (created when you first enable the panel)',
+      show: 'Show',
+      hide: 'Hide',
+      regenerate: 'Regenerate',
+      regenerateWarning: 'Regenerating the access key immediately disconnects every connected device',
+      regenerateConfirm: 'Regenerate the access key?\n\nEvery connected phone and computer will be logged out immediately and must enter the new key to continue.\n\nContinue?',
+      regenerateDone: 'New access key generated. All connected devices have been logged out.'
+    },
     dangerZone: {
       title: 'Danger Zone',
       clearData: 'Clear All Data',

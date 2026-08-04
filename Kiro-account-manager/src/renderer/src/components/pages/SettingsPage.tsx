@@ -3,6 +3,7 @@ import { Card, CardContent, CardHeader, CardTitle, Button } from '../ui'
 import { Eye, EyeOff, RefreshCw, Clock, Trash2, Download, Upload, Globe, Repeat, Palette, Moon, Sun, Fingerprint, Info, ChevronDown, ChevronUp, Settings, Database, Layers, UserX, Monitor } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { ExportDialog } from '../accounts/ExportDialog'
+import { WebPanelCard } from './WebPanelCard'
 import { useTranslation } from '@/hooks/useTranslation'
 
 // 主题配置 - 按色系分组
@@ -1154,6 +1155,9 @@ export function SettingsPage() {
           </div>
         </CardContent>
       </Card>
+
+      {/* 网页管理面板（局域网访问）—— 与代理设置同级,都是"对外暴露服务"的配置 */}
+      <WebPanelCard />
 
       {/* 配置同步（不含敏感凭据，便于多设备共享） */}
       <ConfigSyncCard isEn={isEn} />

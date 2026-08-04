@@ -308,6 +308,39 @@ const zh = {
       concurrency: '导入并发数',
       concurrencyDesc: '同时导入的账号数量'
     },
+    webPanel: {
+      title: '网页管理面板',
+      description: '在同一局域网的手机或其他电脑上用浏览器管理账号',
+      enabled: '启用网页面板',
+      enabledDesc: '开启后可从局域网内其他设备访问；默认关闭',
+      // 真实运行态 —— 与开关意图分开显示（开关是开的 ≠ 服务器在监听）
+      stateListening: '正在监听',
+      stateStopped: '已停止',
+      stateError: '启动失败',
+      // 真实失败原因由主进程 lastError 提供（自由文本），此处只做前缀
+      startFailed: '启动失败：',
+      // 局域网地址
+      address: '访问地址',
+      addressDesc: '在手机浏览器里输入这个地址',
+      addressNone: '尚未监听，暂无可访问地址',
+      addressLoopbackOnly: '当前仅绑定本机（127.0.0.1），其他设备无法访问。如需手机访问，请将绑定地址改为 0.0.0.0。',
+      copy: '复制',
+      copied: '已复制',
+      // 端口
+      port: '端口',
+      portDesc: '面板监听的端口，与反代端口相互独立',
+      portInvalid: '端口需为 1-65535 之间的数字',
+      // adminKey
+      adminKey: '访问密钥',
+      adminKeyDesc: '在手机上打开面板后需要输入它；首次启用时自动生成，不设默认密码',
+      adminKeyNone: '尚未生成（首次启用面板时自动生成）',
+      show: '显示',
+      hide: '隐藏',
+      regenerate: '重新生成',
+      regenerateWarning: '重新生成访问密钥会立即断开所有已连接的设备',
+      regenerateConfirm: '重新生成访问密钥？\n\n所有已连接的手机和电脑会立即被登出，需要重新输入新密钥才能继续使用。\n\n确定继续？',
+      regenerateDone: '新的访问密钥已生成，所有已连接设备已被登出。'
+    },
     dangerZone: {
       title: '危险区域',
       clearData: '清除所有数据',

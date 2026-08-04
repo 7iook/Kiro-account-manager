@@ -1,5 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
+// 面板契约权威源在主进程侧，此处只 import 不重定义
+// `WebPanelStatus` 定义在 wiring，`WebPanelConfig` 定义在 server —— 各从其真正来源取
+import type { WebPanelStatus } from '../main/ipc/webPanelWiring'
+import type { WebPanelConfig } from '../main/webPanel/server'
 
 // Custom APIs for renderer
 const api = {
@@ -1016,6 +1020,61 @@ const api = {
     return () => {
       ipcRenderer.removeListener('proxy-account-suspended', handler)
     }
+  },
+
+  // ============ Web 管理面板（局域网访问） ============
+  // 通道与形状的权威源 = `src/main/ipc/webPanelWiring.ts:registerIpcHandlers`
+  // ⚠️ `enabled`(配置意图) 与 `running`(真实监听态) 是两个字段,绝不合并 —— 端口被占时
+  //    配置里 enabled 仍为 true 而服务器没在监听,合并成一个布尔就会显示「已开启」骗用户。
+
+  /** 取面板真实状态 */
+  webPanelGetStatus: (): Promise<{ success: boolean; status: WebPanelStatus }> => {
+    return ipcRenderer.invoke('web-panel:get-status')
+  },
+
+  /** 取面板配置 */
+  webPanelGetConfig: (): Promise<{ success: boolean; config: WebPanelConfig }> => {
+    return ipcRenderer.invoke('web-panel:get-config')
+  },
+
+  /** 改配置（patch 合并）；只改配置不启停 */
+  webPanelSetConfig: (
+    patch: Partial<WebPanelConfig>
+  ): Promise<
+    | { success: true; config: WebPanelConfig; status: WebPanelStatus }
+    | { success: false; error: string }
+  > => {
+    return ipcRenderer.invoke('web-panel:set-config', patch)
+  },
+
+  /** 启动面板（失败时 error 里是真实原因,UI 必须显示） */
+  webPanelStart: (): Promise<
+    | { success: true; status: WebPanelStatus }
+    | { success: false; error: string; status: WebPanelStatus }
+  > => {
+    return ipcRenderer.invoke('web-panel:start')
+  },
+
+  /** 停止面板 */
+  webPanelStop: (): Promise<
+    | { success: true; status: WebPanelStatus }
+    | { success: false; error: string; status: WebPanelStatus }
+  > => {
+    return ipcRenderer.invoke('web-panel:stop')
+  },
+
+  /** 读 adminKey（**首次调用时生成**,故仅在用户主动要看时调） */
+  webPanelGetAdminKey: (): Promise<
+    { success: true; adminKey: string } | { success: false; error: string }
+  > => {
+    return ipcRenderer.invoke('web-panel:get-admin-key')
+  },
+
+  /** 重新生成 adminKey ——⚠️ 立即失效所有既存会话,所有已连接设备被登出 */
+  webPanelRotateAdminKey: (): Promise<
+    { success: true; adminKey: string } | { success: false; error: string }
+  > => {
+    return ipcRenderer.invoke('web-panel:rotate-admin-key')
   },
 
   // 监听反代账号更新事件（token 刷新 / Enterprise profileArn 自愈）
