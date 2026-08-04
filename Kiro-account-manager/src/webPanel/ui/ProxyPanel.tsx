@@ -269,12 +269,20 @@ interface AccountPickerProps {
 /**
  * 选号弹窗。
  *
- * 只列出 `status === 'active'` 的账号 —— 其余账号服务端会以
- * `ACCOUNT_NOT_IN_POOL` 拒绝（池的构建同样按这个条件过滤），
- * 列出来只会让用户点了才发现不行。
+ * **候选范围与桌面端 `AccountSelectDialog` 一致:列出全部账号,不按状态筛。**
+ *
+ * 曾经这里多了一层 `filter(a => a.status === 'active')`,理由写的是「其余账号服务端会以
+ * ACCOUNT_NOT_IN_POOL 拒绝,列出来只会让用户白点」。实测推翻(2026-08-05,用户在手机上
+ * 报「选择账号什么都列不出来」):7 个账号里 6 个 `status='error'`,但它们全部能正常刷出
+ * 额度数据 —— `status` 并不可靠到能拿来当「能不能选」的判据;而这层过滤把候选从 7 个
+ * 砍到 1 个(仅剩的那一个恰好就是当前已选中的),表现为功能完全不可用。
+ *
+ * 桌面端的做法是「全部列出」——`AccountSelectDialog` 里只有搜索框会过滤,全文不用 status
+ * 做筛选。选了不可用的号失败是一次可恢复的报错,而看不到号、无法选是死路。两端候选范围
+ * 必须一致,否则同一个号在桌面能选、在手机上凭空消失。
  */
 function AccountPicker({ accounts, selectedId, onClose, onPick }: AccountPickerProps): React.JSX.Element {
-  const usable = (accounts ?? []).filter((a) => a.status === 'active')
+  const usable = accounts ?? []
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center">
       <button
@@ -299,7 +307,7 @@ function AccountPicker({ accounts, selectedId, onClose, onPick }: AccountPickerP
           </button>
         </div>
         {usable.length === 0 ? (
-          <p className="py-6 text-center text-sm text-slate-500">没有状态正常的账号可选</p>
+          <p className="py-6 text-center text-sm text-slate-500">暂无账号</p>
         ) : (
           <ul className="space-y-2">
             {usable.map((a) => (

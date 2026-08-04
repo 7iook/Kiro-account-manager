@@ -213,7 +213,13 @@ describe('反代面板 · 选号', () => {
     expect(screen.getByText('选择账号需要反代处于运行状态')).toBeTruthy()
   })
 
-  it('选号弹窗只列状态正常的账号（其余服务端会拒，列出来只会让用户白点）', async () => {
+  it('选号弹窗列出全部账号(候选范围与桌面端一致,不按 status 二层过滤)', async () => {
+    // 旧行为(已推翻):只列 status==='active',理由写的是「其余服务端会拒,列出来让用户白点」。
+    // 实测推翻(2026-08-05 用户报「手机上选择账号什么都列不出来」):真实环境 7 个账号里
+    // 6 个 status='error',却全部能正常刷出额度 —— status 不可靠到不能拿来当「能不能选」
+    // 的判据;过滤后候选只剩 1 个(恰好是当前已选中的那个)= 功能完全不可用。
+    // 桌面端 AccountSelectDialog 全文不用 status 筛选(只有搜索框过滤),两端必须一致,
+    // 否则同一个号在桌面能选、在手机上凭空消失。
     const { fetchMock } = stubServer({ status: { running: true } })
     vi.stubGlobal('fetch', fetchMock)
     renderPanel()
@@ -223,8 +229,9 @@ describe('反代面板 · 选号', () => {
     const dialog = screen.getByRole('dialog', { name: '选择反代账号' })
     expect(within(dialog).getByText('alice@example.com')).toBeTruthy()
     expect(within(dialog).getByText('bob@example.com')).toBeTruthy()
-    // status='error' 的账号不该出现
-    expect(within(dialog).queryByText('dead@example.com')).toBeNull()
+    // status='error' 的账号**也必须列出** —— 选了不可用的号失败是一次可恢复的报错,
+    // 而看不到号、无法选择是死路
+    expect(within(dialog).getByText('dead@example.com')).toBeTruthy()
   })
 
   it('选号只发一个请求（三步顺序在服务端，客户端不拆开编排）', async () => {
