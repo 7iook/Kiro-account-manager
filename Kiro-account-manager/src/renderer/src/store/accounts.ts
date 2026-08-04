@@ -2076,8 +2076,32 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           }
           return { accounts }
         })
-        get().saveToStorage()
-        
+        // ⚠️ 这里**刻意不调 saveToStorage()** —— 落盘已由 main 侧完成。
+        //
+        // W8:`accountService/check.ts:checkAccountStatus` 现在会经
+        // `applyAccountDataMutation` 把这次刷新的结果落盘（IPC 与 web 面板共用同一条路径）。
+        // 上面那次 `set()` 保留,它是桌面端「额度数字逐条即时更新」响应性的来源 ——
+        // UI 不必等盘。但**再落一次盘就是双写**,而且是危险的双写:
+        //
+        //   store 的落盘是**整表覆盖 + 防抖**（saveToStorage → 500ms 窗口 → flushSaveImmediately
+        //   带 expectedRevision 提交）。main 侧刚写完时 disk revision 已经 +1,而本窗口的
+        //   currentRevision 还是旧值 ⇒ 这次提交必然 STALE ⇒ 走三方合并重放,白花一次
+        //   IPC + 整表序列化 + 合并,产出的内容与盘上已有的完全一致。
+        //
+        // 那为什么删掉它是安全的（不破坏 store 自己的一致性假设）:
+        //   - `currentRevision` / `syncBaseSnapshot` 的收敛不依赖这次写:main 侧写入成功后会
+        //     广播 `accounts-data-changed`,App.tsx:150 的 consumer 判定为外部写（本次广播
+        //     不带 originId）→ `reloadFromStorageQuiet` 对齐盘面并更新 base 与 revision。
+        //     广播万一丢失,I3 的 focus / visibilitychange / 短轮询（≤6s）兜底。
+        //   - 期间若有**别的**未落盘编辑,它们有自己的 saveToStorage 在飞,不受影响;
+        //     那次 flush 撞上更高的 disk revision 时走既有的三方合并 —— 而 usage 字段在
+        //     base 与 ours 里相等（本地没改过它,是 main 侧改的）⇒ 合并采纳 theirs
+        //     ⇒ 新额度不会被本地陈旧快照按回旧值。这正是 base 存在的意义。
+        //
+        // 不动 `updateAccountStatus(id,'refreshing')` 那次落盘（它在本函数开头）:
+        // 那是多调用方共享的通用 setter,改它会溢出本轮范围;它写的是 status 而非 usage,
+        // 且同样受上面那条合并语义保护。已登记为技术债。
+
         // 如果刷新了 token，打印日志
         if (result.data.newCredentials) {
           console.log(`[Account] Token refreshed for ${account?.email}`)
