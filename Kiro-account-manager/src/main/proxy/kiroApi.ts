@@ -1843,6 +1843,41 @@ function throwIfAborted(signal?: AbortSignal): void {
 }
 
 // 调用 Kiro API（流式）
+/**
+ * 判断一个出站失败是否属于「值得整体重试」的瞬时故障。
+ *
+ * 用途:三个端点全挂之后决定要不要退避后重走整条端点链(见 callKiroApiStream catch 末尾)。
+ * 现场依据(RCA 2026-08-04):全库 53 次端点故障有 50 次集中在 KiroRuntime-US 的同一个
+ * 抽风窗口;且 undici 把真因埋在 `error.cause.code` 里(message 恒为 "fetch failed")。
+ *
+ * 判据边界 —— 宽了烧额度,窄了救不回:
+ *   - 传输层错误(连接根本没成 / 半路被 RESET)→ 可重试
+ *   - HTTP 5xx(上游服务端自己的问题)→ 可重试
+ *   - 429 穿透(端点内重试已耗尽;Kiro 是概率式限流窗口)→ 可重试
+ *   - HTTP 4xx(请求本身有问题:400 畸形 / 401 过期 / 404 无此模型)→ 不可重试,
+ *     重试 100 次还是同一个 4xx,纯烧额度。CONTENT_LENGTH_EXCEEDS_THRESHOLD 与
+ *     THINKING_SIGNATURE_INVALID 也落在这里 —— 它们各有专属恢复分支,不该走这条路。
+ *   - 未知错误 → 保守判不可重试
+ */
+export function isTransientNetworkError(err: unknown): boolean {
+  if (!err) return false
+  const e = err as { message?: string; code?: string; cause?: { code?: string; message?: string } }
+  const msg = String(e.message ?? '')
+
+  // 带 HTTP 状态码 = 连接是通的,只有 5xx 值得再试
+  const httpStatus = msg.match(/\b(?:API|Auth) error (\d{3})\b/)
+  if (httpStatus) {
+    const status = Number(httpStatus[1])
+    return status >= 500 && status <= 599
+  }
+  // 端点内 429 重试耗尽后抛的 "Rate limited on <ep> after N retries"
+  if (/rate limited/i.test(msg)) return true
+
+  const codes = [e.code, e.cause?.code].filter(Boolean).map(String).join(' ')
+  const haystack = `${msg} ${String(e.cause?.message ?? '')} ${codes}`
+  return /ECONNRESET|ETIMEDOUT|ECONNREFUSED|ECONNABORTED|EPIPE|EAI_AGAIN|ENETUNREACH|ENETRESET|EHOSTUNREACH|socket hang up|secure TLS connection|fetch failed|other side closed|\bterminated\b|UND_ERR_(?:SOCKET|CONNECT|CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT)/i.test(haystack)
+}
+
 export async function callKiroApiStream(
   account: ProxyAccount,
   payload: KiroPayload,
@@ -1901,6 +1936,12 @@ export async function callKiroApiStream(
   // #26518 #8136 #65905),反代裁剪后重试可让 compact 成功,打破死锁。
   const CONTEXT_OVERFLOW_RECOVERY_RATIOS = [0.7, 0.45, 0.2]
   let overflowRecoveryAttempt = 0
+
+  // ===== 三端点全挂后的整体退避重试(具体判据在 catch 末尾)=====
+  // 与上面的上下文溢出恢复正交:那个是「同一端点、裁小 payload 再试」,
+  // 这个是「payload 不变、等上游缓一缓、重走整条端点链」。
+  const ALL_ENDPOINT_RETRY_BACKOFF_MS = [800, 2000]
+  let allEndpointRetryAttempt = 0
 
   for (let endpointIdx = 0; endpointIdx < endpoints.length; endpointIdx++) {
     const endpoint = endpoints[endpointIdx]
@@ -2157,6 +2198,40 @@ export async function callKiroApiStream(
           if (signal?.aborted) { onError(getAbortError(signal)); return }
           console.error(`[KiroAPI] THINKING_SIGNATURE_INVALID retry error:`, retryErr)
         }
+      }
+
+      // ===== 三端点全挂 → 退避后重走整条端点链(RCA 2026-08-04)=====
+      // 现场(16:40:17):CodeWhisperer / KiroRuntime-US / AmazonQ 在同几秒内全部 ECONNRESET
+      // → 端点 fallback 走完 → lastError 交上层 → decideHoldAction 判 giveup → 客户端直接断,
+      // 全程零重试。而全库 53 次端点故障有 50 次挤在 KiroRuntime-US 的同一个抽风窗口 ——
+      // 这类故障是瞬时的,等一下就好。
+      //
+      // 设计意图(用户明确):网络类 / 429 错误「只需要重试,绝不挂起」—— 重试 ≠ 挂起。
+      // 挂起门闸只管「账号级真不可用」(封禁 / 额度上限 / 未授权),不管链路抽风。
+      //
+      // 为何放在 catch 末尾而不包一层 while:复用上下文溢出恢复已验证的 endpointIdx
+      // 回拨手法,不动循环结构 —— 两个恢复机制共用同一套语义,不引入第二种控制流。
+      const isLastEndpoint = endpointIdx >= endpoints.length - 1
+      if (isLastEndpoint
+        && allEndpointRetryAttempt < ALL_ENDPOINT_RETRY_BACKOFF_MS.length
+        && isTransientNetworkError(error)) {
+        const waitMs = ALL_ENDPOINT_RETRY_BACKOFF_MS[allEndpointRetryAttempt]
+        allEndpointRetryAttempt++
+        const retryMsg = `All ${endpoints.length} endpoint(s) failed with transient error — backing off ${waitMs}ms then retrying whole chain ${allEndpointRetryAttempt}/${ALL_ENDPOINT_RETRY_BACKOFF_MS.length} (last: ${errMsgFull.slice(0, 120)})`
+        console.warn(`[KiroAPI] ${retryMsg}`)
+        proxyLogger.warn('KiroAPI', retryMsg, {
+          endpointsTried: endpoints.length,
+          attempt: allEndpointRetryAttempt,
+          maxAttempts: ALL_ENDPOINT_RETRY_BACKOFF_MS.length,
+          backoffMs: waitMs,
+          lastError: errMsgFull.slice(0, 200),
+          account: account.email || account.id?.slice(0, 8) || '?'
+        })
+        await new Promise(r => setTimeout(r, waitMs))
+        // 退避期间客户端可能已经放弃 —— 白等完再烧一轮额度没意义
+        if (signal?.aborted) { onError(getAbortError(signal)); return }
+        endpointIdx = -1  // 下轮 ++ 回到 0,重走整条端点链
+        continue
       }
     }
   }
@@ -3199,6 +3274,20 @@ async function parseEventStream(
     if (toolLeakFixEnabled && leakedTools.length > 0) {
       let rescued = 0
       let deduped = 0
+
+      // 上游结构化 toolUseEvent 计数 —— 写进下面的 RESCUE 埋点,用于持续判定
+      // 「救回的是真泄漏(上游同时发了结构化工具)还是模型正文里的 XML 示例」。
+      //
+      // 2026-08-04 已证伪的假设(勿重复):曾怀疑 GPT 系是「上游走纯文本协议 + 正文 XML
+      // 被误救 → 客户端 No such tool → END_TURN」,据此加过「GPT 系 + 上游零结构化工具
+      // → 抑制注入」的判据。实测 458 条 STREAM-END 推翻:GPT 侧 tool-leak rescue 与
+      // SUPPRESSED 均为 0 条、leakCarryLeft 全 0;42 条 rescued 全部来自 Claude。
+      // GPT 提前收尾的真因是上游模型行为(「outChars<110 + 零工具 + END_TURN」出现率
+      // GPT 10.1% vs Claude 2.1%),与 tool-leak 无关。抑制判据已回滚 —— 它不但是死代码,
+      // 万一 GPT 某天真泄漏还会把真工具丢掉,反而制造断线。
+      // RCA: .agent-workspace/.archive/2026-08-04/gpt-suppression-rollback-and-endpoint-retry/
+      const upstreamStructuredToolCount = processedIds.size
+
       for (const lt of leakedTools) {
         let sig: string
         try { sig = toolSig(lt.name, lt.input) } catch { sig = lt.name + '|?' }
@@ -3208,14 +3297,23 @@ async function parseEventStream(
           continue
         }
         seenToolSigs.add(sig)
+
+        // 无条件 RESCUE 详情埋点(不需要开 KIRO_TOOL_LEAK_DEBUG)——
+        // 用于持续判定「救回的到底是真工具还是模型正文里的 XML 示例」。
+        const inputKeys = (() => { try { return Object.keys(lt.input || {}).join(',') } catch { return '?' } })()
+        const inputPreview = (() => { try { return JSON.stringify(lt.input).slice(0, 160) } catch { return '[unserializable]' } })()
+
         leakIdCounter++
         const rescuedId = `toolleakfix_${Date.now().toString(36)}_${leakIdCounter.toString(36)}`
+        proxyLogger.info('Kiro',
+          `[tool-leak-fix][RESCUE] model=${modelId ?? '?'} · id=${rescuedId} · name=${lt.name} ` +
+          `· inputKeys=[${inputKeys}] · upstreamStructuredTools=${upstreamStructuredToolCount} · input=${inputPreview}`)
         if (toolLeakDebug) console.log(`[tool-leak-fix] [RESCUE] id=${rescuedId} name=${lt.name} input=${JSON.stringify(lt.input).slice(0, 200)}`)
         await onChunk('', { toolUseId: rescuedId, name: lt.name, input: lt.input })
         rescued++
       }
       if (rescued > 0 || toolLeakDebug) {
-        proxyLogger.info('Kiro', `Tool-leak-fix: leaked=${leakedTools.length} rescued=${rescued} deduped=${deduped} seen_sigs=${seenToolSigs.size}`)
+        proxyLogger.info('Kiro', `Tool-leak-fix: leaked=${leakedTools.length} rescued=${rescued} deduped=${deduped} seen_sigs=${seenToolSigs.size} model=${modelId ?? '?'} upstreamStructuredTools=${upstreamStructuredToolCount}`)
       }
     }
 
