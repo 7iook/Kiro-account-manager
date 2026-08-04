@@ -56,6 +56,25 @@ import {
   type AccountsBlob,
   type BroadcastPayload as AccountsBroadcastPayload
 } from './accountService/state'
+// 切号 / 退出登录 / 导入导出 / 订阅 的业务实现已抽到 accountService/,
+// 让 IPC 通道与将来的 web 面板 HTTP 层共用同一份实现(决策卡 §3),而不是各写一份。
+// 本文件的 handler 只负责:注入宿主机能力(Electron dialog / 本机磁盘 / SQLite)+ 注入模块级状态的读写。
+import {
+  switchAccountToIde,
+  logoutAccount,
+  type SwitchAccountCredentials
+} from './accountService/switch'
+import {
+  switchAccountToCli,
+  type SwitchAccountCliCredentials
+} from './accountService/switchCli'
+import {
+  getAccountModels,
+  getAccountSubscriptions,
+  getAccountSubscriptionUrl,
+  setAccountOverage
+} from './accountService/subscription'
+import { exportToFile, importFromFile } from './accountService/transfer'
 import {
   createTray,
   destroyTray,
@@ -4178,50 +4197,45 @@ app.whenReady().then(async () => {
   )
 
   // IPC: 导出到文件
+  //   业务实现在 accountService/transfer.ts(IPC 与将来的 HTTP 层共用)。
+  //   此处只注入宿主机能力:Electron dialog 选路径 + 本机写盘。
   ipcMain.handle('export-to-file', async (_event, data: string, filename: string) => {
-    try {
-      const result = await dialog.showSaveDialog(mainWindow!, {
-        title: '导出账号数据',
-        defaultPath: filename,
-        filters: [{ name: 'JSON Files', extensions: ['json'] }]
-      })
-
-      if (!result.canceled && result.filePath) {
-        await writeFile(result.filePath, data, 'utf-8')
-        return true
-      }
-      return false
-    } catch (error) {
-      console.error('Failed to export:', error)
-      return false
-    }
+    return exportToFile(
+      {
+        pickSavePath: async (defaultPath) => {
+          const result = await dialog.showSaveDialog(mainWindow!, {
+            title: '导出账号数据',
+            defaultPath,
+            filters: [{ name: 'JSON Files', extensions: ['json'] }]
+          })
+          return !result.canceled && result.filePath ? result.filePath : null
+        },
+        writeTextFile: (filePath, content) => writeFile(filePath, content, 'utf-8')
+      },
+      data,
+      filename
+    )
   })
 
   // IPC: 从文件导入
+  //   业务实现在 accountService/transfer.ts;此处只注入 Electron dialog + 本机读盘。
   ipcMain.handle('import-from-file', async () => {
-    try {
-      const result = await dialog.showOpenDialog(mainWindow!, {
-        title: '导入账号数据',
-        filters: [
-          { name: '所有支持的格式', extensions: ['json', 'csv', 'txt'] },
-          { name: 'JSON Files', extensions: ['json'] },
-          { name: 'CSV Files', extensions: ['csv'] },
-          { name: 'TXT Files', extensions: ['txt'] }
-        ],
-        properties: ['openFile']
-      })
-
-      if (!result.canceled && result.filePaths.length > 0) {
-        const filePath = result.filePaths[0]
-        const content = await readFile(filePath, 'utf-8')
-        const ext = filePath.split('.').pop()?.toLowerCase() || 'json'
-        return { content, format: ext }
-      }
-      return null
-    } catch (error) {
-      console.error('Failed to import:', error)
-      return null
-    }
+    return importFromFile({
+      pickOpenPath: async () => {
+        const result = await dialog.showOpenDialog(mainWindow!, {
+          title: '导入账号数据',
+          filters: [
+            { name: '所有支持的格式', extensions: ['json', 'csv', 'txt'] },
+            { name: 'JSON Files', extensions: ['json'] },
+            { name: 'CSV Files', extensions: ['csv'] },
+            { name: 'TXT Files', extensions: ['txt'] }
+          ],
+          properties: ['openFile']
+        })
+        return !result.canceled && result.filePaths.length > 0 ? result.filePaths[0] : null
+      },
+      readTextFile: (filePath) => readFile(filePath, 'utf-8')
+    })
   })
 
   // IPC: 验证网页 API Key(ksk_)凭据有效性 + 附赠尝试解析 profileArn(§6 Surgical Fix · RCA A2-R3 责任拆分)
@@ -4716,7 +4730,8 @@ app.whenReady().then(async () => {
 
   // IPC: 切换账号 - 写入凭证到本地 SSO 缓存
   //
-  // 关键设计：切号前必先 refresh 一次，但与旧实现不同——
+  // 业务实现在 accountService/switch.ts:switchAccountToIde(IPC 与将来的 HTTP 层共用)。
+  // 关键设计(全部在被抽出的函数里,改那边时不要"顺手简化"):
   //   1. (bug A 修复) 把 OIDC 返回的新 refreshToken 也写入磁盘
   //      （旧实现只更新 accessToken，refreshToken 仍是已被服务端 rotate 作废的 v1，
   //       导致 Kiro IDE ~55min 后用 v1 刷新 → 401 → logoutAndForget）
@@ -4724,336 +4739,113 @@ app.whenReady().then(async () => {
   //   3. (bug D 修复) refresh 失败时直接报错并拒绝写入文件，避免埋雷
   //   4. (bug F 支持) 通过 refreshedCredentials 把新 refresh 回传 renderer，让反代 store 同步
   //   5. 记录 lastSwitchedAccountId，供 fs.watch 反向同步时用作账号匹配兜底
-  ipcMain.handle('switch-account', async (_event, credentials: {
-    accessToken: string
-    refreshToken: string
-    clientId: string
-    clientSecret: string
-    region?: string
-    startUrl?: string
-    authMethod?: 'IdC' | 'social' | 'external_idp' | 'api_key'
-    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise' | 'AzureAD' | 'ExternalIdp'
-    profileArn?: string
-    tokenEndpoint?: string
-    issuerUrl?: string
-    scopes?: string
-    audience?: string
-    accountId?: string
-  }) => {
-    try {
-      const {
-        refreshToken,
-        clientId,
-        clientSecret,
-        region = 'us-east-1',
-        startUrl,
-        authMethod = 'IdC',
-        provider = 'BuilderId',
-        profileArn,
-        tokenEndpoint,
-        issuerUrl,
-        scopes,
-        audience,
-        accountId
-      } = credentials
-      let finalAccessToken = credentials.accessToken
-      let finalRefreshToken = refreshToken
-      let finalExpiresIn = 3600
-
-      // 切号前先 refresh，确保磁盘里写的是最新 access + 最新 refresh（rotating）
-      if (refreshToken) {
-        console.log(`[Switch Account] Refreshing token before switch (authMethod: ${authMethod})...`)
-        const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod, undefined, { tokenEndpoint, scopes })
-        if (refreshResult.success && refreshResult.accessToken) {
-          finalAccessToken = refreshResult.accessToken
-          // bug A 修复：OIDC 返回新 refreshToken 时必须替换；否则下次 IDE/反代 refresh 会撞已作废的 v1
-          finalRefreshToken = refreshResult.refreshToken || refreshToken
-          finalExpiresIn = refreshResult.expiresIn ?? 3600
-          console.log('[Switch Account] Token refreshed successfully (rotated refreshToken updated)')
-        } else {
-          // bug D 修复：refresh 失败不写文件 + 直接报错，避免给 IDE 留下"半坏"token
-          const errMsg = refreshResult.error || 'Unknown refresh error'
-          console.warn(`[Switch Account] Token refresh failed, aborting switch: ${errMsg}`)
-          return {
-            success: false,
-            error: `刷新 Token 失败，未写入 Kiro IDE 磁盘文件，避免下次自动刷新失败导致 IDE 强制登出。原因：${errMsg}`
-          }
-        }
-      }
-
-      // profileArn 决策统一由 helper：Enterprise 用区域化备用 ARN，BuilderId 用占位符
-      const resolvedProfileArn = resolveProfileArnForWrite({
-        profileArn,
-        authMethod,
-        provider,
-        region
-      })
-
-      // bug C 修复：用真实 expiresIn 算 expiresAt
-      const expiresAtIso = new Date(Date.now() + finalExpiresIn * 1000).toISOString()
-
-      const { tokenPath, clientRegPath } = await writeKiroAuthTokenFile({
-        accessToken: finalAccessToken,
-        refreshToken: finalRefreshToken,
-        expiresAtIso,
-        authMethod: authMethod === 'api_key' ? 'IdC' : authMethod,
-        provider,
-        region,
-        startUrl,
-        clientId,
-        clientSecret,
-        profileArn: resolvedProfileArn,
-        tokenEndpoint,
-        issuerUrl,
-        scopes,
-        audience
-      })
-      console.log('[Switch Account] Token written to:', tokenPath)
-      if (clientRegPath) {
-        console.log('[Switch Account] Client registration written to:', clientRegPath)
-      }
-
-      // 记录 lastSwitchedAccountId（供 watcher 反向同步时识别 IDE 当前账号）
-      if (accountId) {
-        lastSwitchedAccountId = accountId
-        // 同步记录 access/refresh 的"信任源头"，避免 watcher 把刚写的同一份数据再回写一次
-        lastWrittenTokenSignature = `${finalAccessToken}|${finalRefreshToken}`
-        // 如启用了主动续期，立刻 schedule 下一次（基于刚写入的 expiresAt）
-        if (proactiveRenewalEnabled) {
-          scheduleProactiveRenewal(accountId, Date.now() + finalExpiresIn * 1000)
-        }
-      }
-
-      return {
-        success: true,
-        // bug F 支持：回传 refresh 后的最新 credentials 让 renderer 更新 store
-        refreshedCredentials: {
-          accessToken: finalAccessToken,
-          refreshToken: finalRefreshToken,
-          expiresIn: finalExpiresIn
-        }
-      }
-    } catch (error) {
-      console.error('[Switch Account] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '切换失败' }
-    }
+  //
+  // lastSwitchedAccountId / lastWrittenTokenSignature 通过 setter 注入而非让 switch.ts 自己持有:
+  //   读方是本文件的 watcher(:1875 防回环 / :1937 账号匹配兜底),两边必须是同一份。
+  ipcMain.handle('switch-account', async (_event, credentials: SwitchAccountCredentials) => {
+    return switchAccountToIde(
+      {
+        refreshTokenByMethod,
+        writeKiroAuthTokenFile,
+        resolveProfileArnForWrite,
+        setLastSwitchedAccountId: (id) => {
+          lastSwitchedAccountId = id
+        },
+        setLastWrittenTokenSignature: (sig) => {
+          lastWrittenTokenSignature = sig
+        },
+        isProactiveRenewalEnabled: () => proactiveRenewalEnabled,
+        scheduleProactiveRenewal
+      },
+      credentials
+    )
   })
 
   // IPC: 切换账号到 Kiro CLI - 写入凭证到 SQLite 数据库
   // kiro-cli 使用 ~/.local/share/kiro-cli/data.sqlite3 中的 auth_kv 表
-  ipcMain.handle('switch-account-cli', async (_event, credentials: {
-    accessToken: string
-    refreshToken: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    profileArn?: string
-    provider?: string
-    scopes?: string[]
-    tokenEndpoint?: string
-    issuerUrl?: string
-    audience?: string
-  }) => {
-    const os = await import('os')
-    const path = await import('path')
-    const { mkdir } = await import('fs/promises')
-
-    try {
-      const {
-        refreshToken,
-        clientId,
-        clientSecret,
-        region = 'us-east-1',
-        profileArn,
-        provider,
-        scopes,
-        tokenEndpoint,
-        issuerUrl,
-        audience
-      } = credentials
-      let { accessToken } = credentials
-
-      // external_idp (Azure AD) 判定：切 CLI 全程复用
-      const isExternalIdp = provider === 'AzureAD' || provider === 'ExternalIdp'
-
-      // 切号前先刷新 token（和 IDE 切号一致）
-      let finalRefreshToken = refreshToken
-      let finalExpiresIn = 3600
-      if (refreshToken) {
-        const authMethod = (provider === 'Google' || provider === 'Github') ? 'social'
-          : isExternalIdp ? 'external_idp' : undefined
-        console.log(`[Switch CLI] Refreshing token before switch (provider: ${provider})...`)
-        const refreshResult = await refreshTokenByMethod(refreshToken, clientId || '', clientSecret || '', region, authMethod, undefined, { tokenEndpoint, scopes: scopes?.join(' ') })
-        if (refreshResult.success && refreshResult.accessToken) {
-          accessToken = refreshResult.accessToken
-          // 微软 external_idp 刷新会轮换 refreshToken，必须写回轮换后的值，否则下次 CLI 自刷用作废 v1
-          finalRefreshToken = refreshResult.refreshToken || refreshToken
-          finalExpiresIn = refreshResult.expiresIn ?? 3600
-          console.log('[Switch CLI] Token refreshed successfully')
-        } else {
-          console.warn(`[Switch CLI] Token refresh failed: ${refreshResult.error}, using existing token`)
-        }
-      }
-
-      // kiro-cli SQLite 数据库路径
-      // Windows: %LOCALAPPDATA%\kiro-cli\data.sqlite3
-      // macOS/Linux: ~/.local/share/kiro-cli/data.sqlite3
-      const dataDir = process.platform === 'win32'
-        ? path.join(os.homedir(), 'AppData', 'Local', 'kiro-cli')
-        : path.join(os.homedir(), '.local', 'share', 'kiro-cli')
-      await mkdir(dataDir, { recursive: true })
-      const dbPath = path.join(dataDir, 'data.sqlite3')
-
-      // 判断 token key：external_idp→external-idp:token，social→social:token，IdC→odic:token
-      const isSocial = provider === 'Google' || provider === 'Github'
-      const preferredTokenKey = isExternalIdp ? 'kirocli:external-idp:token'
-        : isSocial ? 'kirocli:social:token' : 'kirocli:odic:token'
-      const preferredRegKey = 'kirocli:odic:device-registration'
-
-      // profileArn 决策统一由 helper：BuilderId 不带 profileArn
-      // kiro-cli 同样不应该在 SQLite 里塞占位符 ARN（实测会触发 REST 端点 403）
-      const resolvedProfileArn = resolveProfileArnForWrite({
-        profileArn,
-        authMethod: isExternalIdp ? 'external_idp' : isSocial ? 'social' : 'IdC',
-        provider,
-        region
-      })
-
-      // 构建 token JSON（snake_case 字段名，与 kiro-cli Rust 结构一致）
-      const expiresAt = new Date(Date.now() + finalExpiresIn * 1000).toISOString()
-      const tokenData: Record<string, unknown> = {
-        access_token: accessToken,
-        refresh_token: finalRefreshToken,
-        expires_at: expiresAt,
-        region
-      }
-      // profileArn 仅在解析出有效值时附加，BuilderId 等不带（避免 kiro-cli 拿占位符 ARN 调 REST 触发 403）
-      if (resolvedProfileArn) {
-        tokenData.profile_arn = resolvedProfileArn
-      }
-      if (scopes) tokenData.scopes = scopes
-      // external_idp: 补齐 kiro-cli 二进制声明的微软元数据字段（参考 kiro-switch cli_writer.py inject_external_idp）
-      if (isExternalIdp) {
-        tokenData.auth_method = 'external_idp'
-        tokenData.provider = 'ExternalIdp'
-        if (tokenEndpoint) tokenData.token_endpoint = tokenEndpoint
-        if (issuerUrl) {
-          tokenData.issuer = issuerUrl
-          tokenData.issuer_url = issuerUrl
-        }
-        if (clientId) tokenData.client_id = clientId
-        if (audience) tokenData.audience = audience
-      }
-
-      // 使用 sqlite3 命令行操作（跨平台兼容，无需原生模块编译）
-      const { execFileSync } = await import('child_process')
-      const sqlite3Bin = process.platform === 'win32' ? 'sqlite3.exe' : 'sqlite3'
-
-      // 构建 SQL 语句
-      const sqlStatements: string[] = [
-        'CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT);',
-        'CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);',
-        `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredTokenKey}', '${JSON.stringify(tokenData).replace(/'/g, "''")}');`
-      ]
-
-      // state 表 api.codewhisperer.profile：external_idp / social 必须写，否则 kiro-cli 报
-      // "profileArn is required for this request"（实测，见 kiro-switch cli_writer.py inject_external_idp/inject_social）。
-      // ★ 严格只含 arn + profile_name 两键——多写 profileName/profile_arn 会让 kiro-cli 的 serde 判 profileArn 无效。
-      // IdC/BuilderId 不写（走 device-registration 路径，占位符 ARN 反而触发 REST 403）；无 ARN 时清掉残留。
-      const STATE_PROFILE_KEY = 'api.codewhisperer.profile'
-      if ((isExternalIdp || isSocial) && resolvedProfileArn) {
-        const profileName = isExternalIdp ? 'ExternalIdp_Default_Profile' : 'Social_Default_Profile'
-        const profileObj = { arn: resolvedProfileArn, profile_name: profileName }
-        sqlStatements.push(
-          `INSERT OR REPLACE INTO state (key, value) VALUES ('${STATE_PROFILE_KEY}', '${JSON.stringify(profileObj).replace(/'/g, "''")}');`
-        )
-      } else if (!resolvedProfileArn) {
-        // BuilderId 等无 ARN：清掉可能残留的上一个账号 profile，避免 CLI 误用旧 ARN
-        sqlStatements.push(`DELETE FROM state WHERE key = '${STATE_PROFILE_KEY}';`)
-      }
-
-      // 写入 device-registration（仅 IdC 登录；social/external_idp 不需要）
-      if (clientId && clientSecret && !isSocial && !isExternalIdp) {
-        const regData = { client_id: clientId, client_secret: clientSecret, region }
-        sqlStatements.push(
-          `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredRegKey}', '${JSON.stringify(regData).replace(/'/g, "''")}');`
-        )
-      }
-
-      // 清除其他优先级的旧 key
-      const cliTokenKeys = ['kirocli:social:token', 'kirocli:odic:token', 'kirocli:external-idp:token', 'codewhisperer:odic:token']
-      for (const key of cliTokenKeys) {
-        if (key !== preferredTokenKey) {
-          sqlStatements.push(`DELETE FROM auth_kv WHERE key = '${key}';`)
-        }
-      }
-
-      try {
-        execFileSync(sqlite3Bin, [dbPath], {
-          input: sqlStatements.join('\n'),
-          timeout: 10000,
-          encoding: 'utf-8'
-        })
-      } catch (sqlite3Error) {
-        // sqlite3 命令不存在，尝试用 Node.js 22+ 的内置 SQLite
-        console.log('[Switch CLI] sqlite3 command not available, trying Node.js built-in SQLite...')
-        try {
-          const { DatabaseSync } = await import('node:sqlite') as { DatabaseSync: new (path: string) => { exec: (sql: string) => void; close: () => void } }
-          const db = new DatabaseSync(dbPath)
+  //
+  // 业务实现在 accountService/switchCli.ts:switchAccountToCli。
+  // 此处只注入宿主机能力:解析本机 kiro-cli 数据目录 + 执行 SQLite 语句(含 sqlite3 命令行
+  // → Node 内置 SQLite 的降级链)。
+  ipcMain.handle('switch-account-cli', async (_event, credentials: SwitchAccountCliCredentials) => {
+    return switchAccountToCli(
+      {
+        refreshTokenByMethod,
+        resolveProfileArnForWrite,
+        resolveCliDbPath: async () => {
+          const os = await import('os')
+          const path = await import('path')
+          const { mkdir } = await import('fs/promises')
+          // kiro-cli SQLite 数据库路径
+          // Windows: %LOCALAPPDATA%\kiro-cli\data.sqlite3
+          // macOS/Linux: ~/.local/share/kiro-cli/data.sqlite3
+          const dataDir =
+            process.platform === 'win32'
+              ? path.join(os.homedir(), 'AppData', 'Local', 'kiro-cli')
+              : path.join(os.homedir(), '.local', 'share', 'kiro-cli')
+          await mkdir(dataDir, { recursive: true })
+          return path.join(dataDir, 'data.sqlite3')
+        },
+        execSqlite: async (dbPath, sqlStatements) => {
+          // 使用 sqlite3 命令行操作（跨平台兼容，无需原生模块编译）
+          const { execFileSync } = await import('child_process')
+          const sqlite3Bin = process.platform === 'win32' ? 'sqlite3.exe' : 'sqlite3'
           try {
-            for (const sql of sqlStatements) {
-              db.exec(sql)
+            execFileSync(sqlite3Bin, [dbPath], {
+              input: sqlStatements.join('\n'),
+              timeout: 10000,
+              encoding: 'utf-8'
+            })
+          } catch (sqlite3Error) {
+            // sqlite3 命令不存在，尝试用 Node.js 22+ 的内置 SQLite
+            console.log('[Switch CLI] sqlite3 command not available, trying Node.js built-in SQLite...')
+            try {
+              const { DatabaseSync } = await import('node:sqlite') as { DatabaseSync: new (path: string) => { exec: (sql: string) => void; close: () => void } }
+              const db = new DatabaseSync(dbPath)
+              try {
+                for (const sql of sqlStatements) {
+                  db.exec(sql)
+                }
+              } finally {
+                db.close()
+              }
+            } catch {
+              throw new Error(`SQLite 操作失败: sqlite3 命令不可用 (${(sqlite3Error as Error).message})，且 Node.js 内置 SQLite 不支持。请确保系统安装了 sqlite3 命令行工具。`)
             }
-          } finally {
-            db.close()
           }
-        } catch {
-          throw new Error(`SQLite 操作失败: sqlite3 命令不可用 (${(sqlite3Error as Error).message})，且 Node.js 内置 SQLite 不支持。请确保系统安装了 sqlite3 命令行工具。`)
         }
-      }
-
-      console.log(`[Switch CLI] Token saved to SQLite key: ${preferredTokenKey}`)
-      console.log(`[Switch CLI] Account switched successfully in ${dbPath}`)
-      return { success: true, dbPath }
-    } catch (error) {
-      console.error('[Switch CLI] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'CLI 切换失败' }
-    }
+      },
+      credentials
+    )
   })
 
 
   // IPC: 退出登录 - 清除本地 SSO 缓存
+  //   业务实现在 accountService/switch.ts:logoutAccount;此处注入本机 SSO 缓存目录的读写。
   ipcMain.handle('logout-account', async () => {
-    const os = await import('os')
-    const path = await import('path')
-    const { readdir, unlink } = await import('fs/promises')
-
-    // 立刻清掉主动续期 timer 和"激活账号"记忆，避免 watcher / timer 误同步
-    clearProactiveRenewal('logout-account')
-    lastSwitchedAccountId = null
-    lastWrittenTokenSignature = null
-
-    try {
-      const ssoCache = path.join(os.homedir(), '.aws', 'sso', 'cache')
-      console.log('[Logout] Clearing SSO cache:', ssoCache)
-      
-      // 读取目录下所有文件
-      const files = await readdir(ssoCache).catch(() => [])
-      
-      // 删除所有文件
-      for (const file of files) {
-        const filePath = path.join(ssoCache, file)
-        await unlink(filePath).catch((e) => {
-          console.warn('[Logout] Failed to delete file:', filePath, e)
-        })
+    return logoutAccount({
+      clearProactiveRenewal,
+      setLastSwitchedAccountId: (id) => {
+        lastSwitchedAccountId = id
+      },
+      setLastWrittenTokenSignature: (sig) => {
+        lastWrittenTokenSignature = sig
+      },
+      listSsoCacheFiles: async () => {
+        const os = await import('os')
+        const path = await import('path')
+        const { readdir } = await import('fs/promises')
+        const ssoCache = path.join(os.homedir(), '.aws', 'sso', 'cache')
+        console.log('[Logout] Clearing SSO cache:', ssoCache)
+        // 目录不存在按空目录处理(与原实现 .catch(() => []) 一致)
+        const files = await readdir(ssoCache).catch(() => [])
+        return files.map((f) => path.join(ssoCache, f))
+      },
+      deleteSsoCacheFile: async (filePath) => {
+        const { unlink } = await import('fs/promises')
+        await unlink(filePath)
       }
-      
-      console.log('[Logout] SSO cache cleared, deleted', files.length, 'files')
-      return { success: true, deletedCount: files.length }
-    } catch (error) {
-      console.error('[Logout] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '退出失败' }
-    }
+    })
   })
 
   // ============ 手动登录相关 IPC ============
@@ -6877,76 +6669,39 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 获取账户可用模型列表
+  //   业务实现在 accountService/subscription.ts(IPC 与将来的 HTTP 层共用)。
   ipcMain.handle('account-get-models', async (_event, accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
-    try {
-      const models = await fetchKiroModels({
-        id: accountId || 'model-list-request',
-        accessToken,
-        region: region || 'us-east-1',
-        profileArn,
-        machineId,
-        provider,
-        authMethod: authMethod as ProxyAccount['authMethod']
-      } as ProxyAccount)
-      return {
-        success: true,
-        models: models.map(m => ({
-          id: m.modelId,
-          name: m.modelName,
-          description: m.description,
-          inputTypes: m.supportedInputTypes,
-          maxInputTokens: m.tokenLimits?.maxInputTokens,
-          maxOutputTokens: m.tokenLimits?.maxOutputTokens,
-          rateMultiplier: m.rateMultiplier,
-          rateUnit: m.rateUnit
-        }))
-      }
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to get models', models: [] }
-    }
+    return getAccountModels(
+      { fetchKiroModels },
+      { accessToken, region, profileArn, machineId, provider, authMethod, accountId }
+    )
   })
 
   // IPC: 获取可用订阅列表
   ipcMain.handle('account-get-subscriptions', async (_event, accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
-    try {
-      const result = await fetchAvailableSubscriptions({ id: accountId || 'subscription-request', accessToken, region: region || 'us-east-1', profileArn, machineId, provider, authMethod } as ProxyAccount)
-      if (result.subscriptionPlans) {
-        return { 
-          success: true, 
-          plans: result.subscriptionPlans,
-          disclaimer: result.disclaimer 
-        }
-      }
-      return { success: false, error: 'No subscription plans returned', plans: [] }
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to get subscriptions', plans: [] }
-    }
+    return getAccountSubscriptions(
+      { fetchAvailableSubscriptions },
+      { accessToken, region, profileArn, machineId, provider, authMethod, accountId }
+    )
   })
 
   // IPC: 获取订阅管理/支付链接
+  //   只返回 URL,打开动作由 open-subscription-window 负责(桌面端本机无痕窗口 = 宿主机能力)。
   ipcMain.handle('account-get-subscription-url', async (_event, accessToken: string, subscriptionType?: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
-    try {
-      const result = await fetchSubscriptionToken({ id: accountId || 'subscription-request', accessToken, region: region || 'us-east-1', profileArn, machineId, provider, authMethod } as ProxyAccount, subscriptionType)
-      if (result.encodedVerificationUrl) {
-        return { success: true, url: result.encodedVerificationUrl, status: result.status }
-      }
-      return { success: false, error: result.message || 'No subscription URL returned' }
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to get subscription URL' }
-    }
+    return getAccountSubscriptionUrl(
+      { fetchSubscriptionToken },
+      { accessToken, region, profileArn, machineId, provider, authMethod, accountId },
+      subscriptionType
+    )
   })
 
   // IPC: 设置用户偏好（超额开启/关闭）
   ipcMain.handle('account-set-overage', async (_event, accessToken: string, overageStatus: 'ENABLED' | 'DISABLED', region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
-    try {
-      const result = await setUserPreference(
-        { id: accountId || 'subscription-request', accessToken, region: region || 'us-east-1', profileArn, machineId, provider, authMethod } as ProxyAccount,
-        overageStatus
-      )
-      return result
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to set overage' }
-    }
+    return setAccountOverage(
+      { setUserPreference },
+      { accessToken, region, profileArn, machineId, provider, authMethod, accountId },
+      overageStatus
+    )
   })
 
   // IPC: 在系统默认浏览器无痕模式中打开订阅链接
