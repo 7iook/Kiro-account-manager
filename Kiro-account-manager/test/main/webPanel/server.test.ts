@@ -6,6 +6,7 @@
  * 传输层才暴露的问题(决策卡 §3:`Path=/panel` 与路由前缀不一致 → 静默 401)。
  */
 import { describe, it, expect, afterEach } from 'vitest'
+import { networkInterfaces } from 'node:os'
 import { WebPanelServer, type WebPanelConfig } from '../../../src/main/webPanel/server'
 import { PanelAuth, type AdminKeyStore } from '../../../src/main/webPanel/auth'
 import { PANEL_PATH_PREFIX, SESSION_COOKIE_NAME } from '../../../src/main/webPanel/cookie'
@@ -373,5 +374,71 @@ describe('WebPanelServer · IP 门禁与生命周期', () => {
     const res = await fetch(`http://127.0.0.1:${server.getListeningAddress()!.port}/nope`)
     expect(res.status).toBe(404)
     expect(res.headers.get('content-type')).toContain('application/json')
+  })
+})
+
+/**
+ * 局域网可达性 —— 受控对照(RCA 2026-08-05 web-panel-lan-no-bind-control)
+ *
+ * 用户报障:「即使连着同一个局域网,手机也无法访问」。设置页当时把 host 永久留在
+ * 默认 `127.0.0.1`(界面没有任何修改绑定地址的控件),所以服务器只绑回环。
+ *
+ * 这两条用例把「host 决定手机能不能连」钉成可执行事实:**只改 host 一个变量**,
+ * 从本机真实网卡 IP 发真请求,可达性必须翻转。它是 WebPanelCard 那侧
+ * 「开关会写 host='0.0.0.0'」的下半段 —— 两段合起来才覆盖完整链路。
+ */
+describe('WebPanelServer · 局域网可达性由 host 决定(受控对照)', () => {
+  /**
+   * 挑一个**真实**的私网 IPv4。刻意排除:
+   *   - `169.254.x`  link-local(RFC 3927),手机永远连不上
+   *   - 非私网段     公网/伪接口地址,不该拿来当局域网自测目标
+   * 本机实测有 11 个 IPv4(WSL / Hyper-V / VMware / Tailscale / 4 个 link-local),
+   * 只有 WLAN 那个是手机真能用的 —— 所以这里必须挑,不能拿第一个。
+   */
+  function pickPrivateLanIp(): string | null {
+    for (const entries of Object.values(networkInterfaces())) {
+      for (const e of entries ?? []) {
+        if (e.family !== 'IPv4' || e.internal) continue
+        const ip = e.address
+        if (ip.startsWith('169.254.')) continue
+        const isPrivate =
+          ip.startsWith('192.168.') ||
+          ip.startsWith('10.') ||
+          /^172\.(1[6-9]|2\d|3[01])\./.test(ip)
+        if (isPrivate) return ip
+      }
+    }
+    return null
+  }
+
+  it('host=0.0.0.0 ⇒ 从本机真实局域网 IP 能连上(手机能访问的前提)', async () => {
+    const lanIp = pickPrivateLanIp()
+    if (!lanIp) return // 无私网网卡的环境(纯 CI)跳过,不伪造结论
+
+    const { server } = makeServer({ host: '0.0.0.0' })
+    await server.start()
+    const addr = server.getListeningAddress()
+    expect(addr).not.toBeNull()
+
+    // 关键判据是「连上了」,不是「拿到 200」—— 未登录返 401 同样证明 TCP+HTTP 通了
+    const res = await fetch(`http://${lanIp}:${addr!.port}${PANEL_PATH_PREFIX}/api/session`)
+    expect(res.status).toBeGreaterThanOrEqual(200)
+    expect(res.status).toBeLessThan(500)
+  })
+
+  it('host=127.0.0.1 ⇒ 从同一个局域网 IP 必须连不上(这正是用户报障的现象)', async () => {
+    const lanIp = pickPrivateLanIp()
+    if (!lanIp) return
+
+    const { server } = makeServer({ host: '127.0.0.1' })
+    await server.start()
+    const addr = server.getListeningAddress()
+    expect(addr).not.toBeNull()
+
+    // 只改了 host,同一个 IP、同一段代码 → 必须连不上。
+    // 这条翻转才让上一条成为「根因证据」而非「碰巧能连」(§0.14 门3)
+    await expect(
+      fetch(`http://${lanIp}:${addr!.port}${PANEL_PATH_PREFIX}/api/session`)
+    ).rejects.toThrow()
   })
 })

@@ -7,16 +7,23 @@ export interface SwitchProps {
   onCheckedChange?: (checked: boolean) => void
   disabled?: boolean
   className?: string
+  /**
+   * 可访问名。同一区块出现多个开关时必须给 —— 否则屏幕阅读器与
+   * `getByRole('switch')` 都无法区分它们(前者念不出这个开关管什么,
+   * 后者会因多个匹配而报 ambiguous)。
+   */
+  'aria-label'?: string
 }
 
 const Switch = React.forwardRef<HTMLButtonElement, SwitchProps>(
-  ({ id, checked = false, onCheckedChange, disabled, className }, ref) => {
+  ({ id, checked = false, onCheckedChange, disabled, className, 'aria-label': ariaLabel }, ref) => {
     return (
       <button
         ref={ref}
         id={id}
         role="switch"
         aria-checked={checked}
+        aria-label={ariaLabel}
         disabled={disabled}
         onClick={() => onCheckedChange?.(!checked)}
         className={cn(

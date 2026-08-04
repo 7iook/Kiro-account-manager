@@ -319,11 +319,16 @@ const en = {
       stateError: 'Failed to start',
       // The real reason comes from the main process `lastError` (free text); this is just a prefix
       startFailed: 'Failed to start: ',
+      // LAN access (= bind address) — deliberately keeps 0.0.0.0 out of the user's
+      // way: what they want is "can my phone reach it", not "which NIC to listen on".
+      lanAccess: 'Allow LAN access',
+      lanAccessDesc: 'Off: this machine only. On: phones/PCs on the same network can reach it, and an access key is prepared automatically',
+      lanAccessOnHint: 'LAN access is on. Open one of the addresses below in your phone browser.',
       // LAN address
       address: 'Address',
       addressDesc: 'Type this into the browser on your phone',
       addressNone: 'Not listening — no reachable address yet',
-      addressLoopbackOnly: 'Currently bound to this machine only (127.0.0.1), so other devices cannot reach it. To allow phone access, change the bind address to 0.0.0.0.',
+      addressLoopbackOnly: 'Currently bound to this machine only (127.0.0.1), so other devices cannot reach it. Turn on "Allow LAN access" above.',
       copy: 'Copy',
       copied: 'Copied',
       // Port

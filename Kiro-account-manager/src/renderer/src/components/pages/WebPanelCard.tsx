@@ -54,6 +54,14 @@ const PLACEHOLDER_STATUS: WebPanelStatus = {
   lastError: null
 }
 
+/**
+ * 该 host 是否只能本机访问。判据只写一处 —— 渲染侧的提示与开关侧的翻转
+ * 必须用同一套判据，否则会出现「提示说仅本机、开关却显示已开」这类自相矛盾。
+ */
+function isLoopbackHost(host: string): boolean {
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost'
+}
+
 export function WebPanelCard(): React.ReactNode {
   const { t } = useTranslation()
 
@@ -164,6 +172,57 @@ export function WebPanelCard(): React.ReactNode {
     }
   }
 
+  /**
+   * 切换局域网访问 —— 把「绑定地址」这个网络概念翻译成一个用户能懂的开关。
+   *
+   *   开 → host='0.0.0.0'（主进程 buildPanelAddresses 会枚举出真实网卡地址供手机使用）
+   *   关 → host='127.0.0.1'
+   *
+   * **打开前先确保 adminKey 存在**：主进程有一条安全红线「外网绑定 + 无 adminKey
+   * → 拒绝启动」（`webPanel/server.ts` start）。不预先生成的话，用户打开这个开关后
+   * 面板会启动失败，而且得自己领悟「要先去下面把密钥生成出来」这个隐藏的操作顺序。
+   * `get-admin-key` 首次调用即生成，所以这里调一次就够 —— 顺序陷阱在此处被吸收掉。
+   *
+   * 运行中改 host 必须重启才生效（照 handleSavePort 先例：start() 读的是实时配置）。
+   */
+  const handleToggleLan = async (): Promise<void> => {
+    if (busy) return
+    setBusy(true)
+    setOpError(null)
+    try {
+      const nextLan = isLoopbackHost(status.host)
+      // 开局域网前先备好密钥，免得撞上安全红线而启动失败
+      if (nextLan && !status.hasAdminKey) {
+        const key = await window.api.webPanelGetAdminKey()
+        if (!key.success) {
+          setOpError(key.error)
+          return
+        }
+        setAdminKey(key.adminKey)
+      }
+      const saved = await window.api.webPanelSetConfig({
+        host: nextLan ? '0.0.0.0' : '127.0.0.1'
+      })
+      if (!saved.success) {
+        setOpError(saved.error)
+        return
+      }
+      applyStatus(saved.status)
+      // 运行中换绑定地址要重启才生效
+      if (status.running) {
+        await window.api.webPanelStop()
+        const restarted = await window.api.webPanelStart()
+        applyStatus(restarted.status)
+        if (!restarted.success) setOpError(restarted.error)
+      }
+    } catch (error) {
+      console.error('[WebPanelCard] Failed to toggle LAN access:', error)
+      setOpError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   /** 用户点「显示」才拉密钥（首次拉取即生成） */
   const handleRevealKey = async (): Promise<void> => {
     if (adminKey !== null) {
@@ -228,8 +287,9 @@ export function WebPanelCard(): React.ReactNode {
    * 仅绑定本机 ⇒ 手机连不上。判据用 **host**（不是「地址列表为空」）——
    * 主进程对非通配 host 会返回恰好一条地址，列表非空但那是回环地址。
    */
-  const loopbackOnly =
-    status.host === '127.0.0.1' || status.host === '::1' || status.host === 'localhost'
+  const loopbackOnly = isLoopbackHost(status.host)
+  /** 局域网访问开关的视觉态 —— 跟随 **真实配置的 host**，不是本地意图 */
+  const lanEnabled = !loopbackOnly
   /** 真实失败原因：优先操作返回的 error，否则主进程记录的 lastError */
   const failureReason = opError ?? status.lastError
 
@@ -254,6 +314,7 @@ export function WebPanelCard(): React.ReactNode {
             <StateBadge status={status} hasFailure={failureReason !== null} />
             <Switch
               id="webPanelEnabled"
+              aria-label={t('settings.webPanel.enabled')}
               // 关键：跟随 running（真实监听态），不是 enabled（配置意图）
               checked={serving}
               disabled={loading || busy}
@@ -262,13 +323,41 @@ export function WebPanelCard(): React.ReactNode {
           </div>
         </div>
 
+        {/* 局域网访问 —— 绑定地址的用户友好封装。
+            放在启用开关之后、地址列表之前：先决定谁能访问，再看拿哪个地址去访问。 */}
+        <div className="flex items-center justify-between pt-2 border-t">
+          <div>
+            <p className="font-medium">{t('settings.webPanel.lanAccess')}</p>
+            <p className="text-sm text-muted-foreground">
+              {t('settings.webPanel.lanAccessDesc')}
+            </p>
+          </div>
+          <Switch
+            id="webPanelLanAccess"
+            aria-label={t('settings.webPanel.lanAccess')}
+            checked={lanEnabled}
+            disabled={loading || busy}
+            onCheckedChange={() => void handleToggleLan()}
+          />
+        </div>
+
+        {/* 操作失败（写配置 / 启停返回 error）—— 与下面的「启动失败」分开,且**无条件显示**:
+            面板正在跑时用户改绑定地址失败,同样必须看到原因,否则表现为
+            「点了开关什么都没发生」,用户既不知道失败也不知道为什么。 */}
+        {opError && (
+          <div className="flex items-start gap-2 text-xs text-destructive bg-destructive/10 rounded-lg p-3">
+            <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+            <span className="break-all">{opError}</span>
+          </div>
+        )}
+
         {/* 启动失败 —— 显示真实原因,这是本区块最重要的一块信息 */}
-        {!serving && failureReason && (
+        {!serving && !opError && status.lastError && (
           <div className="flex items-start gap-2 text-xs text-destructive bg-destructive/10 rounded-lg p-3">
             <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
             <span className="break-all">
               {t('settings.webPanel.startFailed')}
-              {failureReason}
+              {status.lastError}
             </span>
           </div>
         )}
