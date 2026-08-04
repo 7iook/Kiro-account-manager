@@ -85,3 +85,71 @@ export function sendError(
 ): void {
   sendJson(res, status, message === undefined ? { code } : { code, message })
 }
+
+/**
+ * 静态资源出口(第二条车道)—— 发**字节**,不发对象
+ *
+ * ## 为什么加在这里,而不是在 staticAssets.ts 里直接 res.end
+ *
+ * `webpanel_no_direct_res_end.test.ts` 的不变量是「本目录所有 socket 写入都汇聚在
+ * `respond.ts` 一个文件里」。静态托管天然要写字节,若在 staticAssets.ts 里 `res.end`,
+ * 就必须把它加进闸门白名单 —— 那等于把「唯一出口」变成「两个出口」,而闸门存在的
+ * 理由正是**出口唯一**。所以选择相反的方向:把静态资源的写入也搬进这个咽喉点。
+ * 闸门白名单一行未改,不变量字面上仍然成立(Globalrules §4.9 Layer-1;不绕闸门)。
+ *
+ * ## 与 sendJson 的分工:刻意不共用脱敏
+ *
+ * `sendJson` 对 payload 无条件跑 `redactValue`,那是**对象**语义的保护。
+ * 本函数收的是已经成型的 `Buffer`(JS bundle / CSS / 图片),对它跑 redact 毫无意义
+ * (二进制里匹配「键名」是无稽之谈),且会把几百 KB 的 bundle 反复扫一遍。
+ *
+ * 这不是「绕过脱敏」—— 两条车道的**输入来源根本不同**:
+ *   - `sendJson`  ← 业务对象(`loadAccounts()` 的 `unknown` 整表 blob,含明文凭据)
+ *   - `sendAsset` ← 磁盘上的构建产物字节(`out/webPanel/` 内,由 vite 生成)
+ *
+ * 危险的是前者,因为 `unknown` 让编译期零保护。后者的 body **只能**来自
+ * `staticAssets.ts` 的 `readFile(资源根内的路径)`,而那条路径已由
+ * `resolveAssetPath()` 的 fail-closed 校验锁死在资源根内。
+ *
+ * ⚠️ 因此有一条硬约束,由 `webpanel_static_exit.test.ts` 静态断言守住:
+ * **`sendAsset` 只允许 `staticAssets.ts` 调用**。任何业务端点想用它发响应,
+ * 就绕过了 `redactValue` 兜底 —— 那正是闸门要防的事。
+ */
+export interface AssetResponse {
+  status: number
+  contentType: string
+  /** `Cache-Control` 值(由 staticAssets 按「文件名是否含内容哈希」决定) */
+  cacheControl: string
+  /** 弱 ETag,用于条件请求;304 响应也要带 */
+  etag?: string
+  /** CSP 响应头值。静态资源必须带 —— meta 标签管不了非 HTML 资源 */
+  csp: string
+  /** 响应体字节。304 / HEAD 时不发体,但 Content-Length 仍按 body 长度给 */
+  body: Buffer
+  /** HEAD 或 304:只发头不发体(Content-Length 仍须如实反映资源大小) */
+  headOnly?: boolean
+}
+
+export function sendAsset(res: http.ServerResponse, asset: AssetResponse): void {
+  const headers: Record<string, string | number> = {
+    'Content-Type': asset.contentType,
+    'Cache-Control': asset.cacheControl,
+    'Content-Security-Policy': asset.csp,
+    // 静态资源同样要禁 sniff:MIME 猜测能把一个 .txt 当 HTML 执行
+    'X-Content-Type-Options': 'nosniff',
+    // 面板不该被嵌进任何页面。CSP frame-ancestors 是正路,这条是老浏览器的兜底
+    'X-Frame-Options': 'DENY',
+    // 局域网页面不需要向外发 referrer(会泄漏内网地址与路径)
+    'Referrer-Policy': 'no-referrer'
+  }
+  if (asset.etag) headers['ETag'] = asset.etag
+  // 304 按规范不带 Content-Length(否则部分客户端会等一个永不到来的 body)
+  if (asset.status !== 304) headers['Content-Length'] = asset.body.byteLength
+
+  res.writeHead(asset.status, headers)
+  if (asset.headOnly || asset.status === 304) {
+    res.end()
+    return
+  }
+  res.end(asset.body)
+}
