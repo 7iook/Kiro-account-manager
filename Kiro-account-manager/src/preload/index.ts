@@ -271,6 +271,40 @@ const api = {
     return ipcRenderer.invoke('compute-token-fingerprint', accessToken)
   },
 
+  // 导入网页 API Key(ksk_) —— 桌面端与 web 面板共用 accountService/importApiKey.ts 的同一份用例
+  //   四态判定 / 双重判重 / 稳定 userId 派生全在主进程,renderer 不再自己拼账号对象。
+  //   写入经 applyAccountDataMutation 收口 ⇒ 落盘后广播,store 会自动 reload 到最新。
+  //   ⚠️ rawInput 含密钥明文,只走 IPC(同机),绝不经网络;返回体里的 label 已是掩码。
+  importApiKeys: (input: {
+    rawInput: string
+    region?: string
+    groupId?: string
+  }): Promise<{
+    total: number
+    imported: number
+    failed: number
+    results: Array<{
+      label: string
+      code:
+        | 'IMPORTED'
+        | 'BAD_FORMAT'
+        | 'INVALID'
+        | 'SUSPENDED'
+        | 'INDETERMINATE'
+        | 'MISSING_FINGERPRINT'
+        | 'ALREADY_EXISTS'
+        | 'VERIFY_ERROR'
+        | 'WRITE_CONFLICT'
+      reason?: string
+      accountId?: string
+    }>
+    emptyInput?: boolean
+    revision?: number
+    staleRevision?: number
+  }> => {
+    return ipcRenderer.invoke('import-api-keys', input)
+  },
+
   // 验证凭证并获取账号信息
   verifyAccountCredentials: (credentials: {
     refreshToken: string

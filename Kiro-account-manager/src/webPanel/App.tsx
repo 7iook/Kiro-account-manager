@@ -39,6 +39,7 @@ import {
 import { PanelApiError } from './api/client'
 import { LoginScreen } from './ui/LoginScreen'
 import { AccountCard } from './ui/AccountCard'
+import { ImportPanel } from './ui/ImportPanel'
 
 /** 会话三态。`unknown` 是启动时的真实状态，不能默认成 `logged-out`（会闪一下登录页） */
 type SessionState = 'unknown' | 'logged-in' | 'logged-out'
@@ -248,13 +249,17 @@ export function App(): React.JSX.Element {
         </div>
       )}
 
+      {/* 导入放在列表上方：它是用户日常流程的第一步（先有账号才有额度可看）。
+          导入成功后重拉列表 —— 服务端写入已落盘，重拉能拿到真实的新账号。 */}
+      <ImportPanel onImported={() => loadAccounts()} />
+
       {accounts === null ? (
         <p className="py-10 text-center text-sm text-slate-500">加载中…</p>
       ) : accounts.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-slate-300 p-6 text-center dark:border-slate-700">
           <p className="text-sm text-slate-600 dark:text-slate-300">还没有账号</p>
           <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            导入 ksk_ 密钥需要在桌面端完成，面板暂不支持添加账号。
+            用上面的「粘贴 API Key 导入账号」添加第一个账号。
           </p>
         </div>
       ) : (
@@ -323,7 +328,7 @@ export function App(): React.JSX.Element {
             ))}
           </ul>
           <p className="mt-4 text-center text-xs text-slate-500 dark:text-slate-400">
-            添加账号、复制凭据、编辑与删除请在桌面端操作。
+            复制凭据、编辑与删除请在桌面端操作。
           </p>
         </>
       )}

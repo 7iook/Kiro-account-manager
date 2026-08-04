@@ -11,6 +11,7 @@ import {
   runBatchProfileImport,
   type KiroProfileForSelect
 } from './profileImportHelpers'
+import { apiKeyImportCodeText } from './apiKeyImportText'
 
 interface AddAccountDialogProps {
   isOpen: boolean
@@ -67,7 +68,9 @@ type ImportMode = 'oidc' | 'sso' | 'login' | 'apikey'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso' | 'externalidp'
 
 export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): React.ReactNode {
-  const { addAccount, updateAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab, checkAccountStatus } = useAccountsStore()
+  // updateAccount 曾用于 ksk_ 判重时就地回填老账号指纹;该逻辑已下沉到主进程共享用例,
+  // 本组件其余导入路径都只新增不改存量,故不再需要它。
+  const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab, checkAccountStatus } = useAccountsStore()
 
   // 检查账户是否已存在
   //   主键: userId (强前提, 相同即重复)
@@ -92,34 +95,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     })
   }
 
-  // API Key 专用凭据去重(RCA §6 A6-R2 · A3-R5 竞态消除):
-  //   - 按 credentials.tokenFingerprint (sha256(accessToken).slice(0,16)) 命中即重复
-  //   - 老账号缺 fingerprint 但有 accessToken → 通过 IPC 同步补算并就地缓存(消除后台异步迁移竞态)
-  //   - IPC 失败该老账号本轮跳过,不阻止判定
-  const checkApiKeyFingerprintExists = async (fingerprint: string): Promise<boolean> => {
-    for (const acc of accounts.values()) {
-      if (acc.credentials.provider !== 'ApiKey') continue
-      // 已有 fingerprint 直接比
-      if (acc.credentials.tokenFingerprint) {
-        if (acc.credentials.tokenFingerprint === fingerprint) return true
-        continue
-      }
-      // 老账号 · 有 accessToken 就按需补算
-      if (acc.credentials.accessToken) {
-        try {
-          const fp = await window.api.computeTokenFingerprint(acc.credentials.accessToken)
-          // 就地缓存到 store(避免下次再算)
-          updateAccount(acc.id, {
-            credentials: { ...acc.credentials, tokenFingerprint: fp }
-          })
-          if (fp === fingerprint) return true
-        } catch {
-          // IPC 失败降级 · 该老账号本轮视为"无 fingerprint 可比" · 继续下一个
-        }
-      }
-    }
-    return false
-  }
+  // API Key 专用凭据去重已随 ksk_ 导入路径一起下沉到主进程
+  // (`accountService/importApiKey.ts` 的 DedupeIndex —— 含老账号按需补算指纹的 A3-R5 语义)。
+  // 这里不再保留副本:两端各存一份判重逻辑必然漂移,而共享层读的是盘上权威态且与写入同处
+  // applyAccountDataMutation 的串行锁内,比 renderer 从 store 判重更强(无查完到写入的窗口)。
 
   // 导入模式
   const [importMode, setImportMode] = useState<ImportMode>('login')
@@ -1448,122 +1427,61 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   }
 
   const handleApiKeyImport = async () => {
-    // 每行一个 ksk_；支持单个或批量。逐行校验(GetProfile) → 导入 → 后台触发额度刷新。
-    const rawLines = apiKeyInput
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0)
-    // 去重
-    const keys = Array.from(new Set(rawLines))
-    if (keys.length === 0) {
+    // 每行一个 ksk_；支持单个或批量。
+    //
+    // ⚠️ 判重 / 四态判定 / userId 派生 / 账号对象装配**全部下沉**到主进程的
+    // `accountService/importApiKey.ts`(`window.api.importApiKeys`),与 web 面板的
+    // `POST /panel/api/accounts` 是**同一份用例**。
+    //
+    // 为什么不在这里保留一份:这三处判定各自带 RCA 编号(A7-R2 四态 / A3-R5 指纹补算 /
+    // A6-R2 指纹语义),在两端各存一份必然漂移 —— 面板改对了桌面端没改,或反之,
+    // 而症状是"某一端会重复导入同一个密钥",极难归因。共享层是唯一真源。
+    //
+    // renderer 因此**不再调 addAccount**:主进程写入已经过 applyAccountDataMutation
+    // 收口并广播,store 的订阅(App.tsx:150)会自动 reload 到最新状态。
+    const rawInput = apiKeyInput
+    if (rawInput.split(/\r?\n/).every((l) => l.trim().length === 0)) {
       setError(isEn ? 'Please paste the API Key (ksk_...)' : '请粘贴 API Key（ksk_ 开头，每行一个）')
       return
     }
     setError(null)
     setApiKeyResult(null)
     setApiKeyImporting(true)
-    const errors: string[] = []
-    const newIds: string[] = []
-    let success = 0
     try {
-      for (const key of keys) {
-        const short = `${key.slice(0, 8)}…${key.slice(-4)}`
-        if (!key.startsWith('ksk_')) {
-          errors.push(`${short}: ${isEn ? 'must start with ksk_' : '格式错误(应以 ksk_ 开头)'}`)
-          continue
-        }
-        try {
-          // 凭据有效性判定 · state 是 renderer 唯一分类字段(RCA §6 A7-R2 · IPC 真值表)
-          const result = await window.api.verifyApiKey({ apiKey: key, region: apiKeyRegion })
-          if (result.state !== 'VALID') {
-            // INVALID / SUSPENDED / INDETERMINATE → 一律拒绝入池,不再依赖 profileArn 是否存在
-            //   INVALID: 密钥无效 → 展示"密钥无效或已吊销"
-            //   SUSPENDED: 账号被 Kiro 暂停 → 展示"账号已被 Kiro 暂停"
-            //   INDETERMINATE: 暂时无法验证 → 提示用户稍后重试(不静默入池)
-            errors.push(`${short}: ${result.error || (isEn ? 'verification failed' : '校验失败')}`)
-            continue
-          }
-          // VALID 态 · 允许入池(即使 profileArn undefined · STANDALONE 类是 feature gate 不影响运行)
-          if (!result.tokenFingerprint) {
-            // 契约错误:VALID 一定带 tokenFingerprint · 保守拒绝防止污染池
-            errors.push(`${short}: ${isEn ? 'missing token fingerprint from main' : '主进程未返回 fingerprint'}`)
-            continue
-          }
-          const dataRegion = result.region || apiKeyRegion
-          const profileArn = result.profileArn // 可能是 undefined(STANDALONE 类)
-          // 稳定 userId:优先用 profileArn 尾段(元数据可用时) · 否则用 tokenFingerprint(始终有值)
-          //   多 STANDALONE ksk_ 通常无 profileArn · 用 fingerprint 保证唯一
-          const arnTail = profileArn ? (profileArn.split('/').pop() || profileArn.slice(-12)) : undefined
-          const stableUserId = arnTail || result.tokenFingerprint
-          const displayName = result.profileName || `API Key ${key.slice(-6)}`
-          // 双重去重:userId + tokenFingerprint(A3-R5 竞态消除 · 老账号按需补 fingerprint)
-          if (
-            isAccountExists('', stableUserId, 'ApiKey', profileArn) ||
-            (await checkApiKeyFingerprintExists(result.tokenFingerprint))
-          ) {
-            errors.push(`${short}: ${isEn ? 'already exists' : '账户已存在'}`)
-            continue
-          }
-          const now = Date.now()
-          const newId = addAccount({
-            email: '',
-            userId: stableUserId,
-            nickname: displayName,
-            idp: 'ApiKey',
-            groupId: selectedGroupId,
-            profileArn,
-            credentials: {
-              accessToken: key,
-              csrfToken: '',
-              refreshToken: '',
-              region: dataRegion,
-              // ksk 永不过期：设一个很远的到期时间，避免自动刷新/过期判定误触发
-              expiresAt: now + 100 * 365 * 24 * 3600 * 1000,
-              authMethod: 'api_key',
-              provider: 'ApiKey',
-              profileArn,
-              tokenFingerprint: result.tokenFingerprint
-            },
-            subscription: {
-              // 用 verify-api-key 返回的 subscription 覆盖占位值(RCA §6 A2-R3 副作用)
-              type: (result.subscription?.title || 'Pro') as SubscriptionType,
-              title: result.subscription?.title ||
-                (result.profileType ? `API Key · ${result.profileType}` : 'API Key'),
-              rawType: result.subscription?.type
-            },
-            // 额度占位；导入后立即触发 checkAccountStatus 拉真实额度/订阅/邮箱
-            usage: {
-              current: result.subscription?.currentUsage ?? 0,
-              limit: result.subscription?.usageLimit ?? 0,
-              percentUsed: result.subscription?.usageLimit
-                ? Math.round(((result.subscription.currentUsage ?? 0) / result.subscription.usageLimit) * 100)
-                : 0,
-              lastUpdated: now
-            },
-            tags: [],
-            status: 'active',
-            lastUsedAt: now
-          })
-          newIds.push(newId)
-          success++
-        } catch (e) {
-          errors.push(`${short}: ${e instanceof Error ? e.message : String(e)}`)
-        }
-      }
-
-      // 后台触发额度刷新（getUsageLimits + TokenType: API_KEY），账户列表会随各自返回而更新
-      newIds.forEach((id) => {
-        void checkAccountStatus(id)
+      const result = await window.api.importApiKeys({
+        rawInput,
+        region: apiKeyRegion,
+        ...(selectedGroupId !== undefined ? { groupId: selectedGroupId } : {})
       })
 
-      if (keys.length === 1 && success === 1) {
+      // 失败项的展示文案。共享层给的是稳定 code + 中文 reason;这里只补英文与掩码前缀,
+      // 不重新判定语义(code 是唯一分支依据)。
+      const errors = result.results
+        .filter((r) => r.code !== 'IMPORTED')
+        .map((r) => `${r.label}: ${apiKeyImportCodeText(r.code, r.reason, isEn)}`)
+
+      // 后台触发额度刷新（getUsageLimits + TokenType: API_KEY），账户列表会随各自返回而更新。
+      // 广播已经把新账号带进 store,所以这里能直接按 id 刷。
+      for (const r of result.results) {
+        if (r.accountId) void checkAccountStatus(r.accountId)
+      }
+
+      if (result.total === 1 && result.imported === 1) {
         // 单个成功：直接关闭
         resetForm()
         onClose()
         return
       }
-      setApiKeyResult({ total: keys.length, success, failed: keys.length - success, errors })
-      if (success > 0) setApiKeyInput('')
+      setApiKeyResult({
+        total: result.total,
+        success: result.imported,
+        failed: result.failed,
+        errors
+      })
+      if (result.imported > 0) setApiKeyInput('')
+    } catch (e) {
+      // IPC 整体失败(主进程异常 / 通道不可用)。不能静默:用户会以为导入成功了。
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setApiKeyImporting(false)
     }

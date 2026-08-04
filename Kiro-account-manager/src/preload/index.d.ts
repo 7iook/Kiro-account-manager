@@ -332,6 +332,44 @@ interface KiroApi {
   // 计算 accessToken 的 sha256 hex 指纹(前 16 位) · 老账号 tokenFingerprint 补齐用
   computeTokenFingerprint: (accessToken: string) => Promise<string>
 
+  /**
+   * 导入网页 API Key(ksk_)。
+   *
+   * 实现是 `main/accountService/importApiKey.ts`,**与 web 面板 `POST /panel/api/accounts`
+   * 是同一份用例** —— 四态判定(只有 VALID 入池)、双重判重(userId 主键 + 凭据指纹)、
+   * 稳定 userId 派生(profileArn 尾段,无则回退指纹)全在主进程。
+   *
+   * renderer 拿到结果后**不需要**再调 addAccount:写入已经过 applyAccountDataMutation
+   * 收口并广播,store 的订阅会自动 reload 到最新。renderer 只需按 code 展示逐条结果,
+   * 并对 accountId 触发一次额度刷新。
+   *
+   * 类型 SSOT 是 `ApiKeyImportResult`;此处手写是因为 preload 的 d.ts 不 import 主进程模块。
+   */
+  importApiKeys: (input: { rawInput: string; region?: string; groupId?: string }) => Promise<{
+    total: number
+    imported: number
+    failed: number
+    results: Array<{
+      /** 掩码标签(`ksk_abcd…wxyz`),**不是明文密钥** */
+      label: string
+      code:
+        | 'IMPORTED'
+        | 'BAD_FORMAT'
+        | 'INVALID'
+        | 'SUSPENDED'
+        | 'INDETERMINATE'
+        | 'MISSING_FINGERPRINT'
+        | 'ALREADY_EXISTS'
+        | 'VERIFY_ERROR'
+        | 'WRITE_CONFLICT'
+      reason?: string
+      accountId?: string
+    }>
+    emptyInput?: boolean
+    revision?: number
+    staleRevision?: number
+  }>
+
   // 验证凭证并获取账号信息
   verifyAccountCredentials: (credentials: {
     refreshToken: string

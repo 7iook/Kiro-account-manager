@@ -95,11 +95,14 @@ import {
   verifyApiKey as svcVerifyApiKey,
   importFromSsoToken as svcImportFromSsoToken,
   verifyAccountCredentials as svcVerifyAccountCredentials,
+  importApiKeys as svcImportApiKeys,
   type AccountStoreDeps,
   type AccountStoreRef,
   type CredentialFsDeps,
   type VerifyApiDeps,
-  type VerifyCredentialsInput
+  type VerifyCredentialsInput,
+  type ApiKeyImportDeps,
+  type ApiKeyImportInput
 } from './accountService'
 import {
   createTray,
@@ -1886,6 +1889,27 @@ const verifyApiDeps: VerifyApiDeps = {
     getUsageAndLimits(accessToken, idp, profileArn, accountMachineId, ssoRegion, email, authMethod),
   refreshTokenByMethod: (token, clientId, clientSecret, region, authMethod, proxyUrl, externalIdp) =>
     refreshTokenByMethod(token, clientId, clientSecret, region, authMethod, proxyUrl, externalIdp)
+}
+
+/**
+ * ksk_ 导入用例的依赖装配（IPC 与 web 面板共用同一份）。
+ *
+ * 为什么是函数而不是模块级常量：`applyAccountDataMutation` 要求 store 已注入
+ * （`setStoreRef` 在 initStore 末尾才跑）。装配成常量会在模块求值时就绑定，
+ * 与 `accountDeps.getStore` 用惰性 getter 同一理由。
+ *
+ * `newMachineId` 用主进程的 `generateRandomMachineId` —— renderer 侧那份
+ * （`store/accounts.ts:33`）用的是 Web Crypto，两者产出同为 64 位 hex，
+ * 但共享层跑在主进程，必须用 Node 侧实现。
+ */
+function buildApiKeyImportDeps(): ApiKeyImportDeps {
+  return {
+    verifyApiKey: (params) => svcVerifyApiKey(params),
+    applyMutation: (mutate, opts) => applyAccountDataMutation(mutate, opts),
+    now: () => Date.now(),
+    newId: () => crypto.randomUUID(),
+    newMachineId: () => machineIdModule.generateRandomMachineId()
+  }
 }
 
 async function initStore(): Promise<void> {
@@ -4164,6 +4188,16 @@ app.whenReady().then(async () => {
     svcComputeTokenFingerprint(accessToken)
   )
 
+  // IPC: 导入网页 API Key(ksk_) —— 桌面端与 web 面板**共用同一份用例**
+  //   实现在 accountService/importApiKey.ts。四态判定 / 双重判重 / 稳定 userId 派生
+  //   全在那里,renderer 不再自己拼账号对象(否则判重逻辑会有两份真源,必然漂移)。
+  //
+  //   ⚠️ 写入经 applyAccountDataMutation 收口 ⇒ 落盘后会广播 accounts-data-changed,
+  //   renderer 的订阅（App.tsx:150）据此静默 reload,新账号自动出现在桌面列表里。
+  ipcMain.handle('import-api-keys', async (_event, input: ApiKeyImportInput) =>
+    svcImportApiKeys(buildApiKeyImportDeps(), input ?? { rawInput: '' })
+  )
+
   // IPC: 验证凭证并获取账号信息（用于添加账号）
   //   实现在 accountService/verify.ts（IPC 与 web 面板共用）
   ipcMain.handle('verify-account-credentials', async (_event, credentials: VerifyCredentialsInput) =>
@@ -4318,6 +4352,7 @@ app.whenReady().then(async () => {
     ensureStore: () => initStore(),
     routeDeps: buildPanelRouteDeps({
       loadAccountsBlob: () => svcLoadAccounts(accountDeps),
+      importApiKeys: (input) => svcImportApiKeys(buildApiKeyImportDeps(), input),
       checkAccountStatus: (account) => checkAccountStatus(accountServiceDeps, account as never),
       refreshAccountToken: (account) => refreshAccountToken(accountServiceDeps, account as never),
       switchAccountToIde: (credentials) =>

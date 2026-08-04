@@ -25,6 +25,7 @@
 import type http from 'node:http'
 import { sendJson, sendError, type PanelErrorCode } from './respond'
 import { projectAccountsBlob, type AccountListPayload } from './dto'
+import type { ApiKeyImportInput, ApiKeyImportResult } from '../accountService/importApiKey'
 
 /** 业务层的通用返回形状 —— 两种 error 形状都要能吃（见文件头说明） */
 type ServiceLike = {
@@ -53,6 +54,14 @@ export interface PanelAccountIdentity {
 export interface PanelRouteDeps {
   /** `accountService/accounts.ts:loadAccounts` —— 返回整表 blob（含明文凭据，绝不直出） */
   loadAccountsBlob: () => Promise<unknown>
+  /**
+   * `accountService/importApiKey.ts:importApiKeys` —— 手机端粘贴 ksk_ 导入。
+   *
+   * 与其它 dep 的形状差异：它返回自己的结果类型而不是 `ServiceLike`。**有意为之** ——
+   * 逐条结果（哪条成功 / 哪条已存在 / 哪条被封）是这个端点的全部价值，
+   * 压成一个 `{success}` 布尔就等于把它丢掉。`respondService` 的归一路径不适用于它。
+   */
+  importApiKeys: (input: ApiKeyImportInput) => Promise<ApiKeyImportResult>
   /** `accountService/check.ts:checkAccountStatus` —— 用户日常的「刷新额度」 */
   checkAccountStatus: (account: unknown) => Promise<ServiceLike>
   /** `accountService/refresh.ts:refreshAccountToken` */
@@ -200,6 +209,62 @@ async function handleList(res: http.ServerResponse, deps: PanelRouteDeps): Promi
 }
 
 /**
+ * 进行中的导入（single-flight 用）。
+ *
+ * 与上面的 `inFlight` 分开是因为返回类型不同（`ApiKeyImportResult` 而非 `ServiceLike`）。
+ * 键是**粘贴内容本身**而非固定字符串：手机上连点提交按钮会发两个一样的请求，
+ * 共享一次执行才不会产生两条记录；而两次粘贴**不同**内容是两个正当请求，不该互相阻塞。
+ *
+ * ⚠️ 键里含密钥明文，所以这个 Map **绝不能**被日志打印或出网 —— 它只在内存里活到本次执行结束。
+ */
+const importInFlight = new Map<string, Promise<ApiKeyImportResult>>()
+
+/**
+ * 导入 ksk_ 密钥（手机端「添加账号」的落点）。
+ *
+ * 本 handler 只做三件事（与文件头不变量 1 一致）：读参数 → 调共享用例 → 经 `respond.ts` 写回。
+ * 四态判定 / 判重 / userId 派生**全在 `accountService/importApiKey.ts`**，
+ * 与桌面端是同一份实现 —— 在这里再写一遍判重就是第二个真源。
+ */
+async function handleImport(
+  res: http.ServerResponse,
+  deps: PanelRouteDeps,
+  body: Record<string, unknown> | undefined
+): Promise<void> {
+  const raw = body?.apiKeys
+  if (typeof raw !== 'string') {
+    sendError(res, 400, 'INVALID_CREDENTIAL', '请提供 apiKeys（每行一个 ksk_ 密钥）')
+    return
+  }
+  // 空白输入在这一层就拒：让它进业务层会得到一个 total=0 的「成功」响应，
+  // 手机上表现为「点了导入、没报错、也没东西」—— 最难自查的一种反馈。
+  if (raw.trim().length === 0) {
+    sendError(res, 400, 'INVALID_CREDENTIAL', '请粘贴至少一个 ksk_ 密钥')
+    return
+  }
+
+  const input: ApiKeyImportInput = {
+    rawInput: raw,
+    ...(typeof body?.region === 'string' ? { region: body.region } : {}),
+    ...(typeof body?.groupId === 'string' ? { groupId: body.groupId } : {})
+    // expectedRevision 刻意**不**从请求体读:面板没有可信的 revision 快照(它拿到的
+    // 列表可能已经旧了),带上只会让正常导入被 STALE 拒。导入是"增加一条",
+    // 不是"覆盖整表",无仲裁直写才是正确语义 —— 收口函数内部的串行锁保证原子。
+  }
+
+  const key = `import:${raw}`
+  const existing = importInFlight.get(key)
+  const task = existing ?? deps.importApiKeys(input).finally(() => importInFlight.delete(key))
+  if (!existing) importInFlight.set(key, task)
+
+  const result = await task
+  // 逐条结果原样回（label 已是掩码，业务层保证不含明文）。
+  // 即使一条都没成功也回 200 —— 「3 个里 2 个已存在」不是 HTTP 层的错误，
+  // 是需要逐条展示给用户的业务结果。
+  sendJson(res, 200, result)
+}
+
+/**
  * 路由分派。
  *
  * @returns true = 本函数已处理（响应已写出）；false = 路径不属于 API 命名空间，交给调用方兜底
@@ -214,6 +279,13 @@ export async function routePanelApi(
   // 账号列表（读）
   if (path === '/api/accounts' && method === 'GET') {
     await handleList(res, deps)
+    return true
+  }
+
+  // 导入 ksk_ 密钥（写）—— 必须在下面 parseAccountPath 之前判，
+  // 否则 `/api/accounts` 会被当成 accountId 为空的子路径。
+  if (path === '/api/accounts' && method === 'POST') {
+    await handleImport(res, deps, ctx.body)
     return true
   }
 

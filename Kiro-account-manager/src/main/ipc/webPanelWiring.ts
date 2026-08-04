@@ -314,6 +314,7 @@ export function buildPanelAddresses(host: string, port: number): string[] {
  */
 export function buildPanelRouteDeps(impl: {
   loadAccountsBlob: () => Promise<unknown>
+  importApiKeys: PanelRouteDeps['importApiKeys']
   checkAccountStatus: (account: unknown) => Promise<unknown>
   refreshAccountToken: (account: unknown) => Promise<unknown>
   switchAccountToIde: (credentials: unknown) => Promise<unknown>
@@ -334,6 +335,8 @@ export function buildPanelRouteDeps(impl: {
   }
   return {
     loadAccountsBlob: impl.loadAccountsBlob,
+    // 不过 asService：它的返回值是结构化的逐条结果，压成 Record 会丢掉类型
+    importApiKeys: impl.importApiKeys,
     checkAccountStatus: asService(impl.checkAccountStatus),
     refreshAccountToken: asService(impl.refreshAccountToken),
     switchAccountToIde: asService(impl.switchAccountToIde),

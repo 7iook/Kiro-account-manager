@@ -57,6 +57,16 @@ export {
   type VerifyCredentialsResult
 } from './verify'
 
+// ksk_ 导入用例（桌面端 IPC 与 web 面板 HTTP 的唯一实现 —— 判重 / 四态 / userId 派生的 SSOT）
+export {
+  importApiKeys,
+  type ApiKeyImportDeps,
+  type ApiKeyImportInput,
+  type ApiKeyImportResult,
+  type ApiKeyImportItemResult,
+  type ApiKeyImportCode
+} from './importApiKey'
+
 // 归一化工具（SSOT · 消除 index.ts 内的逐字副本）
 // 订阅类型判定 SSOT 统一到 parseUsage.ts（W2/W3 曾各抽一份等价实现，合并时合一）
 export { classifySubscriptionType } from './parseUsage'

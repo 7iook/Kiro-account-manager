@@ -61,6 +61,57 @@ export async function fetchAccounts(): Promise<AccountListPayload> {
 }
 
 /**
+ * 导入 ksk_ 密钥。
+ *
+ * 服务端调的是 `accountService/importApiKey.ts` —— 与桌面端「添加账号」**同一份用例**。
+ * 所以判重语义在两端完全一致：同一个密钥在手机上导入过，桌面端再导就是 `ALREADY_EXISTS`。
+ *
+ * ⚠️ 密钥经局域网发往主进程，这是不可避免的（用户就是在手机上粘贴它）。
+ * 面板整体已在 HTTP 上，adminKey + 会话 cookie 是这条链的保护。
+ * 但**返回体里的 `label` 是掩码**，密钥不会再回显到浏览器。
+ *
+ * 即使一条都没成功也是 200 —— 「3 个里 2 个已存在」是要逐条展示的业务结果，不是请求失败。
+ */
+export async function importApiKeys(
+  rawInput: string,
+  region?: string
+): Promise<ApiKeyImportResponse> {
+  return panelRequest<ApiKeyImportResponse>('POST', '/accounts', {
+    apiKeys: rawInput,
+    ...(region !== undefined ? { region } : {})
+  })
+}
+
+/** 单条密钥的处理结果码。**分支只看 code，不看文案** */
+export type ApiKeyImportCode =
+  | 'IMPORTED'
+  | 'BAD_FORMAT'
+  | 'INVALID'
+  | 'SUSPENDED'
+  | 'INDETERMINATE'
+  | 'MISSING_FINGERPRINT'
+  | 'ALREADY_EXISTS'
+  | 'VERIFY_ERROR'
+  | 'WRITE_CONFLICT'
+
+/** `main/accountService/importApiKey.ts:ApiKeyImportResult` 的浏览器侧形状 */
+export interface ApiKeyImportResponse {
+  total: number
+  imported: number
+  failed: number
+  results: Array<{
+    /** 掩码标签（`ksk_abcd…wxyz`）—— 服务端保证不含明文 */
+    label: string
+    code: ApiKeyImportCode
+    reason?: string
+    accountId?: string
+  }>
+  emptyInput?: boolean
+  revision?: number
+  staleRevision?: number
+}
+
+/**
  * 刷新额度 / 检查账户信息 —— 用户日常最高频的操作。
  *
  * ⚠️ **服务端不落盘**：`accountService/check.ts:checkAccountStatus` 只返回结果，

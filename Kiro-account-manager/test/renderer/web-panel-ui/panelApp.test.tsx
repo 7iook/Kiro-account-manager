@@ -147,10 +147,12 @@ describe('账号列表', () => {
     expect(screen.getByText('KIRO PRO')).toBeInTheDocument()
   })
 
-  it('空列表时给出「去桌面端导入」的说明，而不是一片空白', async () => {
+  it('空列表时指引用户用面板自己的导入入口，而不是一片空白', async () => {
     stubLoggedIn([])
     render(<App />)
-    expect(await screen.findByText(/桌面端/)).toBeInTheDocument()
+    // 面板现在**自己能导入**（`POST /api/accounts` → accountService/importApiKey.ts）。
+    // 这条原先断言的是「去桌面端导入」——那个限制已经解除，断言随之改成新的真实行为。
+    expect(await screen.findByText(/粘贴 API Key/)).toBeInTheDocument()
   })
 
   it('渲染多个账号，各自独立', async () => {
@@ -258,11 +260,159 @@ describe('会话失效', () => {
 })
 
 describe('桌面端专属能力', () => {
-  it('没有「添加账号」按钮，而是说明需在桌面端导入', async () => {
+  it('仍然说明复制凭据 / 编辑 / 删除需在桌面端（导入已不在此列）', async () => {
     stubLoggedIn([account()])
     render(<App />)
     await screen.findByText('alice@example.com')
-    expect(screen.queryByRole('button', { name: /添加账号/ })).not.toBeInTheDocument()
-    expect(screen.getByText(/桌面端/)).toBeInTheDocument()
+    // 面板不提供凭据复制与编辑删除 —— 这些仍是桌面端专属
+    expect(screen.getByText(/复制凭据、编辑与删除请在桌面端/)).toBeInTheDocument()
+  })
+})
+
+describe('手机端导入 ksk_', () => {
+  const KEY = `ksk_${'a'.repeat(40)}`
+
+  /** 展开导入表单（默认折叠，见 ImportPanel 的说明） */
+  async function openForm(): Promise<HTMLElement> {
+    await userEvent.click(await screen.findByRole('button', { name: /粘贴 API Key/ }))
+    return screen.getByRole('textbox')
+  }
+
+  it('粘贴一个 key 并点导入 → 发出带 CSRF 头的 POST /accounts，成功后重拉列表', async () => {
+    stubLoggedIn([], {
+      'POST /panel/api/accounts': {
+        body: {
+          total: 1,
+          imported: 1,
+          failed: 0,
+          results: [{ label: 'ksk_aaaa…aaaa', code: 'IMPORTED', accountId: 'acc-new' }]
+        }
+      }
+    })
+    render(<App />)
+
+    await userEvent.type(await openForm(), KEY)
+    await userEvent.click(screen.getByRole('button', { name: '导入' }))
+
+    const post = await waitFor(() => {
+      const hit = seen.find((r) => r.method === 'POST' && r.url === '/panel/api/accounts')
+      expect(hit).toBeDefined()
+      return hit as SeenRequest
+    })
+    // CSRF 头是服务端 guard 的判据 —— 漏了这个按钮会永远 401
+    expect(post.headers['x-panel-request']).toBe('1')
+
+    // 成功后必须重拉列表：写入已落盘，重拉才能看到真实的新账号
+    await waitFor(() => {
+      const gets = seen.filter((r) => r.method === 'GET' && r.url === '/panel/api/accounts')
+      expect(gets.length).toBeGreaterThanOrEqual(2)
+    })
+  })
+
+  it('全部失败（已存在）→ 逐条显示原因，且不重拉列表（白跑一次请求）', async () => {
+    stubLoggedIn([account()], {
+      'POST /panel/api/accounts': {
+        body: {
+          total: 1,
+          imported: 0,
+          failed: 1,
+          results: [{ label: 'ksk_aaaa…aaaa', code: 'ALREADY_EXISTS', reason: '该账号已存在' }]
+        }
+      }
+    })
+    render(<App />)
+    await screen.findByText('alice@example.com')
+    const before = seen.filter((r) => r.method === 'GET' && r.url === '/panel/api/accounts').length
+
+    await userEvent.type(await openForm(), KEY)
+    await userEvent.click(screen.getByRole('button', { name: '导入' }))
+
+    expect(await screen.findByText(/该账号已存在/)).toBeInTheDocument()
+    const after = seen.filter((r) => r.method === 'GET' && r.url === '/panel/api/accounts').length
+    expect(after).toBe(before)
+  })
+
+  it('被封的密钥 → 显示「已被 Kiro 暂停」，不谎报成功', async () => {
+    stubLoggedIn([], {
+      'POST /panel/api/accounts': {
+        body: {
+          total: 1,
+          imported: 0,
+          failed: 1,
+          results: [{ label: 'ksk_aaaa…aaaa', code: 'SUSPENDED', reason: '账号已被 Kiro 暂停' }]
+        }
+      }
+    })
+    render(<App />)
+    await userEvent.type(await openForm(), KEY)
+    await userEvent.click(screen.getByRole('button', { name: '导入' }))
+
+    expect(await screen.findByText(/已被 Kiro 暂停/)).toBeInTheDocument()
+    expect(screen.getByText(/成功 0/)).toBeInTheDocument()
+  })
+
+  it('空输入 → 本地就提示，不发请求（不浪费一次往返）', async () => {
+    stubLoggedIn([])
+    render(<App />)
+    await openForm()
+    await userEvent.click(screen.getByRole('button', { name: '导入' }))
+
+    expect(await screen.findByText(/请先粘贴至少一个/)).toBeInTheDocument()
+    expect(seen.some((r) => r.method === 'POST' && r.url === '/panel/api/accounts')).toBe(false)
+  })
+
+  it('界面上不出现密钥明文 —— 只显示服务端给的掩码 label', async () => {
+    stubLoggedIn([], {
+      'POST /panel/api/accounts': {
+        body: {
+          total: 1,
+          imported: 0,
+          failed: 1,
+          results: [{ label: 'ksk_aaaa…aaaa', code: 'INVALID', reason: '密钥无效或已吊销' }]
+        }
+      }
+    })
+    render(<App />)
+    await userEvent.type(await openForm(), KEY)
+    await userEvent.click(screen.getByRole('button', { name: '导入' }))
+    await screen.findByText(/密钥无效或已吊销/)
+
+    // 输入框里用户自己敲的内容不算泄漏；结果区不得回显完整密钥。
+    // 成功路径会清空输入框，失败路径保留（让用户能改），所以这里只断言结果区。
+    const resultRegion = screen.getByRole('status')
+    expect(resultRegion.textContent ?? '').not.toContain(KEY)
+  })
+
+  it('导入过程中按钮禁用，防手机连点提交两次', async () => {
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((r) => {
+      release = r
+    })
+    stubLoggedIn([])
+    // 在既有桩之上再包一层：POST 挂住直到我们放行
+    const original = globalThis.fetch as unknown as (i: string, x?: RequestInit) => Promise<Response>
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if ((init?.method ?? 'GET').toUpperCase() === 'POST' && input === '/panel/api/accounts') {
+          seen.push({ url: input, method: 'POST', headers: {} })
+          await gate
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: () => null },
+            text: async () => JSON.stringify({ total: 1, imported: 1, failed: 0, results: [] })
+          } as unknown as Response
+        }
+        return original(input, init)
+      })
+    )
+    render(<App />)
+    await userEvent.type(await openForm(), KEY)
+    const button = screen.getByRole('button', { name: '导入' })
+    await userEvent.click(button)
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '导入中…' })).toBeDisabled())
+    release?.()
   })
 })
