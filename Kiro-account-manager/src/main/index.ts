@@ -42,7 +42,9 @@ import {
   applyAccountDataMutation,
   setStoreRef as setAccountStoreRef,
   setLastSavedDataSetter as setAccountLastSavedSetter,
-  type AccountsBlob
+  setBroadcaster as setAccountBroadcaster,
+  type AccountsBlob,
+  type BroadcastPayload as AccountsBroadcastPayload
 } from './accountService/state'
 import {
   createTray,
@@ -1830,6 +1832,21 @@ async function initStore(): Promise<void> {
   // 决策卡 §1 不变量 2:所有 accountData 写入必须过 revision 仲裁
   setAccountStoreRef(store!)
   setAccountLastSavedSetter((data) => { lastSavedData = data })
+
+  // T8 广播装配 · 决策卡 §1 不变量 3:收口成功后广播 accounts-data-changed
+  // payload 严格白名单 { revision, changedIds } —— 绝不含凭证（§3 输出脱敏 · state.ts 内部就限定死了 payload 形状）
+  // 照抄 kiro-ide-token-changed 先例（:1966 / :2110）:全窗口广播（W5 web 面板落地后同一 channel 也可服务它）
+  setAccountBroadcaster((payload: AccountsBroadcastPayload) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed()) continue
+      try {
+        win.webContents.send('accounts-data-changed', payload)
+      } catch (e) {
+        // 单窗口发送失败不影响其它窗口 · precise catch（§4.4）
+        console.warn('[Broadcaster] send accounts-data-changed failed:', e)
+      }
+    }
+  })
 }
 
 // ============ Kiro IDE Auth Token 反向同步 ============
@@ -3531,20 +3548,33 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 保存账号数据
-  ipcMain.handle('save-accounts', async (_event, data) => {
+  // 返回契约（T7 升级）:
+  //   成功 → { ok: true, revision: number }
+  //   过期 → { ok: false, code: 'STALE_REVISION', currentRevision: number }
+  // 客户端未传 expectedRevision 时降级为无仲裁直写（向后兼容,同 W1 骨架语义）,仍返回 { ok: true, revision }。
+  ipcMain.handle('save-accounts', async (_event, data: { expectedRevision?: number; originId?: string; [k: string]: unknown }) => {
     try {
       await initStore()
-      // 走收口:本轮 T7 尚未落地,renderer 未传 expectedRevision → 降级为无仲裁直写。
-      // 收口内部会把 revision +1 写回,为 T7/T8（renderer 拿 revision + 广播）打基础。
-      // 契约签名保持不变（返回 void）,T7 落地时再改为 { ok, code, revision }。
-      await applyAccountDataMutation(() => data as AccountsBlob)
+      // 从 payload 里剥离仲裁参数（expectedRevision / originId 不入盘）;其余整表作为 mutator 返回值
+      const { expectedRevision, originId, ...blob } = data ?? {}
+      const result = await applyAccountDataMutation(() => blob as AccountsBlob, {
+        ...(typeof expectedRevision === 'number' ? { expectedRevision } : {}),
+        ...(typeof originId === 'string' ? { originId } : {})
+      })
 
-      // 保存最后的数据（用于崩溃恢复）· lastSavedData 由收口内部同步（setLastSavedDataSetter）
-      // 这里保留显式赋值以保证语义与老代码一致（防收口未注入时也能兜底,虽然理论上装配完成才会走到这里）
-      lastSavedData = data
+      // 保存最后的数据（用于崩溃恢复）· lastSavedData 由收口内部同步（setLastSavedDataSetter）,
+      // 这里的显式赋值仅在装配未完成 / 未来 STALE 分支不进 setter 时兜底。
+      // 说明:M1 评审指出这行冗余,当前保留是为了不改动"handler 里 lastSavedData=data"的历史信号语义
+      // （避免装配次序 bug 时 lastSavedData 永远为 null）。收口成功时 setter 已把 toPersist（带新 revision）
+      // 覆盖过了,这里的 data（无 revision）会瞬间被覆盖,不影响功能。
+      if (result.ok) {
+        lastSavedData = blob
 
-      // 每次保存时也创建备份
-      await createBackup(data)
+        // 每次保存时也创建备份（仅在成功写入后,STALE 时不备份陈旧快照）
+        await createBackup(blob)
+      }
+
+      return result
     } catch (error) {
       console.error('Failed to save accounts:', error)
       throw error

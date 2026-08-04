@@ -30,7 +30,13 @@ const api = {
   },
 
   // 账号管理 - 保存账号数据
-  saveAccounts: (data: unknown): Promise<void> => {
+  // 返回契约（T7 升级）:
+  //   { ok: true, revision } | { ok: false, code: 'STALE_REVISION', currentRevision }
+  saveAccounts: (
+    data: unknown
+  ): Promise<
+    { ok: true; revision: number } | { ok: false; code: 'STALE_REVISION'; currentRevision: number }
+  > => {
     return ipcRenderer.invoke('save-accounts', data)
   },
 
@@ -164,6 +170,25 @@ const api = {
     ipcRenderer.on('kiro-ide-token-changed', handler)
     return (): void => {
       ipcRenderer.removeListener('kiro-ide-token-changed', handler)
+    }
+  },
+
+  // 订阅账号数据变更广播（T8）· 决策卡 §1 不变量 3
+  // 触发场景:main 侧任何 applyAccountDataMutation 成功后 · 包括 renderer 自己发起的 save-accounts
+  // payload 严格白名单 { revision, changedIds, originId } —— 无凭证
+  // 反检责任在 renderer store 层:originId === 本窗口 → 自写回声忽略·否则按 revision 处理
+  onAccountsDataChanged: (
+    callback: (data: { revision: number; changedIds?: string[]; originId?: string }) => void
+  ): (() => void) => {
+    const handler = (
+      _event: unknown,
+      data: { revision: number; changedIds?: string[]; originId?: string }
+    ): void => {
+      callback(data)
+    }
+    ipcRenderer.on('accounts-data-changed', handler)
+    return (): void => {
+      ipcRenderer.removeListener('accounts-data-changed', handler)
     }
   },
 

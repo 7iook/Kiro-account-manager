@@ -23,6 +23,7 @@ import type {
 } from '../types/proxy'
 import { DEFAULT_PROXY_POOL_CONFIG } from '../types/proxy'
 import { useWebhookStore, type WebhookEvent, type WebhookMessage } from './webhooks'
+import { mergeSyncBlob, type SyncBlob } from './syncMerge'
 
 // ============================================
 // 账号管理 Store
@@ -53,9 +54,298 @@ const SAVE_DEBOUNCE_MS = 500
 const SAVE_MAX_WAIT_MS = 5000
 let saveDebounceTimer: ReturnType<typeof setTimeout> | null = null
 let saveMaxWaitTimer: ReturnType<typeof setTimeout> | null = null
-let saveInFlight: Promise<void> | null = null
+/** 本次 flush 的结果契约。调用方靠它知道「我的保存到底成不成」—— 而不是以前的 void（无从得知）。 */
+export type FlushSaveResult =
+  | { ok: true; revision: number }
+  | { ok: false; code: 'SYNC_CONFLICT_UNRESOLVED'; attempts: number }
+  | { ok: false; code: 'SAVE_FAILED'; error: string }
+
+let saveInFlight: Promise<FlushSaveResult> | null = null
 /** 等待本轮防抖窗口落盘的所有调用方 resolver；批量唤醒，避免风暴时 Promise 永久挂起 */
 let savePendingResolvers: Array<() => void> = []
+
+// ============ 跨端同步：base 快照 + 被吞广播账本（C1 / A-I2 返修） ============
+//
+// base = 「我当前内存状态所基于的那个磁盘快照」。
+// 为什么必须有它:整表覆盖写模型下,只有 ours 与 theirs 两方时,「某账号在 ours 里没有」
+// 是二义的 —— 可能是"我删的",也可能是"别人刚加的、我还没见过"。二义无法消除 ⇒ 必然误判一种,
+// 这正是 C1「删除被 reload 复活」的根因。有 base 后语义唯一,合并成为确定性运算而非猜测。
+//
+// 四个写入点与 currentRevision 严格同步（任何一处漏更新都会让下次合并基于错误的 base）:
+//   1. loadFromStorage 成功      2. reloadFromStorageQuiet 成功
+//   3. flushSaveImmediately 写盘成功（base = 我刚写上去的内容,它已经是盘面）
+//   4. 重放循环每轮合并后（base = 本轮拉到的盘面 theirs,**不是**合并产物 —— 见 C3）
+//
+// C3 的教训:base 有两个必须同时满足的要求,过去被混为一谈 ——
+//   内容必须是「盘面」(theirs)  · 形状必须与 ours 同一生产者(buildPersistBlob)。
+// 取「合并产物」满足了形状却违反了内容,于是用户的删除从第二轮起被判成"别人新加的"而复活。
+// 三个读盘路径统一走 deriveBaseFromDisk,同时满足两条。
+let syncBaseSnapshot: SyncBlob | null = null
+
+/** 被 isSyncing 反检吞掉的最高外部 revision;null = 无待对账项（A-I2） */
+let pendingExternalRevision: number | null = null
+
+/**
+ * 本窗口的写入来源标识（A-I2）。随每次 saveAccounts 上行,main 侧原样带回广播 payload,
+ * 使 consumer 能**精确**判定「这条广播是我自己写的回声」。
+ *
+ * 为何不用 isSyncing 时间窗:时间窗无法区分「我的回声」与「刚好落在窗口内的外部写」,
+ * 于是两者一起被吃且不留痕迹;本机写入随后把 revision 推得更高 ⇒ revision 反检此后永久失效
+ * ⇒ 那条外部改动再也不会被拉回来。originId 把“猜”换成了“知道”。
+ */
+export const SYNC_ORIGIN_ID = `renderer-${Math.random().toString(36).slice(2)}-${Date.now()}`
+
+/** STALE 后基于最新盘面重放的最大次数。超出即明确报错,绝不静默丢弃也绝不无限重试。 */
+const MAX_STALE_REPLAY_ATTEMPTS = 3
+
+/**
+ * 「内存里有未落盘的本地编辑」判据（C1-again 返修 · 本轮核心）。
+ *
+ * 为什么不能用 isSyncing:
+ *   isSyncing 只在 flushSaveImmediately 执行期间为 true = **IPC 在途**。
+ *   而用户编辑后的真实时序是:
+ *     set() 改内存 → saveToStorage 起防抖 timer(500ms,最长 5000ms) → flushNow → isSyncing=true
+ *                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *                    这整段 isSyncing 恒为 false,可内存里已经有未落盘的删除/编辑
+ *   于是任何以 isSyncing 为守卫的 reload 通道在防抖窗内全部畅通 ⇒ 整表覆盖 ⇒ 用户编辑被磁盘复活。
+ *   这正是 C1 第一轮只修了 STALE 分支却复发的原因:isSyncing ≠ dirty,两个概念不等价。
+ *
+ * 判据取自持久化机制本身（saveToStorage / flushSaveImmediately 是唯一落盘入口,天然 SSOT）:
+ *   - saveDebounceTimer / saveMaxWaitTimer 非空 → 有编辑在等防抖
+ *   - savePendingResolvers 非空               → 有调用方在等本轮落盘
+ *   - saveInFlight 非空 / isSyncing            → IPC 在途
+ *
+ * timer 被 clear 到 flush 真正开始之间**没有窗口**:flushNow 里
+ * 「clear timers → 取走 resolvers → 调 flushSaveImmediately」全程同步无 await,
+ * 而 flushSaveImmediately 的同步段即刻 set isSyncing=true 并赋值 saveInFlight。
+ * 故任一 await 点上观察,必然至少命中上面一项。
+ */
+function hasPendingLocalEditsInternal(isSyncing: boolean): boolean {
+  return (
+    saveDebounceTimer !== null ||
+    saveMaxWaitTimer !== null ||
+    savePendingResolvers.length > 0 ||
+    saveInFlight !== null ||
+    isSyncing
+  )
+}
+
+/**
+ * 持久化设置字段的默认值 —— store 初始 state 与 `keep()` fallback 的**单一来源**（I7）。
+ *
+ * 为什么必须同源:这两处过去各写一份字面量（如 `autoRefreshInterval: 5` 出现两次）。
+ * 在「盘面有这个 key 但值为 null」的路径上,`keep` 走 fallback、初始化走初值 ——
+ * 改一处漏一处就产生真实的行为分叉,而且没有任何测试会发现。
+ */
+const DEFAULT_SETTINGS: Pick<
+  AccountsStore,
+  | 'autoRefreshEnabled'
+  | 'autoRefreshInterval'
+  | 'autoRefreshConcurrency'
+  | 'autoRefreshSyncInfo'
+  | 'batchImportConcurrency'
+  | 'loginPrivateMode'
+  | 'statusCheckInterval'
+  | 'privacyMode'
+  | 'usagePrecision'
+  | 'proxyEnabled'
+  | 'proxyUrl'
+  | 'autoSwitchEnabled'
+  | 'autoSwitchThreshold'
+  | 'autoSwitchInterval'
+  | 'switchTarget'
+  | 'theme'
+  | 'darkMode'
+  | 'language'
+  | 'machineIdConfig'
+  | 'accountMachineIds'
+  | 'machineIdHistory'
+> = {
+  autoRefreshEnabled: true,
+  autoRefreshInterval: 5,
+  autoRefreshConcurrency: 100,
+  autoRefreshSyncInfo: true,
+  batchImportConcurrency: 100,
+  loginPrivateMode: false,
+  statusCheckInterval: 60,
+  privacyMode: false,
+  usagePrecision: false,
+  proxyEnabled: false,
+  proxyUrl: '',
+  autoSwitchEnabled: false,
+  autoSwitchThreshold: 0,
+  autoSwitchInterval: 5,
+  switchTarget: 'ide',
+  theme: 'default',
+  darkMode: false,
+  language: 'auto',
+  machineIdConfig: {
+    autoSwitchOnAccountChange: false,
+    bindMachineIdToAccount: false,
+    useBindedMachineId: true
+  },
+  accountMachineIds: {},
+  machineIdHistory: []
+}
+
+/**
+ * 从 store 现值构造落盘 blob（accountData 的字段清单 SSOT）。
+ *
+ * 抽出的原因:C1 的重放需要「用同一套字段清单再构造一次 payload」。若让 flush 与重放各写一份
+ * 字段列表,任何新增字段都会漏在其中一处 —— 那是 Shotgun Surgery。这里是唯一构造点。
+ */
+function buildPersistBlob(s: AccountsStore): SyncBlob {
+  return {
+    accounts: Object.fromEntries(s.accounts),
+    groups: Object.fromEntries(s.groups),
+    tags: Object.fromEntries(s.tags),
+    activeAccountId: s.activeAccountId,
+    autoRefreshEnabled: s.autoRefreshEnabled,
+    autoRefreshInterval: s.autoRefreshInterval,
+    autoRefreshConcurrency: s.autoRefreshConcurrency,
+    // I-b:以下三个字段有 setter + UI + 读入,却从未进落盘 payload（基线存量 bug,c15cbe4 同样缺）。
+    //     旧代码里只在启动时发作一次;本轮新增的 reload 通道会把它们**每次同步都重置回默认值**
+    //     （applySyncBlobToState 读到 undefined → ?? 默认值）。补齐输出即同时消灭存量 bug。
+    autoRefreshSyncInfo: s.autoRefreshSyncInfo,
+    batchImportConcurrency: s.batchImportConcurrency,
+    loginPrivateMode: s.loginPrivateMode,
+    statusCheckInterval: s.statusCheckInterval,
+    privacyMode: s.privacyMode,
+    usagePrecision: s.usagePrecision,
+    proxyEnabled: s.proxyEnabled,
+    proxyUrl: s.proxyUrl,
+    autoSwitchEnabled: s.autoSwitchEnabled,
+    autoSwitchThreshold: s.autoSwitchThreshold,
+    autoSwitchInterval: s.autoSwitchInterval,
+    switchTarget: s.switchTarget,
+    theme: s.theme,
+    darkMode: s.darkMode,
+    language: s.language,
+    machineIdConfig: s.machineIdConfig,
+    accountMachineIds: s.accountMachineIds,
+    machineIdHistory: s.machineIdHistory,
+    proxyPool: Object.fromEntries(s.proxyPool),
+    proxyPoolConfig: s.proxyPoolConfig,
+    proxyPoolCursor: s.proxyPoolCursor,
+    accountProxyBindings: s.accountProxyBindings
+  }
+}
+
+/**
+ * 把一个 blob（磁盘读到的 / 合并产物）归一化成 store 的 state 形状。
+ *
+ * 为什么要把「归一化」与「写入 store」拆开（C3 返修）:
+ *   base 的定义是「我当前内存状态**所基于的那个磁盘快照**」,而它必须与 ours 同一个生产者
+ *   （buildPersistBlob）才能逐字比对（见 M2 / loadFromStorage 处注释）。重放循环需要
+ *   「把 theirs 归一化成我的形状」却**不能**把 theirs 写进内存（内存要装的是合并产物）。
+ *   拆出纯归一化后,deriveBaseFromDisk 与 applySyncBlobToState 共用同一套归一化逻辑,
+ *   不存在"两份形状规则漂移"的可能。
+ */
+function normalizeSyncBlob(data: SyncBlob, current: AccountsStore): Partial<AccountsStore> {
+  const accounts = new Map(Object.entries((data.accounts ?? {}) as Record<string, Account>))
+  const activeAccountId = (data.activeAccountId as string | null) ?? null
+
+  // 根据 activeAccountId 同步 isActive（保持与 loadFromStorage 一致性）
+  for (const [id, account] of accounts) {
+    const shouldBeActive = id === activeAccountId
+    if (account.isActive !== shouldBeActive) {
+      accounts.set(id, { ...account, isActive: shouldBeActive })
+    }
+  }
+
+  /** 盘面有这个 key → 用盘面值（null/undefined 时落 fallback）;盘面没有 key → 保留内存现值 */
+  const keep = <K extends keyof AccountsStore>(key: K, fallback: AccountsStore[K]): AccountsStore[K] => {
+    if (!Object.prototype.hasOwnProperty.call(data, key)) return current[key]
+    const v = (data as Record<string, unknown>)[key as string]
+    return (v ?? fallback) as AccountsStore[K]
+  }
+
+  return {
+    accounts,
+    groups: new Map(Object.entries((data.groups ?? {}) as Record<string, AccountGroup>)),
+    tags: new Map(Object.entries((data.tags ?? {}) as Record<string, AccountTag>)),
+    activeAccountId,
+    currentRevision: typeof data.revision === 'number' ? data.revision : 0,
+    autoRefreshEnabled: keep('autoRefreshEnabled', DEFAULT_SETTINGS.autoRefreshEnabled),
+    autoRefreshInterval: keep('autoRefreshInterval', DEFAULT_SETTINGS.autoRefreshInterval),
+    autoRefreshConcurrency: keep('autoRefreshConcurrency', DEFAULT_SETTINGS.autoRefreshConcurrency),
+    autoRefreshSyncInfo: keep('autoRefreshSyncInfo', DEFAULT_SETTINGS.autoRefreshSyncInfo),
+    batchImportConcurrency: keep('batchImportConcurrency', DEFAULT_SETTINGS.batchImportConcurrency),
+    loginPrivateMode: keep('loginPrivateMode', DEFAULT_SETTINGS.loginPrivateMode),
+    statusCheckInterval: keep('statusCheckInterval', DEFAULT_SETTINGS.statusCheckInterval),
+    privacyMode: keep('privacyMode', DEFAULT_SETTINGS.privacyMode),
+    usagePrecision: keep('usagePrecision', DEFAULT_SETTINGS.usagePrecision),
+    proxyEnabled: keep('proxyEnabled', DEFAULT_SETTINGS.proxyEnabled),
+    proxyUrl: keep('proxyUrl', DEFAULT_SETTINGS.proxyUrl),
+    autoSwitchEnabled: keep('autoSwitchEnabled', DEFAULT_SETTINGS.autoSwitchEnabled),
+    autoSwitchThreshold: keep('autoSwitchThreshold', DEFAULT_SETTINGS.autoSwitchThreshold),
+    autoSwitchInterval: keep('autoSwitchInterval', DEFAULT_SETTINGS.autoSwitchInterval),
+    switchTarget: keep('switchTarget', DEFAULT_SETTINGS.switchTarget),
+    theme: keep('theme', DEFAULT_SETTINGS.theme),
+    darkMode: keep('darkMode', DEFAULT_SETTINGS.darkMode),
+    language: keep('language', DEFAULT_SETTINGS.language),
+    machineIdConfig: keep('machineIdConfig', DEFAULT_SETTINGS.machineIdConfig),
+    accountMachineIds: keep('accountMachineIds', DEFAULT_SETTINGS.accountMachineIds),
+    machineIdHistory: keep('machineIdHistory', DEFAULT_SETTINGS.machineIdHistory),
+    proxyPool: data.proxyPool
+      ? new Map(Object.entries(data.proxyPool as Record<string, ProxyEntry>))
+      : new Map<string, ProxyEntry>(),
+    proxyPoolConfig: {
+      ...DEFAULT_PROXY_POOL_CONFIG,
+      ...(data.proxyPoolConfig as Partial<ProxyPoolConfig> | undefined)
+    },
+    proxyPoolCursor: typeof data.proxyPoolCursor === 'number' ? data.proxyPoolCursor : 0,
+    accountProxyBindings: (data.accountProxyBindings as Record<string, string> | undefined) || {}
+  }
+}
+
+/**
+ * 把一个 blob（磁盘读到的 / 合并产物）回灌进 store state。
+ *
+ * 只写数据,**不做副作用** —— 副作用由 reloadFromStorageQuiet 按 before/after 差异决定,
+ * 因为重放循环里会多次回灌,若每次都重启定时器会造成抖动。
+ *
+ * I-b 结构性防线:标量设置字段一律经 `keep()` 读取 —— 盘面**根本没有这个 key** 时保留内存现值,
+ * 而不是回落到默认值。理由:`?? 默认值` 把"盘面没说"与"盘面说了默认值"混为一谈,于是任何
+ * 「有 setter 有 UI 但漏出落盘清单」的字段都会被每次跨端同步重置回默认（autoRefreshSyncInfo /
+ * batchImportConcurrency / loginPrivateMode 三个字段就是这样被用户"关掉又自己打开"的）。
+ * 补齐 buildPersistBlob 治了当下三例;这条防线让同类漏字段今后**结构上不再表现为静默重置**。
+ */
+function applySyncBlobToState(
+  data: SyncBlob,
+  set: (partial: Partial<AccountsStore>) => void,
+  current: AccountsStore
+): void {
+  set(normalizeSyncBlob(data, current))
+}
+
+/** 从 blob 里取 accounts 集合（缺失 / 形状不对时退化成空对象,供 I6 不变量断言用） */
+function asAccountMap(blob: SyncBlob | null): Record<string, unknown> {
+  const v = blob?.accounts
+  return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+}
+
+/**
+ * 由「刚从磁盘读到的盘面」推导出新的 base 快照（C3 返修 · 本轮核心）。
+ *
+ * base 的语义是「我这份内存状态**所基于的那个磁盘快照**」—— 它必须装**别人的盘面内容**,
+ * 因为它唯一的用途是回答:「某条记录在 ours 里不见了,是我删的、还是我根本没见过?」
+ *
+ * 于是它有两个必须同时满足的要求,过去被混为一谈:
+ *   ① 内容 = theirs（新拉到的盘面）。装成合并产物就等于把"这条记录我曾见过"的证据抹掉,
+ *      下一轮它会落到「base 没有 + theirs 有」= 别人新加的 ⇒ 用户的删除被复活。
+ *   ② 形状 = 与 ours 同一个生产者（buildPersistBlob ∘ normalizeSyncBlob）。直接存磁盘原始
+ *      blob 会因归一化差异（isActive 推导 / Map 转换 / 缺 key 补默认）把每条记录误判为
+ *      "本地改过" ⇒ 合并退化成全量本地胜 ⇒ 等于回到整表覆盖（这是 M2 修过的坑）。
+ *
+ * @param disk    刚读到的盘面（theirs）
+ * @param current 归一化时的参照内存态 —— 必须与 `ours = buildPersistBlob(current)` 同一份,
+ *                这样"盘面缺某个 key"在 base 与 ours 里取到同一个值 ⇒ 判为"我没改过"（保守正确）
+ */
+function deriveBaseFromDisk(disk: SyncBlob, current: AccountsStore): SyncBlob {
+  const normalized = { ...current, ...normalizeSyncBlob(disk, current) } as AccountsStore
+  return { ...buildPersistBlob(normalized), revision: normalized.currentRevision }
+}
 
 // ============ getFilteredAccounts / getStats 引用缓存 ============
 // 大账号量场景下这两个 selector 每次 re-render 都跑 O(n) 计算（filter + sort）
@@ -282,6 +572,21 @@ interface AccountsState {
   isLoading: boolean
   isSyncing: boolean
 
+  /**
+   * 本地持有的 accountData revision 快照（T7 · 决策卡 §1 不变量 2）
+   * - 每次 loadFromStorage / reloadFromStorageQuiet 从盘面读入
+   * - flushSaveImmediately 携带此值传给 main 侧仲裁
+   * - 收到广播 accounts-data-changed 时:payload.revision <= 此值 → 忽略（自写回声）· > 此值 → reload
+   * - 初始 0 = 未加载 · load 后与磁盘一致
+   */
+  currentRevision: number
+
+  /**
+   * 跨端同步失败且无法自动合并时的用户可见错误（C1 返修）
+   * null = 无冲突。非 null 时 UI 应提示用户「你的改动没能保存」——绝不静默丢弃。
+   */
+  syncError: { code: 'SYNC_CONFLICT_UNRESOLVED'; attempts: number; at: number } | null
+
   // 批量测活(走反代真实发请求探活/探封禁)进度；null=未运行
   livenessProgress: { done: number; total: number; ok: number; failed: number } | null
 
@@ -422,10 +727,25 @@ interface AccountsActions {
 
   // 持久化
   loadFromStorage: () => Promise<void>
+  /**
+   * 静默重载账号数据（T7 · 决策卡 §1 跨端同步机制）
+   *
+   * 与 loadFromStorage 的关键差异（recon-revision-sync.md §2 P6 副作用清单）:
+   *   - 不设 isLoading = true（不影响 UI loading 态,广播触发的 reload 应静默）
+   *   - 不调 syncLocalSsoAccountAsync（防幽灵账号回归:web 端删账号 → 桌面端 reload →
+   *     若走 SSO 同步则从本机 SSO 缓存自动重新导入 = 删除失效）
+   *   - 不调 startAutoSave / 不做 machineId 迁移（那是首屏一次性动作）
+   *   - 但**会**按 before/after 差异重启定时器 / 应用主题 / 切代理（B-I1 返修）——
+   *     否则"同步了值但不生效",UI 显示与实际行为不一致
+   *
+   * ⚠️ 调用前必须确认没有未落盘的本地编辑（`hasPendingLocalEdits()`）:本函数是**整表覆盖**,
+   *    在防抖窗内调用会把用户尚未落盘的删除/编辑抹掉（C1-again）。守卫在 syncIfRevisionDrifted。
+   */
+  reloadFromStorageQuiet: (preloaded?: SyncBlob) => Promise<void>
   /** 防抖触发持久化（推荐：高频 mutation 自动合并写盘） */
   saveToStorage: () => Promise<void>
   /** 立即持久化（用于 beforeunload 或关键操作场景） */
-  flushSaveImmediately: () => Promise<void>
+  flushSaveImmediately: () => Promise<FlushSaveResult>
 
   // 设置
   setAutoRefresh: (enabled: boolean, interval?: number) => void
@@ -574,6 +894,53 @@ interface AccountsActions {
     remove?: string[]
     replace?: Array<Record<string, unknown>>
   }) => Promise<{ success: boolean; addedCount?: number; removedCount?: number; poolSize?: number; error?: string }>
+
+  // ==================== 跨端同步（C1 / A-I2 / I3 返修） ====================
+
+  /**
+   * 记录一次收到的外部 revision（A-I2 返修）。
+   *
+   * 为什么需要:原实现里 isSyncing 反检命中后直接 return,**不留任何痕迹** ⇒
+   * 本机写入随后把本地 revision 推到更高值,那条被吞的外部改动此后再也不会被 reload
+   * （revision 反检永久失效）。用户若不再编辑,就永远看不到它。
+   *
+   * @param selfOrigin true = 这条广播是本窗口自己写入产生的回声,无需补拉
+   */
+  noteExternalRevision: (revision: number, opts?: { selfOrigin?: boolean }) => void
+
+  /**
+   * 对账:若存在被吞过的外部 revision 且本地盘面确实落后,补拉一次（A-I2 返修）。
+   * 在 flushSaveImmediately 结束后 / 窗口聚焦时调用。
+   */
+  reconcilePendingExternalRevision: () => Promise<void>
+
+  /**
+   * 兜底同步（I3 返修 · 决策卡「跨端同步机制」表格要求）:
+   * 比对磁盘 revision 与本地 revision,不一致才整表拉取。广播丢失时的安全网。
+   *
+   * @returns true = 本次确实与盘面对齐了（含"无漂移,无需动作"）;
+   *          false = 没对上（被 dirty 守卫挡下 / 读盘失败 / 盘面为空）。
+   *          调用方据此决定「待对账账本」能否清除（I5）—— 本函数的 catch 只 warn 不抛,
+   *          所以失败**无法**通过 await 抛错感知,必须靠这个返回值。
+   */
+  syncIfRevisionDrifted: () => Promise<boolean>
+
+  /**
+   * 「内存里有未落盘的本地编辑」（C1-again 返修）。
+   *
+   * 所有 reload 通道的守卫判据。**不要用 isSyncing 代替** —— 后者只表示 IPC 在途,
+   * 覆盖不到防抖窗（500ms,最长 5000ms）,而用户的删除恰恰在那段时间只存在于内存里。
+   */
+  hasPendingLocalEdits: () => boolean
+
+  /**
+   * 收到 kiro-ide-token-changed 后的同步（C1-again · 第 4 条 reload 通道）。
+   * 与广播 / 聚焦 / 轮询共用同一套 dirty 守卫 + revision 比对,不再无条件 loadFromStorage。
+   */
+  syncAfterIdeTokenChanged: () => Promise<void>
+
+  /** 清除跨端同步冲突提示（C2:UI 弹窗告知用户后调用,避免重复弹） */
+  clearSyncError: () => void
 }
 
 type AccountsStore = AccountsState & AccountsActions
@@ -658,38 +1025,17 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   selectedIds: new Set(),
   isLoading: false,
   isSyncing: false,
+  currentRevision: 0,
+  syncError: null,
   livenessProgress: null,
-  autoRefreshEnabled: true,
-  autoRefreshInterval: 5,
-  autoRefreshConcurrency: 100,
-  autoRefreshSyncInfo: true,
-  statusCheckInterval: 60,
+  // I7:持久化设置字段一律取 DEFAULT_SETTINGS,不再与 keep() 的 fallback 各写一份字面量
+  ...DEFAULT_SETTINGS,
   proactiveRenewalEnabled: false,
   proactiveRenewalLeadMinutes: 15,
-  privacyMode: false,
-  usagePrecision: false,
-  proxyEnabled: false,
-  proxyUrl: '',
-  autoSwitchEnabled: false,
-  autoSwitchThreshold: 0,
-  autoSwitchInterval: 5,
-  batchImportConcurrency: 100,
-  loginPrivateMode: false,
-  switchTarget: 'ide' as const,
-  theme: 'default',
-  darkMode: false,
-  language: 'auto',
 
-  machineIdConfig: {
-    autoSwitchOnAccountChange: false,
-    bindMachineIdToAccount: false,
-    useBindedMachineId: true
-  },
   currentMachineId: '',
   originalMachineId: null,
   originalBackupTime: null,
-  accountMachineIds: {},
-  machineIdHistory: [],
 
   // 代理池初始状态
   proxyPool: new Map<string, ProxyEntry>(),
@@ -1998,13 +2344,21 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         const activeAccountId = data.activeAccountId ?? null
 
         // 为没有 machineId 的现有账户生成一个
+        //
+        // ⚠️ 必须写**副本**而非就地改 account（C3 别名变体）:
+        //   `new Map(Object.entries(data.accounts))` 是浅拷贝 —— Map 里的 value 与
+        //   `data.accounts[id]` 是同一个对象引用。就地写 `account.machineId = …` 会连带污染
+        //   `data`,而 data 正是下面 deriveBaseFromDisk(data, …) 的「盘面」入参。
+        //   一旦 base 里也带上刚生成的 machineId,它就与 ours 相同 ⇒ 合并读作「我没改过」
+        //   ⇒ 采纳盘面（无 machineId）⇒ 生成的值被静默丢弃(flush 仍返回 ok:true)。
+        //   base 的**内容**必须是盘面原样,这是 C3 的同一条铁律。
         let needsSave = false
         for (const [id, account] of accounts) {
           if (!account.machineId) {
-            account.machineId = generateRandomMachineId()
-            accounts.set(id, account)
+            const machineId = generateRandomMachineId()
+            accounts.set(id, { ...account, machineId })
             needsSave = true
-            console.log(`[Store] Generated machineId for account ${account.email}: ${account.machineId.substring(0, 16)}...`)
+            console.log(`[Store] Generated machineId for account ${account.email}: ${machineId.substring(0, 16)}...`)
           }
         }
 
@@ -2021,6 +2375,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           groups: new Map(Object.entries(data.groups ?? {}) as [string, AccountGroup][]),
           tags: new Map(Object.entries(data.tags ?? {}) as [string, AccountTag][]),
           activeAccountId,
+          // T7:记住磁盘 revision,后续 save 携带此值参与仲裁;旧盘无此字段视为 0 兼容
+          currentRevision: typeof (data as unknown as { revision?: unknown }).revision === 'number'
+            ? (data as unknown as { revision: number }).revision
+            : 0,
           autoRefreshEnabled: data.autoRefreshEnabled ?? true,
           autoRefreshInterval: data.autoRefreshInterval ?? 5,
           autoRefreshConcurrency: data.autoRefreshConcurrency ?? 100,
@@ -2077,11 +2435,117 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         // SSO 同步（含潜在网络请求）异步执行，不阻塞首屏加载
         // 完成后通过 set 应用结果，UI 会自然更新
         queueMicrotask(() => { void syncLocalSsoAccountAsync(get, set) })
+
+        // C1:记下「我这份内存状态所基于的盘面快照」作为后续三方合并的 base。
+        // 没有 base 就无法区分「我删的」与「别人刚加的」,STALE 后必然误判丢用户操作。
+        //
+        // C3 变体:base 的**内容**必须来自盘面（`data`）,不能取回灌后的内存 ——
+        // 此处内存已可能含刚生成的 machineId（上面的 needsSave 分支）,而盘面还没有。
+        // 若 base 取内存,那个新 machineId 在 base 与 ours 里都存在 ⇒ 合并判为"我没改过"
+        // ⇒ 采纳 theirs（无 machineId）⇒ 刚生成的 machineId 被静默丢弃。
+        // 形状仍由 buildPersistBlob 统一产出（与 ours 同一生产者,否则每条记录误判为本地改过）。
+        syncBaseSnapshot = deriveBaseFromDisk(data as unknown as SyncBlob, get())
       }
     } catch (error) {
       console.error('Failed to load accounts:', error)
     } finally {
       set({ isLoading: false })
+    }
+  },
+
+  /**
+   * 静默重载（T7 · 决策卡 §1 跨端同步机制）
+   *
+   * 用于:
+   *   - 收到 accounts-data-changed 广播且 payload.revision > currentRevision 时
+   *   - flushSaveImmediately 收到 STALE_REVISION 后同步到最新状态
+   *
+   * 与 loadFromStorage 的差异（recon §2 P6）:
+   *   - 不设 isLoading = true
+   *   - 不调 syncLocalSsoAccountAsync（防幽灵账号回归 · 手机端删账号后不会自动重新导入）
+   *   - 不调 startAutoSave / 不做 machineId 迁移（那是首屏一次性动作）
+   *   - 但**会**按 before/after 差异重启定时器 / 应用主题 / 切代理（B-I1 返修）——
+   *     否则“同步了值但不生效”，UI 显示与实际行为不一致
+   *
+   * @param preloaded 已经读到的盘面（避免兼容校对后再读一次）
+   */
+  reloadFromStorageQuiet: async (preloaded?: SyncBlob) => {
+    try {
+      const data = (preloaded ?? (await window.api.loadAccounts())) as SyncBlob | null
+      if (!data) return
+
+      // ---- B-I1:先记下「需要副作用才能生效」的字段旧值 ----
+      // 原实现只 set 值、不重启定时器 / 不应用主题 / 不切代理 ⇒ 用户在 UI 上看到新值,
+      // 实际行为仍按旧值跑（显示 10 分钟、实际 5 分钟）。「同步值但不生效」是最差的选择:
+      // 它让用户以为已生效。桌面端用户自己改设置时走的是 setter（都带副作用）,
+      // 跨端同步理应等价 —— 这就是「照搬桌面端行为」的含义。
+      const before = get()
+      const prev = {
+        autoSwitchEnabled: before.autoSwitchEnabled,
+        autoSwitchInterval: before.autoSwitchInterval,
+        theme: before.theme,
+        darkMode: before.darkMode,
+        proxyEnabled: before.proxyEnabled,
+        proxyUrl: before.proxyUrl,
+        autoRefreshEnabled: before.autoRefreshEnabled,
+        autoRefreshInterval: before.autoRefreshInterval
+      }
+
+      applySyncBlobToState(data, set, get())
+
+      // 盘面已成为我当前状态的基准 → 更新 base。
+      // 内容取盘面（`data`）· 形状由 buildPersistBlob 统一产出（与 ours 同一生产者,
+      // 否则归一化差异会把每条记录误判为本地改过）。这里回灌的就是 data 本身,
+      // 故「内存态」与「盘面」等价;仍走 deriveBaseFromDisk 以保持三个写入点同一语义（C3）。
+      syncBaseSnapshot = deriveBaseFromDisk(data, get())
+
+      const after = get()
+
+      // ---- B-I1:仅在值真变了时施加副作用（值未变不动,避免每次广播都重建定时器 / 闪主题） ----
+
+      // 主题:applyTheme 是命令式 DOM 操作,App.tsx 无响应式订阅 ⇒ 不显式调用则跨端改主题不变色
+      if (after.theme !== prev.theme || after.darkMode !== prev.darkMode) {
+        get().applyTheme()
+      }
+
+      // 自动换号定时器:startAutoSwitch 一次性读 interval 建 timer,改值不影响已建 timer。
+      // 照 setAutoSwitch 的既有契约 —— 改完必须重启。
+      if (
+        after.autoSwitchEnabled !== prev.autoSwitchEnabled ||
+        after.autoSwitchInterval !== prev.autoSwitchInterval
+      ) {
+        if (after.autoSwitchEnabled) {
+          get().startAutoSwitch()
+        } else {
+          get().stopAutoSwitch()
+        }
+      }
+
+      // 自动 token 刷新定时器:同构问题（startAutoTokenRefresh 也是一次性读 interval）
+      if (
+        after.autoRefreshEnabled !== prev.autoRefreshEnabled ||
+        after.autoRefreshInterval !== prev.autoRefreshInterval
+      ) {
+        if (after.autoRefreshEnabled) {
+          get().startAutoTokenRefresh()
+        } else {
+          get().stopAutoTokenRefresh()
+        }
+      }
+
+      // 代理:只 set 值不调 setProxy ⇒ main 侧代理实际未切换
+      if (after.proxyEnabled !== prev.proxyEnabled || after.proxyUrl !== prev.proxyUrl) {
+        try {
+          await window.api.setProxy?.(after.proxyEnabled, after.proxyUrl)
+        } catch (e) {
+          // 代理切换失败不应回滚数据同步;留 warn 可观测（§4.4 精准 catch）
+          console.warn('[Store] setProxy after cross-end sync failed:', e)
+        }
+      }
+    } catch (error) {
+      // 静默失败:调用方（广播 consumer / STALE 处理）会在下次机会重试
+      // NEVER 吞:留 warn 让 devtools 可观测（§4.4）
+      console.warn('[Store] reloadFromStorageQuiet failed:', error)
     }
   },
 
@@ -2130,77 +2594,221 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       return inflight
     }
 
-    const {
-      accounts,
-      groups,
-      tags,
-      activeAccountId,
-      autoRefreshEnabled,
-      autoRefreshInterval,
-      autoRefreshConcurrency,
-      statusCheckInterval,
-      privacyMode,
-      usagePrecision,
-      proxyEnabled,
-      proxyUrl,
-      autoSwitchEnabled,
-      autoSwitchThreshold,
-      autoSwitchInterval,
-      switchTarget,
-      theme,
-      darkMode,
-      language,
-      machineIdConfig,
-      accountMachineIds,
-      machineIdHistory,
-      proxyPool,
-      proxyPoolConfig,
-      proxyPoolCursor,
-      accountProxyBindings
-    } = get()
-
     set({ isSyncing: true })
 
     saveInFlight = (async () => {
       try {
-        await window.api.saveAccounts({
-          accounts: Object.fromEntries(accounts),
-          groups: Object.fromEntries(groups),
-          tags: Object.fromEntries(tags),
-          activeAccountId,
-          autoRefreshEnabled,
-          autoRefreshInterval,
-          autoRefreshConcurrency,
-          statusCheckInterval,
-          privacyMode,
-          usagePrecision,
-          proxyEnabled,
-          proxyUrl,
-          autoSwitchEnabled,
-          autoSwitchThreshold,
-          autoSwitchInterval,
-          switchTarget,
-          theme,
-          darkMode,
-          language,
-          machineIdConfig,
-          accountMachineIds,
-          machineIdHistory,
-          proxyPool: Object.fromEntries(proxyPool),
-          proxyPoolConfig,
-          proxyPoolCursor,
-          accountProxyBindings
+        let attempt = 0
+        /**
+         * I6:本次落盘期间「用户删掉过的账号 id」累积集合。
+         * 逐轮累积而不是只看当轮:删除意图属于**本次落盘**,一旦成立就必须一路保持到写盘成功。
+         */
+        const myDeletedIds = new Set<string>()
+        // STALE 重放循环（C1 返修）:
+        //   原实现收到 STALE 后只 reload,而 reload 整表覆盖内存 ⇒ 用户本次操作被磁盘数据冲掉,
+        //   磁盘上从未写入 ⇒ 真实丢更新且无提示。
+        //   正确语义不是"把陈旧整表再写一遍"（那会覆盖别人的改动）,而是
+        //   **基于新拉到的磁盘状态,重新施加本次改动** —— 即 base/ours/theirs 三方合并后重放。
+        while (attempt < MAX_STALE_REPLAY_ATTEMPTS) {
+          attempt++
+          const blob = buildPersistBlob(get())
+          const expectedRevision = get().currentRevision
+
+          // blob 是 buildPersistBlob 的产物（accountData 字段清单 SSOT）。
+          // saveAccounts 的形参声明为 AccountData（preload 的 ambient 类型,web tsconfig 里不可见）,
+          // 故此处按调用契约收窄:整表字段 + 两个仲裁参数。
+          const result = await window.api.saveAccounts({
+            ...blob,
+            expectedRevision,
+            originId: SYNC_ORIGIN_ID
+          } as Parameters<typeof window.api.saveAccounts>[0])
+
+          if (result.ok) {
+            // 写盘成功 → 本次落盘内容成为新的 base（下次合并的比较基准）
+            syncBaseSnapshot = { ...blob, revision: result.revision }
+            set({ currentRevision: result.revision, syncError: null })
+            return { ok: true as const, revision: result.revision }
+          }
+
+          // STALE:别人在我提交期间写过盘。拉最新盘面,把本次改动重新施加其上。
+          console.warn(
+            `[Store] saveAccounts STALE (local=${expectedRevision}, server=${result.currentRevision}); ` +
+              `merging + replaying (attempt ${attempt}/${MAX_STALE_REPLAY_ATTEMPTS})`
+          )
+
+          const theirs = (await window.api.loadAccounts()) as SyncBlob | null
+          if (!theirs) {
+            // 盘面读不到 → 无法安全合并。明确失败,不假装成功（§4.4 不吞）
+            const error = 'cannot read latest state for merge'
+            set({ syncError: { code: 'SYNC_CONFLICT_UNRESOLVED', attempts: attempt, at: Date.now() } })
+            return { ok: false as const, code: 'SAVE_FAILED' as const, error }
+          }
+
+          const ours = buildPersistBlob(get())
+          const oursAccountIds = new Set(Object.keys(asAccountMap(ours)))
+          const { merged, stats } = mergeSyncBlob(syncBaseSnapshot ?? {}, ours, theirs)
+          console.log(
+            `[Store] merge: localKept=${stats.localRecordsKept} remoteAdopted=${stats.remoteRecordsAdopted} ` +
+              `myDeletions=${stats.localDeletionsHonored} theirDeletions=${stats.remoteDeletionsAdopted} ` +
+              `remoteCreds=${stats.remoteCredentialsAdopted} settingsKept=[${stats.localScalarsKept.join(',')}]`
+          )
+
+          // I6:用户删除意图的**跨轮次守恒**闸门（§4.9 Layer-1）。
+          //
+          // 为什么需要它:C1 与 C3 是同一个母题 —— 丢用户数据时缺少"这不对"的信号。
+          // syncError 弹窗只覆盖「重试耗尽」,覆盖不到「合并成功但用户意图蒸发」——
+          // 后者 flush 返回 ok:true、syncError 为 null,日志里 merge: 那行看起来一切正常
+          // （C3 就是这样躲过三轮评审的）。这道闸门让同类 base 语义错误无法再静默发生。
+          //
+          // 判据选「意图集合守恒」而不是「统计数字逐轮比较」:后者会误报 ——
+          // 别人也删了同一个账号时,我的 localDeletionsHonored 会合法归零,
+          // 而 remoteDeletionsAdopted 那个分支要求 inOurs 故仍为 0 ⇒ 看起来像"意图蒸发"。
+          // 而「我删过的 id 不得重新出现在合并产物里」对这种情况天然免疫（依然不存在 = 正确）,
+          // 且它正是用户可感知的那句话:我删掉的账号不许自己回来。
+          for (const id of Object.keys(asAccountMap(syncBaseSnapshot))) {
+            if (!oursAccountIds.has(id)) myDeletedIds.add(id)
+          }
+          const resurrected = [...myDeletedIds].filter((id) =>
+            Object.prototype.hasOwnProperty.call(asAccountMap(merged), id)
+          )
+          if (resurrected.length > 0) {
+            console.error(
+              `[Store] merge invariant violated: 我删除的账号在合并产物里复活了 ` +
+                `[${resurrected.join(',')}] —— base 语义可能有误,拒绝落盘以免静默丢弃用户操作`
+            )
+            set({
+              syncError: { code: 'SYNC_CONFLICT_UNRESOLVED', attempts: attempt, at: Date.now() }
+            })
+            return {
+              ok: false as const,
+              code: 'SAVE_FAILED' as const,
+              error: `merge invariant violated: deleted accounts resurrected [${resurrected.join(',')}]`
+            }
+          }
+
+          // C3:新 base 必须是**本轮拉到的盘面**（theirs）,不是合并产物。
+          //
+          // 为什么:base 只有一个用途 —— 回答「某记录在 ours 里没有,是我删的还是我没见过」。
+          // 合并产物里用户删掉的账号已经不存在了,把它当 base 就等于抹掉"我曾见过这条记录"
+          // 的证据 ⇒ 下一轮它落到「base 无 + theirs 有」= 别人新加的 ⇒ 删除复活,
+          // 而 flush 仍返回 ok:true、syncError 为 null（比 C1 更隐蔽:连日志都显示正常）。
+          //
+          // 注意顺序:先用**回灌前**的内存态推 base,再回灌。因为归一化时"盘面缺某个 key"
+          // 要保留的是与 ours 同一份内存现值（deriveBaseFromDisk 的 @param current 契约）。
+          const nextBase = deriveBaseFromDisk(theirs, get())
+          applySyncBlobToState(merged, set, get())
+          syncBaseSnapshot = nextBase
+        }
+
+        // 重试耗尽:持续撞车（罕见,通常意味着有写路径在高频刷盘）。
+        // 必须让用户知道 —— 静默是 C1 的原罪之一。
+        console.error(
+          `[Store] saveAccounts still conflicting after ${MAX_STALE_REPLAY_ATTEMPTS} replays; surfacing to user`
+        )
+        set({
+          syncError: {
+            code: 'SYNC_CONFLICT_UNRESOLVED',
+            attempts: MAX_STALE_REPLAY_ATTEMPTS,
+            at: Date.now()
+          }
         })
+        return {
+          ok: false as const,
+          code: 'SYNC_CONFLICT_UNRESOLVED' as const,
+          attempts: MAX_STALE_REPLAY_ATTEMPTS
+        }
       } catch (error) {
         console.error('Failed to save accounts:', error)
+        return {
+          ok: false as const,
+          code: 'SAVE_FAILED' as const,
+          error: error instanceof Error ? error.message : String(error)
+        }
       } finally {
         set({ isSyncing: false })
         saveInFlight = null
         for (const r of pending) r()
+        // A-I2:写入窗口内被反检吞掉的外部广播,在这里补拉,避免永久错过。
+        void get().reconcilePendingExternalRevision()
       }
     })()
 
     return saveInFlight
+  },
+
+  // ==================== 跨端同步（C1 / A-I2 / I3 返修） ====================
+
+  hasPendingLocalEdits: () => hasPendingLocalEditsInternal(get().isSyncing),
+
+  noteExternalRevision: (revision, opts) => {
+    if (opts?.selfOrigin) return
+    if (revision <= get().currentRevision) return
+    if (pendingExternalRevision !== null && pendingExternalRevision >= revision) return
+    pendingExternalRevision = revision
+  },
+
+  reconcilePendingExternalRevision: async () => {
+    const target = pendingExternalRevision
+    if (target === null) return
+    // C1-again:判据是 dirty（内存有未落盘编辑）,不是 isSyncing（仅 IPC 在途）。
+    // 防抖窗内 isSyncing 恒为 false,若只看它,这里会整表覆盖掉用户尚未落盘的删除。
+    if (get().hasPendingLocalEdits()) return // 留到那次 flush 的 finally 再对账
+
+    // I5:先拉取成功再清账本。这个账本存在的唯一理由是「绝不丢失外部信号」,
+    // 而 syncIfRevisionDrifted 内部的 catch 只 warn（不能让兜底通道的失败冒泡打断主流程）,
+    // 所以**不能靠 await 抛错**来判断成败 —— 它返回布尔告知本次是否真的对上了盘面。
+    // 若先清账再拉取,IPC 抛错时账本已空而数据未到,那次外部改动就只能等兜底轮询（≤6s）,
+    // 「确定性补拉」被降级成「依赖兜底」。
+    const settled = await get().syncIfRevisionDrifted()
+    if (!settled) return // 账本原样留着,下次广播 / 轮询继续对账
+    // 仅当账本仍是我进来时看到的那个值才清除:期间可能有更高的外部 revision 记进来,
+    // 直接置 null 会把那条新信号一起丢掉。
+    if (pendingExternalRevision === target) pendingExternalRevision = null
+  },
+
+  syncIfRevisionDrifted: async () => {
+    // C1-again 核心:守卫用 dirty 而非 isSyncing。
+    //   isSyncing 只覆盖 flushSaveImmediately 执行期间（IPC 在途）;而用户编辑后先在防抖窗里等
+    //   500ms（最长 5000ms）,那段时间 isSyncing === false 却已有未落盘编辑 ⇒ 本函数畅通
+    //   ⇒ reloadFromStorageQuiet 整表覆盖 ⇒ 删除被磁盘数据复活,且不 STALE、不进合并、不报错。
+    //   reviewer 探针实测同一场景复活 3 个已删账号、syncError 为 null,与首轮 C1 现象逐字相同。
+    // 挡下不等于丢弃:记账后由 flush 的 finally 对账补拉（见 flushSaveImmediately 的 finally）。
+    if (get().hasPendingLocalEdits()) {
+      const local = get().currentRevision
+      pendingExternalRevision = Math.max(pendingExternalRevision ?? 0, local + 1)
+      return false
+    }
+    try {
+      const data = (await window.api.loadAccounts()) as SyncBlob | null
+      if (!data) return false
+      const diskRevision = typeof data.revision === 'number' ? data.revision : 0
+      if (diskRevision === get().currentRevision) return true // 无漂移,不做无谓整表 set
+      console.log(
+        `[Store] revision drift detected (disk=${diskRevision}, local=${get().currentRevision}); syncing`
+      )
+      await get().reloadFromStorageQuiet(data)
+      return true
+    } catch (error) {
+      // 兜底通道失败不能影响主流程;留 warn 可观测（§4.4 不吞）
+      console.warn('[Store] syncIfRevisionDrifted failed:', error)
+      return false // I5:告知调用方本次没对上,账本不要清
+    }
+  },
+
+  /**
+   * IDE token 反向同步（kiro-ide-token-changed）后的重取（C1-again 第 4 条通道）。
+   *
+   * 原来 App.tsx 收到该事件直接调 loadFromStorage() —— 那是**无守卫的整表覆盖**,
+   * 且比另外三条更狠:它还会跑 syncLocalSsoAccountAsync（重新导入本机 SSO 账号 = 幽灵账号回归）。
+   * ProactiveRenewal 刷 token 后正是同时发这个事件与 accounts-data-changed 广播,
+   * 于是防抖窗内用户的删除会被这条通道复活。改为与其余三条同一套 dirty 守卫 + revision 比对。
+   */
+  syncAfterIdeTokenChanged: async () => {
+    await get().syncIfRevisionDrifted()
+  },
+
+  clearSyncError: () => {
+    if (get().syncError !== null) set({ syncError: null })
   },
 
   // ==================== 设置 ====================

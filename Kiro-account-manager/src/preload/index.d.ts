@@ -142,7 +142,16 @@ interface KiroApi {
 
   // 账号管理
   loadAccounts: () => Promise<AccountData | null>
-  saveAccounts: (data: AccountData) => Promise<void>
+  /**
+   * 保存账号数据（T7 升级）· 决策卡 §1 不变量 2 revision 乐观锁
+   * data 可包含可选 `expectedRevision`(客户端持有的 revision 快照);
+   * 成功 → { ok: true, revision };过期 → { ok: false, code: 'STALE_REVISION', currentRevision }
+   */
+  saveAccounts: (
+    data: AccountData & { expectedRevision?: number; originId?: string }
+  ) => Promise<
+    { ok: true; revision: number } | { ok: false; code: 'STALE_REVISION'; currentRevision: number }
+  >
   refreshAccountToken: (account: unknown) => Promise<RefreshResult>
   checkAccountStatus: (account: unknown) => Promise<StatusResult>
   
@@ -223,6 +232,22 @@ interface KiroApi {
    * 让 UI 显示最新 expiresAt。返回 unsubscribe 函数。
    */
   onKiroIdeTokenChanged: (callback: (data: KiroIdeTokenChangedPayload) => void) => () => void
+
+  /**
+   * 订阅账号数据变更广播（T8）· 决策卡 §1 不变量 3
+   *
+   * 触发场景:main 侧任何 applyAccountDataMutation 成功后（本进程 save-accounts / ProactiveRenewal /
+   * 关窗 flush / 退出 flush / 解封 · 未来 web 面板同一 channel 服务两端）
+   *
+   * payload 严格白名单 { revision, changedIds } —— 无凭证（§3 输出脱敏）
+   *
+   * 反检责任在 renderer store 层:
+   *   payload.revision <= 本地 currentRevision → 忽略（自写回声,防成环）
+   *   payload.revision >  本地 currentRevision → 调 reloadFromStorageQuiet()
+   */
+  onAccountsDataChanged: (
+    callback: (data: { revision: number; changedIds?: string[]; originId?: string }) => void
+  ) => () => void
 
   /**
    * 开启/关闭"主动续期"功能。
