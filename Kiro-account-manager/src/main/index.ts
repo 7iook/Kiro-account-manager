@@ -58,6 +58,7 @@ import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 //   webPanel/ 目录本身不得 import electron(架构闸门 webpanel_auth_constraints.test.ts),
 //   故 electron 依赖留在 wiring 一侧。
 import { WebPanelWiring, buildPanelRouteDeps } from './ipc/webPanelWiring'
+import { buildPanelProxyDeps } from './ipc/panelProxyDeps'
 import {
   applyAccountDataMutation,
   setStoreRef as setAccountStoreRef,
@@ -4381,7 +4382,19 @@ app.whenReady().then(async () => {
       getAccountSubscriptionUrl: (identity, subscriptionType) =>
         getAccountSubscriptionUrl({ fetchSubscriptionToken }, identity, subscriptionType),
       setAccountOverage: (identity, enabled) =>
-        setAccountOverage({ setUserPreference }, identity, enabled ? 'ENABLED' : 'DISABLED')
+        setAccountOverage({ setUserPreference }, identity, enabled ? 'ENABLED' : 'DISABLED'),
+      // 反代编排(W8):用户日常的第三、四步 —— 在手机上选号 + 启停反代。
+      // 顺序与判据都在 proxy/activation.ts 与 ipc/panelProxyDeps.ts,面板不重算。
+      ...buildPanelProxyDeps({
+        getProxyServer: () => proxyServer,
+        initProxyServer: () => initProxyServer(),
+        loadAccountData: () => store?.get('accountData') as never,
+        persistProxyConfig: (config) => {
+          store?.set('proxyConfig', config)
+        },
+        updateTrayMenu: () => updateTrayMenu(),
+        archiveSessionIfAny: () => archiveProxySessionIfAny()
+      })
     })
   })
   webPanelWiring.registerIpcHandlers()

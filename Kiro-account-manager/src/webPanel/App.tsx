@@ -40,6 +40,7 @@ import { PanelApiError } from './api/client'
 import { LoginScreen } from './ui/LoginScreen'
 import { AccountCard } from './ui/AccountCard'
 import { ImportPanel } from './ui/ImportPanel'
+import { ProxyPanel } from './ui/ProxyPanel'
 
 /** 会话三态。`unknown` 是启动时的真实状态，不能默认成 `logged-out`（会闪一下登录页） */
 type SessionState = 'unknown' | 'logged-in' | 'logged-out'
@@ -249,8 +250,19 @@ export function App(): React.JSX.Element {
         </div>
       )}
 
-      {/* 导入放在列表上方：它是用户日常流程的第一步（先有账号才有额度可看）。
-          导入成功后重拉列表 —— 服务端写入已落盘，重拉能拿到真实的新账号。 */}
+      {/* 反代服务 —— 用户日常流程的第三、四步（选号 + 启停）。
+          放最上面：日常打开面板多半是为了启停反代，而账号列表可能很长，
+          放后面在手机上要一直滚。 */}
+      <ProxyPanel
+        accounts={accounts}
+        onSessionLost={dropSession}
+        onNotice={setNotice}
+        onError={setError}
+      />
+
+      {/* 导入 —— 日常流程的第一步，但**频次低于启停**（账号加一次用很久），
+          故排在反代之后、列表之前。导入成功后重拉列表：服务端写入已落盘，
+          重拉能拿到真实的新账号（而不是把响应拼进本地状态）。 */}
       <ImportPanel onImported={() => loadAccounts()} />
 
       {accounts === null ? (

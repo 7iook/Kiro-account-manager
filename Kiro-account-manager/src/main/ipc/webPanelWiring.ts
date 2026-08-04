@@ -327,6 +327,12 @@ export function buildPanelRouteDeps(impl: {
     subscriptionType?: string
   ) => Promise<unknown>
   setAccountOverage: (identity: PanelAccountIdentity, enabled: boolean) => Promise<unknown>
+  // 反代编排（W8）—— 实现在 `index.ts` 侧用真实 proxyServer + store 组装
+  proxyGetStatus: () => Promise<unknown>
+  proxySyncPool: () => Promise<unknown>
+  proxyActivateAccount: (accountId: string) => Promise<unknown>
+  proxyStart: () => Promise<unknown>
+  proxyStop: () => Promise<unknown>
 }): PanelRouteDeps {
   const asService = <A extends unknown[]>(
     fn: (...args: A) => Promise<unknown>
@@ -345,6 +351,11 @@ export function buildPanelRouteDeps(impl: {
     getAccountModels: asService(impl.getAccountModels),
     getAccountSubscriptions: asService(impl.getAccountSubscriptions),
     getAccountSubscriptionUrl: asService(impl.getAccountSubscriptionUrl),
-    setAccountOverage: asService(impl.setAccountOverage)
+    setAccountOverage: asService(impl.setAccountOverage),
+    proxyGetStatus: asService(impl.proxyGetStatus),
+    proxySyncPool: asService(impl.proxySyncPool),
+    proxyActivateAccount: asService(impl.proxyActivateAccount),
+    proxyStart: asService(impl.proxyStart),
+    proxyStop: asService(impl.proxyStop)
   }
 }

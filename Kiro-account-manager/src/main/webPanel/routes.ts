@@ -83,6 +83,31 @@ export interface PanelRouteDeps {
   ) => Promise<ServiceLike>
   /** `accountService/subscription.ts:setAccountOverage` */
   setAccountOverage: (identity: PanelAccountIdentity, enabled: boolean) => Promise<ServiceLike>
+
+  // ===== 反代编排（W8）=====
+  //
+  // 这五个的实现全部落在主进程 `proxy/activation.ts` + 既有 `proxy-*` IPC 背后的
+  // 同一批函数上。**路由层不复制 ProxyPanel 的状态机** —— 顺序与判据都在编排层，
+  // 这里只做「解析入参 → 调编排 → 归一响应」。
+  //
+  // 为什么没有 `proxyUpdateConfig` 这样的通用配置端点：`proxy-update-config` 有
+  // 大量副作用分支（日志开关 / payload 上限 / agent 模式 / steering 重载），从手机
+  // 误触的代价远大于收益。面板只暴露日常操作，端口 / API Key / 模型映射留在桌面端。
+
+  /** 反代真实状态（running 读 server 句柄，不是"我发过启动请求"） */
+  proxyGetStatus: () => Promise<ServiceLike>
+  /** 从盘上账号表同步整池（启动前必须先做，否则空池启动） */
+  proxySyncPool: () => Promise<ServiceLike>
+  /**
+   * 让反代使用指定账号 —— 内部固定三步顺序（入池 → 单账号模式写
+   * selectedAccountIds → 指针+粘性失效）。只调其中一步会产生
+   * 「接口成功但反代仍打旧号」的失效，故必须整体复用编排。
+   */
+  proxyActivateAccount: (accountId: string) => Promise<ServiceLike>
+  /** 启动反代（实现内部先同步池，池空则拒绝启动） */
+  proxyStart: () => Promise<ServiceLike>
+  /** 停止反代 */
+  proxyStop: () => Promise<ServiceLike>
 }
 
 /** 已解析的请求上下文（路径已去掉 `/panel` 前缀） */
@@ -265,6 +290,114 @@ async function handleImport(
 }
 
 /**
+ * 反代编排层返回的 error 串 → 稳定错误码 + HTTP 状态。
+ *
+ * 编排层（`proxy/activation.ts`）与既有 `proxy-*` IPC 用的都是**已归一的短串**
+ * （`not_running` / `no_credentials` / `EMPTY_POOL` …），不是上游原始报文，
+ * 所以这里是一张确定的对照表而非模糊匹配。表外一律 500 `INTERNAL_ERROR`。
+ */
+function mapProxyFailure(result: ServiceLike | undefined): {
+  status: number
+  code: PanelErrorCode
+} {
+  const raw = errorMessage(result)
+  switch (raw) {
+    case 'not_running':
+    case 'PROXY_NOT_RUNNING':
+      // 409：反代没跑不是请求本身有错，是当前状态不允许这个操作
+      return { status: 409, code: 'PROXY_NOT_RUNNING' }
+    case 'no_credentials':
+    case 'ACCOUNT_NOT_IN_POOL':
+      return { status: 404, code: 'ACCOUNT_NOT_IN_POOL' }
+    case 'ACCOUNT_NOT_AVAILABLE':
+      return { status: 409, code: 'ACCOUNT_NOT_AVAILABLE' }
+    case 'EMPTY_POOL':
+      // 空池启动是负条件之一 —— 必须让用户看到"没有可用账号"，而不是启动成功
+      return { status: 409, code: 'EMPTY_POOL' }
+    default:
+      return { status: 500, code: 'INTERNAL_ERROR' }
+  }
+}
+
+/** 反代端点统一响应：失败走 `mapProxyFailure`，成功原样出（经 sendJson 强制脱敏） */
+function respondProxy(res: http.ServerResponse, result: ServiceLike | undefined): void {
+  if (result?.success === false) {
+    const { status, code } = mapProxyFailure(result)
+    sendError(res, status, code)
+    return
+  }
+  sendJson(res, 200, result ?? { success: true })
+}
+
+/**
+ * 反代命名空间路由 —— `/api/proxy/*`
+ *
+ * ## 为什么启动端点不接受任何配置参数
+ *
+ * 端口 / API Key / 模型映射 / 日志开关都留在桌面端。它们是一次性配置而非日常操作，
+ * 且 `proxy-update-config` 有大量副作用分支（steering 重载 / agent 模式 / payload
+ * 上限），从手机误触的代价远大于收益。面板只做用户日常的第三、四步：选号 + 启停。
+ *
+ * ## 顺序不在这一层
+ *
+ * 「先同步池、再启动」与选号的三步顺序都在 `proxy/activation.ts` 与
+ * `proxyStart` 的实现内部。路由层若自己编排这个顺序，就会成为第二个顺序真源
+ * —— 两处早晚分叉，而分叉的表现是「面板绿灯但反代行为错」。
+ *
+ * @returns true = 已处理；false = 不属于本命名空间
+ */
+async function routeProxyApi(
+  ctx: PanelRequestContext,
+  res: http.ServerResponse,
+  deps: PanelRouteDeps
+): Promise<boolean> {
+  const { method, path, body } = ctx
+
+  // 真实状态（读）：running / 端口 / 池大小 / 当前账号 / 在飞请求数
+  if (path === '/api/proxy/status' && method === 'GET') {
+    respondProxy(res, await deps.proxyGetStatus())
+    return true
+  }
+
+  if (method !== 'POST') return false
+
+  switch (path) {
+    // 启动。单飞去重：手机端连点不会真启两次（实现侧幂等，这里再收一道）
+    case '/api/proxy/start':
+      respondProxy(res, await singleFlight('proxy-start', () => deps.proxyStart()))
+      return true
+
+    case '/api/proxy/stop':
+      respondProxy(res, await singleFlight('proxy-stop', () => deps.proxyStop()))
+      return true
+
+    // 只同步池，不启动（用户改了账号后想刷新池）
+    case '/api/proxy/sync-pool':
+      respondProxy(res, await singleFlight('proxy-sync-pool', () => deps.proxySyncPool()))
+      return true
+
+    // 选号。走编排的三步，不在这里拆开调
+    case '/api/proxy/active-account': {
+      const accountId = typeof body?.accountId === 'string' ? body.accountId : ''
+      if (!accountId) {
+        // 刻意不把缺失当成「清空指定」—— 单账号模式下清空会退化成"用第一个可用号"，
+        // 那与用户点了某个账号的意图相反，而且从手机上无法区分是误触还是有意。
+        sendError(res, 400, 'INVALID_CREDENTIAL', '缺少 accountId')
+        return true
+      }
+      respondProxy(
+        res,
+        await singleFlight(`proxy-activate:${accountId}`, () => deps.proxyActivateAccount(accountId))
+      )
+      return true
+    }
+
+    default:
+      return false
+  }
+}
+
+/**
  * 路由分派。
  *
  * @returns true = 本函数已处理（响应已写出）；false = 路径不属于 API 命名空间，交给调用方兜底
@@ -293,6 +426,13 @@ export async function routePanelApi(
   if (path === '/api/local/logout' && method === 'POST') {
     respondService(res, await singleFlight('local-logout', () => deps.logoutFromIde()))
     return true
+  }
+
+  // 反代编排（读+写）。放在账号路径解析**之前** —— `/api/proxy/*` 与
+  // `/api/accounts/:id/...` 是两个不相交命名空间，先分流可读性更好，
+  // 也避免将来有人给 accounts 加通配路径时误吞 proxy 路径。
+  if (path === '/api/proxy' || path.startsWith('/api/proxy/')) {
+    return routeProxyApi(ctx, res, deps)
   }
 
   const parsed = parseAccountPath(path)
