@@ -91,6 +91,17 @@ export class PanelAuth {
   }
 
   /**
+   * 暴露登录限流表供服务包接周期清扫（`sweep()`）。
+   *
+   * 与 `sessionStore` 同一理由：定时器的生命周期属于服务器（start/stop），
+   * 不属于鉴权对象；但表本身归鉴权持有。服务包需要能拿到它才能在 stop 时收干净，
+   * 否则 timer 泄漏（应用退出时挂住 Node）。
+   */
+  get loginThrottle(): LoginThrottle {
+    return this.throttle
+  }
+
+  /**
    * 确保存在 adminKey：已有则原样返回，从未生成过则生成并落盘。
    *
    * **不设默认密码** —— 同类项目 `kiro-reverse-api` 出厂 `changeme` 是反面教材。

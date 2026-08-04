@@ -32,7 +32,17 @@ const SENSITIVE_KEYS = [
 const SAFE_KEYS = new Set([
   'inputtokens', 'outputtokens', 'cachetokens',
   'cachereadtokens', 'cachewritetokens', 'reasoningtokens',
-  'totaltokens', 'maxtokens', 'tokensused', 'tokencount'
+  'totaltokens', 'maxtokens', 'tokensused', 'tokencount',
+  // ===== 存在性布尔（webPanel/dto.ts 的「送结论不送原料」约定）=====
+  // `hasRefreshToken` 归一化后是 `hasrefreshtoken`，包含子串 `refreshtoken`
+  // → 会被 isSensitiveKey 命中，把 `true` 打成 `'***'`（实测确认）。
+  // 它是**布尔判定结果**，不含任何凭据原料：桌面端用 `!credentials.refreshToken`
+  // 判断能否刷新，面板不能拿到 token 本身，所以送出判定结论替代原料
+  // （recon-http-layer.md §3.3）。打码它会让面板 UI 的「能否刷新」判断永久为真值字符串
+  // （'***' 是 truthy）—— 后果不是泄漏而是**功能损坏**。
+  // ⚠️ 将来在 dto.ts 新增 `hasAccessToken` / `hasClientSecret` 这类存在性布尔时，
+  //    必须同步加到这里；`test/main/webPanel/dtoRedactComposition.test.ts` 会自动抓漏。
+  'hasrefreshtoken'
 ])
 
 /** 仅保留头尾少量字符，中间打码；过短直接全打码 */
