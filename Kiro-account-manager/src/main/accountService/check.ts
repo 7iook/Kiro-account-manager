@@ -20,6 +20,11 @@ import {
   parseSubscription,
   type RawUsageResponse
 } from './parseUsage'
+import {
+  persistCheckResult,
+  persistBatchCheckResults,
+  type BatchCheckItem
+} from './persistCheckResult'
 import type {
   AccountLike,
   AccountRuntimeDeps,
@@ -168,10 +173,51 @@ function resolveIdp(account: AccountLike): string {
 /**
  * 检查单个账号的用量 / 订阅 / 封禁状态(用户日常的"刷新额度")。
  *
- * 编排:api_key 走单请求;其余并行 GetUserInfo + GetUsageLimits,
- * 401/403 且具备刷新凭证 → refresh 后重试一次。
+ * 成功后**落盘**（`./persistCheckResult`）—— 这是 IPC 与 web 面板共用的持久化点。
+ * 原先落盘只长在 renderer store 里（`store/accounts.ts:2013/2079`），面板走 HTTP 调同一
+ * 函数却没有那个 store ⇒ 手机端刷出的新数字重载即丢、桌面端也不知情。
+ *
+ * 取数编排在 `performAccountStatusCheck`，落盘在这里收口 —— 那边有三个成功返回点
+ * （api_key / 首次成功 / 刷新后重试成功），三处各写一次落盘就是 Shotgun Surgery。
  */
 export async function checkAccountStatus(
+  deps: AccountRuntimeDeps,
+  account: AccountLike
+): Promise<CheckAccountStatusResult> {
+  const result = await performAccountStatusCheck(deps, account)
+  if (!result.success) return result
+
+  // 落盘失败 ⇒ 整个「刷新额度」失败。
+  //
+  // 为什么不吞掉后照样返回成功：本轮要交付的成功状态是**用户视角**的
+  // 「刷新后重载页面数字仍是新的」。落不了盘就交付不了这件事,返回 success 只会让
+  // 用户看到一个重载即消失的数字 —— 正是本轮在修的那个 bug,只是变得更隐蔽。
+  // 现实成因就两种:收口的 store 未注入（装配次序 bug）/ 写盘异常（磁盘满）,两者都该响。
+  try {
+    const outcome = await persistCheckResult(account.id, result.data)
+    if (!outcome.persisted && outcome.reason === 'account-not-found') {
+      // 另一端刚把这个账号删了。不是错误 —— 数据本身有效,只是没有归属可写。
+      // 绝不重建（那是 C1/C3「已删账号复活」）。
+      console.log(
+        `[IPC] check-account-status: account ${account.id} no longer on disk, skipped persist`
+      )
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    console.error('[IPC] check-account-status: failed to persist result:', e)
+    return { success: false, error: { message: `额度已取到但保存失败: ${message}` } }
+  }
+
+  return result
+}
+
+/**
+ * 取数编排:api_key 走单请求;其余并行 GetUserInfo + GetUsageLimits,
+ * 401/403 且具备刷新凭证 → refresh 后重试一次。
+ *
+ * 不落盘 —— 落盘由上面的 `checkAccountStatus` 统一收口。
+ */
+async function performAccountStatusCheck(
   deps: AccountRuntimeDeps,
   account: AccountLike
 ): Promise<CheckAccountStatusResult> {
@@ -361,6 +407,9 @@ export interface BatchCheckAccount {
  *
  * 逐条结果经 `deps.emit('background-check-result', …)` 推送,每批结束推
  * `background-check-progress` —— channel 名 / payload 形状 / 发射时机与原 handler 一致。
+ *
+ * **每切片落盘一次**（`persistBatchCheckResults`）：事件照原样先发（UI 逐条更新的响应性不受影响），
+ * 落盘在切片边界做。为什么是切片而不是逐账号 / 最后一次性，见 persistCheckResult.ts 的注释。
  */
 export async function backgroundBatchCheck(
   deps: AccountRuntimeDeps,
@@ -378,6 +427,11 @@ export async function backgroundBatchCheck(
   // 串行处理每批
   for (let i = 0; i < accounts.length; i += concurrency) {
     const batch = accounts.slice(i, i + concurrency)
+    /**
+     * 本切片待落盘的结果。事件仍逐条即时发（UI 响应性不变），落盘攒到切片边界。
+     * 每个 emit 点旁边都要 push —— 两者是同一个事实的两个出口，漏一个就是「UI 显示了但盘上没有」。
+     */
+    const sliceResults: BatchCheckItem[] = []
 
     await Promise.allSettled(
       batch.map(async (account) => {
@@ -392,6 +446,7 @@ export async function backgroundBatchCheck(
               success: false,
               error: '缺少 accessToken'
             })
+            sliceResults.push({ id: account.id, success: false, error: '缺少 accessToken' })
             return
           }
 
@@ -552,28 +607,46 @@ export async function backgroundBatchCheck(
           completed++
 
           // 通知渲染进程更新账号
+          const resultData = {
+            usage: usageData ? { ...usageData, resourceDetail } : null,
+            subscription: subscriptionData,
+            userInfo: userInfoData,
+            status,
+            errorMessage
+          }
           deps.emit('background-check-result', {
             id: account.id,
             success: true,
-            data: {
-              usage: usageData ? { ...usageData, resourceDetail } : null,
-              subscription: subscriptionData,
-              userInfo: userInfoData,
-              status,
-              errorMessage
-            }
+            data: resultData
           })
+          sliceResults.push({ id: account.id, success: true, data: resultData })
         } catch (e) {
           failed++
           completed++
+          const message = e instanceof Error ? e.message : 'Unknown error'
           deps.emit('background-check-result', {
             id: account.id,
             success: false,
-            error: e instanceof Error ? e.message : 'Unknown error'
+            error: message
           })
+          sliceResults.push({ id: account.id, success: false, error: message })
         }
       })
     )
+
+    // 本切片落盘（一次 revision 递增 + 一条广播）。
+    // 失败**不中断整个批量** —— 为一片写盘失败放弃后面所有账号是更差的选择；
+    // 结果已通过事件到达 UI，下次刷新会重新取到。绝不静默：日志是唯一可观测出口。
+    if (sliceResults.length > 0) {
+      try {
+        const applied = await persistBatchCheckResults(sliceResults)
+        console.log(
+          `[BackgroundCheck] Persisted ${applied}/${sliceResults.length} results of this slice`
+        )
+      } catch (e) {
+        console.error('[BackgroundCheck] Failed to persist slice results:', e)
+      }
+    }
 
     // 通知进度
     deps.emit('background-check-progress', {
