@@ -391,6 +391,19 @@ export interface KiroUsage {
     disposition: 'complete' | 'tool_use' | 'length' | 'filtered' | 'incomplete'
     /** 该 disposition 是否应让客户端明确失败(filtered/incomplete = true) */
     shouldFail: boolean
+    /**
+     * 本轮**一个字节的语义正文都没吐、也没有任何工具调用**。
+     *
+     * 这是「失败能否被透明重试」的唯一判据:零输出意味着客户端还没收到任何内容
+     * (流式路径的 `message_start` 也是惰性发送、要等首个语义正文才发 —— 见
+     * `proxyServer` ADR-0001 边界 1),所以重发不会造成内容重复或协议错乱;
+     * 反之只要吐过一个字,重试就会让客户端看到重复输出。
+     *
+     * 由 `parseEventStream` 按实际累计的 outChars / 工具数填写,不由
+     * `classifyKiroStopReason` 推断 —— 后者只做「stopReason → 处置」的映射,
+     * 不该知道流里到底吐了多少东西(SSOT 分层)。
+     */
+    emptyOutput?: boolean
   }
   /** Context usage breakdown（来自后端 ContextUsageEvent） */
   contextUsage?: {

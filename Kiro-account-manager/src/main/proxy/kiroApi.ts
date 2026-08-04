@@ -1943,6 +1943,14 @@ export async function callKiroApiStream(
   const ALL_ENDPOINT_RETRY_BACKOFF_MS = [800, 2000]
   let allEndpointRetryAttempt = 0
 
+  // ===== CONTENT_FILTERED 且零输出 → 透明重试(具体判据在 parseEventStream 调用处)=====
+  // 上游内容过滤器有时在**一个字都没吐**的情况下就掎断。实测(RCA 2026-08-05):
+  // UTC 19:13-19:17 四分钟内 CONTENT_FILTERED 爆发 16 次,**16/16 全部 outChars=0**,
+  // 而同期 421 次 TOOL_USE 正常 —— 形态是上游过滤器的瞬时/概率性行为,不是「这个
+  // prompt 内容违规」(真违规重试也会失败,代价只多一次调用)。
+  const CONTENT_FILTER_RETRY_BACKOFF_MS = [400, 1200]
+  let contentFilterRetryAttempt = 0
+
   for (let endpointIdx = 0; endpointIdx < endpoints.length; endpointIdx++) {
     const endpoint = endpoints[endpointIdx]
     // [DIAG] 记录本端点实际出站的 modelId,供 catch 分支写入 UI 日志。
@@ -2080,7 +2088,40 @@ export async function callKiroApiStream(
       // 解析 Event Stream
       // 传入 modelId + payloadStr 用于精确 token 计算（contextUsage 反推 + tiktoken）
       const inputChars = payloadStr.length
-      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr)
+      // CONTENT_FILTERED 且零输出 → 不上报给客户端,原地重试。
+      // 零输出使重试**完全安全**:客户端还没收到任何内容,且流式路径的 message_start
+      // 是惰性发送(要等首个语义正文,见 proxyServer ADR-0001 边界 1),重发不会造成
+      // 内容重复或 SSE 协议错乱。吐过正文则**绝不重试** —— 那会让客户端看到重复内容。
+      let retryFilteredEmpty = false
+      const completeGuard = (u: KiroUsage): void => {
+        if (
+          u.terminal?.disposition === 'filtered' &&
+          u.terminal.emptyOutput === true &&
+          contentFilterRetryAttempt < CONTENT_FILTER_RETRY_BACKOFF_MS.length
+        ) {
+          retryFilteredEmpty = true
+          return
+        }
+        onComplete(u)
+      }
+      await parseEventStream(response.body!, onChunk, completeGuard, onError, inputChars, signal, requestedModelId, payloadStr)
+      if (retryFilteredEmpty) {
+        const waitMs = CONTENT_FILTER_RETRY_BACKOFF_MS[contentFilterRetryAttempt]
+        contentFilterRetryAttempt++
+        const cfMsg = `CONTENT_FILTERED with zero output — retrying ${endpoint.name} ${contentFilterRetryAttempt}/${CONTENT_FILTER_RETRY_BACKOFF_MS.length} after ${waitMs}ms (safe: nothing sent to client yet)`
+        console.warn(`[KiroAPI] ${cfMsg}`)
+        proxyLogger.warn('KiroAPI', cfMsg, {
+          endpoint: endpoint.name,
+          attempt: contentFilterRetryAttempt,
+          maxAttempts: CONTENT_FILTER_RETRY_BACKOFF_MS.length,
+          backoffMs: waitMs,
+          account: account.email || account.id?.slice(0, 8) || '?'
+        })
+        await new Promise(r => setTimeout(r, waitMs))
+        if (signal?.aborted) { onError(getAbortError(signal)); return }
+        endpointIdx--  // 重试同一端点(与上下文溢出恢复同手法),不消耗端点 fallback 机会
+        continue
+      }
       return
     } catch (error) {
       if (signal?.aborted) {
@@ -3345,6 +3386,10 @@ async function parseEventStream(
     // (四条路径的协议不同:Claude SSE error / OpenAI finish_reason / Gemini finishReason / 非流式 JSON)。
     const hasAnyToolCall = processedIds.size > 0 || leakedTools.length > 0
     usage.terminal = classifyKiroStopReason(diagUpstreamStopReason, hasAnyToolCall)
+    // 本轮是否一个字的语义正文都没吐、也没有工具调用 —— 失败能否被透明重试的唯一判据。
+    // 放在这里而不是 classifyKiroStopReason 里:后者只做「stopReason → 处置」的映射,
+    // 不应知道流里到底吐了多少东西(SSOT 分层)。
+    usage.terminal.emptyOutput = totalOutputChars === 0 && !hasAnyToolCall
     if (usage.terminal.shouldFail) {
       proxyLogger.warn('Kiro', `Upstream terminated abnormally: stopReason=${usage.terminal.upstreamStopReason ?? 'ABSENT'} disposition=${usage.terminal.disposition} outChars=${totalOutputChars} tools=${processedIds.size}`)
     }

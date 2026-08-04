@@ -42,6 +42,22 @@ import { HoldGate, realClock, type HoldGateRuntimeConfig, type HeldRequestHooks 
 import { normalizeHoldConfig } from './holdConfig'
 
 
+/**
+ * 该错误是否属于「上游终止类失败」—— 上游内容过滤器截断 / 上游异常终止。
+ *
+ * 这类失败**既不是账号的错，也不是请求本身的错**，处置上三点不同于普通错误：
+ *   ① 状态码 502 而非 500（500 会让人以为反代自己炸了）
+ *   ② 不记进账号错误计数（换号一样被同一个过滤器拦）
+ *   ③ 日志需带 model / responseTime，否则 UI 上只剩一行 `-`
+ *
+ * 判据收口成一个导出函数是为了可测 + 单一真源；文案真源是 `kiroApi.ts` 非流式
+ * onComplete 拦截处抛出的那两条消息（`Upstream content filter truncated…` /
+ * `Upstream terminated abnormally…`），改文案时必须同步这里。
+ */
+export function isUpstreamTerminalFailure(message: string): boolean {
+  return /Upstream (content filter truncated|terminated abnormally)/i.test(message || '')
+}
+
 export interface ProxyServerEvents {
   onRequest?: (info: { path: string; method: string; accountId?: string }) => void
   onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }) => void
@@ -4506,10 +4522,27 @@ export class ProxyServer {
     const errorType = classifyError(parsedCode)
     const isAuthError = error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth')
 
-    this.accountPool.recordError(account.id, errorType, parsedCode)
+    // 上游终止类失败（内容过滤 / 异常截断）—— 既不是账号的错，也不是请求本身的错，
+    // 是上游侧的行为。三处后果都要按这个语义处理（RCA 2026-08-05）：
+    //   ① 状态码给 502（Bad Gateway）而非 500 —— kiroApi 的抛错文案里没有 HTTP 状态码，
+    //      extractHttpStatusCode 提取不到就落到默认 500，而 500 会让人以为反代自己炸了。
+    //      实测用户看到请求日志里一片 500 时第一反应就是「反代有 bug」，排查方向被带偏。
+    //   ② 不记进账号错误计数 —— 换个号一样会被同一个过滤器拦，给账号记错误只会让一个
+    //      完全正常的号因为上游过滤器发神经而被打入退避冷却。
+    //   ③ 日志带上 model / responseTime（见下）。
+    const isUpstreamTerminal = isUpstreamTerminalFailure(error.message)
 
-    let statusCode = parsedCode
+    if (!isUpstreamTerminal) {
+      this.accountPool.recordError(account.id, errorType, parsedCode)
+    }
+
+    let statusCode = isUpstreamTerminal ? 502 : parsedCode
     if (isAuthError) statusCode = 401
+
+    // 失败也要能在 UI 里看出「哪个模型、耗了多久」。此前这两处 onResponse 只传
+    // { path, status, error }，而请求日志读的正是它 —— 于是所有走本函数的失败在
+    // UI 上模型列与耗时列都是 `-`，用户无法判断是哪个模型出的问题（RCA 2026-08-05）。
+    const responseTime = startTime ? Date.now() - startTime : 0
 
     if (res.headersSent) {
       if (!this.isResponseClosed(res)) {
@@ -4518,14 +4551,14 @@ export class ProxyServer {
         }
         res.end()
       }
-      this.events.onResponse?.({ path, status: statusCode, error: error.message })
-      this.recordRequest({ path, model, accountId: account.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: error.message })
+      this.events.onResponse?.({ path, model, status: statusCode, responseTime, error: error.message })
+      this.recordRequest({ path, model, accountId: account.id, responseTime, success: false, error: error.message })
       return
     }
 
     this.sendError(res, statusCode, error.message, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
-    this.events.onResponse?.({ path, status: statusCode, error: error.message })
-    this.recordRequest({ path, model, accountId: account.id, responseTime: startTime ? Date.now() - startTime : 0, success: false, error: error.message })
+    this.events.onResponse?.({ path, model, status: statusCode, responseTime, error: error.message })
+    this.recordRequest({ path, model, accountId: account.id, responseTime, success: false, error: error.message })
   }
 
   // 读取请求体
