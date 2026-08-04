@@ -39,6 +39,17 @@ export type PanelErrorCode =
   | 'STALE_REVISION'
   | 'RATE_LIMITED'
   | 'INTERNAL_ERROR'
+  // ===== 反代编排（W8）=====
+  /** 反代未运行 —— 选号 / 读当前账号在此前提下无意义 */
+  | 'PROXY_NOT_RUNNING'
+  /** 指定账号不在池里。单账号模式是严格模式，刻意不 fallback 到随机账号 */
+  | 'ACCOUNT_NOT_IN_POOL'
+  /** 账号被风控封禁或不可用 */
+  | 'ACCOUNT_NOT_AVAILABLE'
+  /** 池是空的 —— 拒绝启动。空池启动会「起来了、状态正常、每个请求都失败」 */
+  | 'EMPTY_POOL'
+  /** 启停失败（端口占用等） */
+  | 'PROXY_START_FAILED'
 
 /**
  * 面板唯一的 JSON 出口。**所有** `/panel/api/*` 响应必须经此函数。

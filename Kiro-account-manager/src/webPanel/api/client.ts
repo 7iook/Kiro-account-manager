@@ -74,7 +74,15 @@ const ERROR_TEXT: Record<PanelErrorCode, string> = {
   TOKEN_REFRESH_FAILED: '刷新 Token 失败，请稍后重试',
   STALE_REVISION: '数据已被其他端修改，请刷新后重试',
   RATE_LIMITED: '操作过于频繁，请稍候再试',
-  INTERNAL_ERROR: '操作失败，请稍后重试'
+  INTERNAL_ERROR: '操作失败，请稍后重试',
+  // 反代编排（W8）。这张表是 `isPanelErrorCode` 的判据（`in ERROR_TEXT`），
+  // 漏补会让新错误码静默退化成 INTERNAL_ERROR —— 用户看到「操作失败」而不是
+  // 「没有可用账号」，真因被抹掉。
+  PROXY_NOT_RUNNING: '反代未在运行，请先启动',
+  ACCOUNT_NOT_IN_POOL: '该账号不在反代池里（可能凭据缺失或状态非正常）',
+  ACCOUNT_NOT_AVAILABLE: '该账号当前不可用（被风控封禁或额度耗尽）',
+  EMPTY_POOL: '没有可用账号，反代未启动',
+  PROXY_START_FAILED: '反代启动失败（端口可能被占用）'
 }
 
 function isPanelErrorCode(v: unknown): v is PanelErrorCode {

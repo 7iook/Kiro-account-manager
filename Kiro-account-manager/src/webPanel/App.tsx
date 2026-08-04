@@ -39,6 +39,7 @@ import {
 import { PanelApiError } from './api/client'
 import { LoginScreen } from './ui/LoginScreen'
 import { AccountCard } from './ui/AccountCard'
+import { ProxyPanel } from './ui/ProxyPanel'
 
 /** 会话三态。`unknown` 是启动时的真实状态，不能默认成 `logged-out`（会闪一下登录页） */
 type SessionState = 'unknown' | 'logged-in' | 'logged-out'
@@ -247,6 +248,16 @@ export function App(): React.JSX.Element {
           {notice}
         </div>
       )}
+
+      {/* 反代服务 —— 用户日常流程的第三、四步（选号 + 启停）。
+          放在账号列表**之前**：日常打开面板多半是为了启停反代，
+          而账号列表可能很长，放后面在手机上要一直滚。 */}
+      <ProxyPanel
+        accounts={accounts}
+        onSessionLost={dropSession}
+        onNotice={setNotice}
+        onError={setError}
+      />
 
       {accounts === null ? (
         <p className="py-10 text-center text-sm text-slate-500">加载中…</p>

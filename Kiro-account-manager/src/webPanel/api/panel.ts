@@ -164,3 +164,75 @@ export interface SubscriptionsResponse {
 export async function setOverage(id: string, enabled: boolean): Promise<void> {
   await panelRequest('POST', `/accounts/${encodeURIComponent(id)}/overage`, { enabled })
 }
+
+// ============ 反代（用户日常的第三、四步）============
+
+/**
+ * 反代状态。
+ *
+ * `running` 是**真实读数** —— 服务端读 `ProxyServer.isRunning()`（即 server 句柄
+ * 是否存在），不是「客户端发过启动请求所以应该在跑」。UI 必须以它为准，
+ * 绝不能在发出启动请求后乐观地把开关拨到「运行中」。
+ */
+export interface ProxyStatus {
+  success?: boolean
+  running: boolean
+  port?: number
+  host?: string
+  /** 多账号轮询是否开启。面板只做单账号指定，此值为 true 时选号按钮应说明它只移动轮询起点 */
+  enableMultiAccount: boolean
+  /** 单账号模式下用户指定的账号 id；多账号模式为 undefined */
+  selectedAccountId?: string
+  selectedAccountEmail?: string
+  poolSize: number
+  availableCount: number
+  /** 已服务请求数 —— 停止前展示给用户，让他自己判断现在停是否合适 */
+  totalRequests: number
+  successRequests: number
+  failedRequests: number
+}
+
+export async function fetchProxyStatus(): Promise<ProxyStatus> {
+  return panelRequest<ProxyStatus>('GET', '/proxy/status')
+}
+
+/**
+ * 启动反代。
+ *
+ * **不接受任何参数** —— 端口 / API Key / 模型映射留在桌面端（一次性配置，
+ * 且 `proxy-update-config` 的副作用分支多，手机误触代价大）。
+ * 服务端内部会先同步账号池再启动；池为空时返回 `EMPTY_POOL` 而**不是**启动成功
+ * （空池启动会「起来了、状态正常、每个请求都失败」）。
+ */
+export async function startProxy(): Promise<{ running?: boolean; port?: number; poolSize?: number }> {
+  return panelRequest('POST', '/proxy/start')
+}
+
+/**
+ * 停止反代。
+ *
+ * ⚠️ 会掐断在飞请求 —— 与桌面端行为一致（桌面端 `ProxyPanel.tsx:352` 也是直接停）。
+ * 面板刻意**不**引入独有的优雅停止：那会让两端行为分叉。取而代之，UI 在停止前
+ * 展示 `totalRequests`，让用户自己判断。
+ */
+export async function stopProxy(): Promise<{ running?: boolean }> {
+  return panelRequest('POST', '/proxy/stop')
+}
+
+/** 重新同步账号池（改了账号后刷新池，不启停） */
+export async function syncProxyPool(): Promise<{ poolSize?: number }> {
+  return panelRequest('POST', '/proxy/sync-pool')
+}
+
+/**
+ * 指定反代使用某个账号。
+ *
+ * 服务端内部是**三步**（入池刷凭据 → 单账号模式写 `selectedAccountIds` → 移指针并
+ * 作废会话粘性）。只做其中任一步会产生「接口返回成功、池里也有这个号、但反代
+ * 仍打旧号」的失效，所以客户端只调这一个端点，绝不自己拆开编排。
+ */
+export async function setProxyActiveAccount(
+  accountId: string
+): Promise<{ mode?: 'single' | 'multi'; accountId?: string; email?: string }> {
+  return panelRequest('POST', '/proxy/active-account', { accountId })
+}
