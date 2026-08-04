@@ -22,11 +22,23 @@ import type { Socket } from 'node:net'
 import { isBindingExternal, isIPAllowed, type IPAccessPolicy } from '../utils/netGuard'
 import { PANEL_PATH_PREFIX } from './cookie'
 import { sendJson, sendError } from './respond'
+import { serveStaticAsset } from './staticAssets'
+import { resolveWebPanelAssets, type WebPanelAssets } from '../utils/webPanelAssetRoot'
 import { routePanelApi, type PanelRouteDeps, type PanelRequestContext } from './routes'
 import type { PanelAuth, GuardDenyReason } from './auth'
 
 /** 请求体大小上限 —— 面板的写操作 payload 都很小，防止内存被大 body 打爆 */
 const MAX_BODY_BYTES = 256 * 1024
+
+/**
+ * API 命名空间前缀（去掉 `/panel` 之后的部分）。
+ *
+ * 静态托管与 API 的分界线收在这一个常量上：`/panel/api/*` 走 JSON 闸门，
+ * 其余走静态资源。**不写字面量散落各处** —— 分界线一旦分叉，
+ * 未知 API 路径会被 SPA 回退成 HTML，前端拿到 `<!doctype` 再报 JSON 解析错，
+ * 排查方向被彻底带偏。
+ */
+const API_PREFIX = '/api'
 
 /** 会话清扫间隔（照 `proxyServer.ts:552` 的 5 分钟 + unref 先例） */
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000
@@ -255,6 +267,27 @@ export class WebPanelServer {
       const path = pathOnly.slice(PANEL_PATH_PREFIX.length) || '/'
       const method = (req.method ?? 'GET').toUpperCase()
 
+      // ===== 静态资源（在鉴权闸门**之前**）=====
+      // 顺序理由：登录页本身就是这个 shell。若放在闸门之后，就成了
+      // 「必须先登录才能拿到登录页」—— 死锁。鉴权决策的完整论证见
+      // `staticAssets.ts` 的 `serveStaticAsset` 注释。
+      //
+      // 分界线：只有 `/api/*` 之外的路径才交给静态层。这保证未知 API 路径
+      // 仍然落到下方的 JSON 404，**不会**被 SPA 回退伪装成 200 HTML。
+      if (path !== API_PREFIX && !path.startsWith(`${API_PREFIX}/`)) {
+        await serveStaticAsset(
+          {
+            method,
+            // 去掉前导斜杠：静态层契约要求相对路径（以 `/` 开头一律判逃逸）
+            relUrlPath: path.replace(/^\/+/, ''),
+            ifNoneMatch: headerValue(req.headers['if-none-match'])
+          },
+          res,
+          this.getAssets()
+        )
+        return
+      }
+
       // ===== 登录（闸门之前，因为此时还没有会话）=====
       if (path === '/api/login' && method === 'POST') {
         const body = await this.readJsonBody(req, res)
@@ -369,6 +402,18 @@ export class WebPanelServer {
     }
   }
 
+  /**
+   * 静态资源位置。**每次请求都问 `resolveWebPanelAssets()`**，不缓存整个结果 ——
+   * 这样开发时跑一次 `npm run build:webpanel` 后无需重启应用，面板立刻可用。
+   *
+   * 若改成启动时解析一次并缓存：产物在服务器启动后才构建出来的场景下，
+   * 面板会一直返回「资源未构建」直到重启 —— 一个纯属自找的运维坑。
+   * 代价是每请求一次 `existsSync`，对局域网面板的量级可忽略。
+   */
+  private getAssets(): WebPanelAssets {
+    return resolveWebPanelAssets()
+  }
+
   /** 审计日志：记录「谁、何时、对什么路径」被拒，**不记录凭证值**（决策卡 §3） */
   private logDeny(
     clientIP: string,
@@ -387,4 +432,9 @@ export class WebPanelServer {
 function normalizeClientIP(remote: string | undefined): string {
   if (!remote) return ''
   return remote.startsWith('::ffff:') ? remote.slice('::ffff:'.length) : remote
+}
+
+/** 取单值头（Node 对重复头会给数组；`if-none-match` 理论上可重复出现） */
+function headerValue(v: string | string[] | undefined): string | undefined {
+  return Array.isArray(v) ? v[0] : v
 }
