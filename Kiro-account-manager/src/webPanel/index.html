@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kiro 账号管理 · 局域网面板</title>
+    <!--
+      注意:此处不设 CSP meta。桌面端 renderer 的 CSP 写在 index.html 里是因为它由
+      file:// 加载;局域网面板由 main 侧 HTTP server 托管,CSP 必须由响应头下发
+      (由 W5 的静态托管层负责),写在 HTML 里会被响应头覆盖且无法约束非 HTML 资源。
+    -->
+  </head>
+  <body>
+    <div id="webpanel-root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

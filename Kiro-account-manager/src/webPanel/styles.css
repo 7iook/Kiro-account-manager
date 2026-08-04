@@ -1,0 +1,14 @@
+/*
+ * 局域网 Web 面板的 tailwind entry(与桌面端 renderer 的样式入口相互独立)。
+ *
+ * `@source` 显式声明扫描范围:tailwind v4 默认从 CSS 文件所在位置向上探测项目根,
+ * 会把整个 src/ 扫进来。显式限定后,面板样式只由面板自身源码 + 复用的基础组件决定,
+ * 不被桌面端页面级组件的 class 污染(也避免桌面端改样式时面板产物无谓变动)。
+ *
+ * W6 若从 src/renderer/src/components/ui/ 拷组件进来,第二条 @source 已覆盖;
+ * 若改为直接 import 桌面端组件,请保留第二条。
+ */
+@import 'tailwindcss';
+
+@source '.';
+@source '../renderer/src/components/ui';
