@@ -1,9 +1,9 @@
-// Kiro Proxy HTTP/HTTPS 服务器
+﻿// Kiro Proxy HTTP/HTTPS 服务器
 import http from 'http'
 import https from 'https'
 import fs from 'fs'
-import crypto from 'crypto'
 import { v4 as uuidv4 } from 'uuid'
+import { safeStringEq, isBindingExternal, isIPAllowed } from '../utils/netGuard'
 import type { Socket } from 'net'
 import type {
   OpenAIChatRequest,
@@ -450,13 +450,12 @@ export class ProxyServer {
   /**
    * 检测当前绑定地址是否会暴露到本机以外
    * 0.0.0.0 / :: / 网卡地址 → true；127.0.0.1 / ::1 / localhost → false
+   *
+   * 判定逻辑已抽至 `utils/netGuard.ts`（Web 面板共用同一护栏）。
+   * 此处保留薄 wrapper 让类内调用点零改动。
    */
   private isBindingExternal(host?: string): boolean {
-    if (!host) return false
-    const h = host.toLowerCase().trim()
-    return h === '0.0.0.0' || h === '::' || h === '*' || (
-      h !== '127.0.0.1' && h !== '::1' && h !== 'localhost'
-    )
+    return isBindingExternal(host)
   }
 
   // 启动服务器
@@ -1826,22 +1825,12 @@ export class ProxyServer {
 
   /**
    * 常数时间字符串比较（防时序攻击）
-   * 长度不同时返回 false 但仍走一次 timingSafeEqual 防止旁路
+   *
+   * 实现已抽至 `utils/netGuard.ts`（Web 面板比对 adminKey 时共用同一实现）。
+   * 此处保留薄 wrapper 让 validateApiKey 的两个调用点零改动。
    */
   private safeStringEq(a: string, b: string): boolean {
-    // Buffer.from 处理 UTF-8 编码
-    const ab = Buffer.from(a, 'utf8')
-    const bb = Buffer.from(b, 'utf8')
-    if (ab.length !== bb.length) {
-      // 仍执行一次比较保证常数时间（用 a 自身比，结果不影响）
-      try { crypto.timingSafeEqual(ab, ab) } catch { /* ignore */ }
-      return false
-    }
-    try {
-      return crypto.timingSafeEqual(ab, bb)
-    } catch {
-      return false
-    }
+    return safeStringEq(a, b)
   }
 
   // 验证 API Key 并返回匹配的 Key（用于统计）
@@ -1900,103 +1889,17 @@ export class ProxyServer {
    * - allowedIPs 配置后：必须在列表内（白名单模式）
    * - 都未配置：允许
    * 支持单 IP 和 CIDR（IPv4 / IPv6 简化处理）
+   *
+   * 判定逻辑（含 CIDR 匹配）已抽至 `utils/netGuard.ts` 的 `isIPAllowed(ip, policy)`。
+   * 此处保留薄 wrapper：策略来源仍是本实例的 config，
+   * 让 handleRequest 的唯一调用点零改动，同时让面板可以传自己的准入名单。
    */
   private isClientIPAllowed(clientIP: string): { allowed: boolean; reason?: string } {
-    if (!clientIP) return { allowed: true }
-    // 规范化（::ffff:1.2.3.4 → 1.2.3.4）
-    const ip = clientIP.startsWith('::ffff:') ? clientIP.slice(7) : clientIP
-
-    const matchEntry = (entry: string): boolean => {
-      const e = entry.trim()
-      if (!e) return false
-      // CIDR
-      if (e.includes('/')) {
-        return this.ipInCidr(ip, e)
-      }
-      return e === ip
-    }
-
-    const denied = this.config.deniedIPs?.find(matchEntry)
-    if (denied) return { allowed: false, reason: `IP ${ip} matches denied entry ${denied}` }
-
-    const allowList = this.config.allowedIPs
-    if (allowList && allowList.length > 0) {
-      const allowed = allowList.some(matchEntry)
-      if (!allowed) return { allowed: false, reason: `IP ${ip} not in allowed list` }
-    }
-    return { allowed: true }
+    return isIPAllowed(clientIP, this.config)
   }
 
-  /**
-   * 简化 IPv4/IPv6 CIDR 匹配（不依赖外部库）
-   * IPv4 CIDR：1.2.3.0/24；IPv6 CIDR：仅前缀逐 bit 比较
-   */
-  private ipInCidr(ip: string, cidr: string): boolean {
-    const [range, bitsStr] = cidr.split('/')
-    const bits = parseInt(bitsStr, 10)
-    if (!Number.isFinite(bits)) return false
-
-    const isV4 = ip.includes('.') && range.includes('.')
-    if (isV4) {
-      const ipNum = this.ipv4ToInt(ip)
-      const rangeNum = this.ipv4ToInt(range)
-      if (ipNum < 0 || rangeNum < 0) return false
-      const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0
-      return (ipNum & mask) === (rangeNum & mask)
-    }
-    // IPv6 简化：转字节数组 + 前缀逐 bit 比较
-    const ipBytes = this.ipv6ToBytes(ip)
-    const rangeBytes = this.ipv6ToBytes(range)
-    if (!ipBytes || !rangeBytes) return false
-    let bitsLeft = bits
-    for (let i = 0; i < 16 && bitsLeft > 0; i++) {
-      if (bitsLeft >= 8) {
-        if (ipBytes[i] !== rangeBytes[i]) return false
-        bitsLeft -= 8
-      } else {
-        const mask = (0xff << (8 - bitsLeft)) & 0xff
-        if ((ipBytes[i] & mask) !== (rangeBytes[i] & mask)) return false
-        bitsLeft = 0
-      }
-    }
-    return true
-  }
-
-  private ipv4ToInt(ip: string): number {
-    const parts = ip.split('.').map(p => parseInt(p, 10))
-    if (parts.length !== 4 || parts.some(p => !Number.isFinite(p) || p < 0 || p > 255)) return -1
-    return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
-  }
-
-  private ipv6ToBytes(ip: string): Uint8Array | null {
-    try {
-      // 简化处理：支持 :: 缩写
-      const parts = ip.split('::')
-      let head: string[] = []
-      let tail: string[] = []
-      if (parts.length === 1) {
-        head = parts[0].split(':')
-      } else if (parts.length === 2) {
-        head = parts[0] ? parts[0].split(':') : []
-        tail = parts[1] ? parts[1].split(':') : []
-      } else {
-        return null
-      }
-      const missing = 8 - head.length - tail.length
-      if (missing < 0) return null
-      const segments = [...head, ...new Array(missing).fill('0'), ...tail]
-      const bytes = new Uint8Array(16)
-      for (let i = 0; i < 8; i++) {
-        const v = parseInt(segments[i] || '0', 16)
-        if (!Number.isFinite(v) || v < 0 || v > 0xffff) return null
-        bytes[i * 2] = (v >> 8) & 0xff
-        bytes[i * 2 + 1] = v & 0xff
-      }
-      return bytes
-    } catch {
-      return null
-    }
-  }
+  // CIDR 匹配（ipInCidr / ipv4ToInt / ipv6ToBytes）已随 isIPAllowed 一并抽至
+  // `utils/netGuard.ts`；类内已无调用点，故不保留 wrapper。
 
   /** 取客户端真实 IP（不信任 X-Forwarded-For，仅取 socket address） */
   private getClientIP(req: http.IncomingMessage): string {
