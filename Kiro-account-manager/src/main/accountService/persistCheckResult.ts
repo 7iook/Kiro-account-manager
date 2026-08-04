@@ -38,18 +38,16 @@
  */
 
 import { applyAccountDataMutation, type AccountsBlob } from './state'
+import { persistAccountPatch, asRecord, type PersistOutcome } from './persistAccountPatch'
 import type { CheckAccountStatusData } from './check'
 
-/** 落盘结果 —— 调用方（业务函数）据此决定日志级别，不用 try/catch 猜 */
-export type PersistCheckOutcome =
-  | { persisted: true; revision: number }
-  /**
-   * 没写盘，且**这是正确行为**：
-   *   - `no-account-id`：调用方没给 id（无法定位记录）
-   *   - `account-not-found`：盘上已无此账号（用户刚在另一端删了它）——
-   *     **绝不能顺手创建**，那正是 C1/C3 「已删账号复活」的病灶
-   */
-  | { persisted: false; reason: 'no-account-id' | 'account-not-found' }
+/**
+ * 落盘结果 —— 调用方（业务函数）据此决定日志级别，不用 try/catch 猜。
+ *
+ * 单账号路径的语义已收敛到 `./persistAccountPatch`（与「刷新 Token」共用同一条路径）；
+ * 这里保留别名以免改动现有调用方的类型引用。
+ */
+export type PersistCheckOutcome = PersistOutcome
 
 /**
  * 中止收口用的私有哨兵。
@@ -60,18 +58,16 @@ export type PersistCheckOutcome =
  * 收口在 `const next = await mutate(prev)` 处就中断，`storeRef.set` 与广播都不会执行，
  * revision 保持不变 —— 这是零副作用的中止方式，且不需要改动写入 SSOT 的契约。
  *
- * 哨兵**不跨层**：在本文件抛出、在本文件捕获，对外仍是 `PersistCheckOutcome` 返回值语义
+ * 哨兵**不跨层**：在本文件抛出、在本文件捕获，对外仍是返回值语义
  * （§4.4「预期失败用返回值而非异常」的边界内）。
+ *
+ * 单账号路径的同款哨兵已收敛进 `./persistAccountPatch`；这里保留的这一份专供**批量**
+ * 路径（它一次写 N 条，遍历逻辑与单条补丁不同源，不能共用那个收口）。
  */
 class SkipPersist extends Error {
   constructor(readonly reason: 'account-not-found') {
     super(`skip persist: ${reason}`)
   }
-}
-
-function asRecord(v: unknown): Record<string, unknown> | undefined {
-  if (v === null || typeof v !== 'object' || Array.isArray(v)) return undefined
-  return v as Record<string, unknown>
 }
 
 /**
@@ -178,51 +174,14 @@ export async function persistCheckResult(
   accountId: string | undefined,
   data: CheckAccountStatusData
 ): Promise<PersistCheckOutcome> {
-  if (!accountId) return { persisted: false, reason: 'no-account-id' }
-
   const now = Date.now()
-  try {
-    const result = await applyAccountDataMutation((prev) => {
-      // 在收口内部重新读盘：入参 account 快照可能已陈旧（见文件头「字段级补丁」）
-      const accountsRaw = prev.accounts
-
-      // 历史数据 / 导入路径可能是数组形状（dto.ts:196 同样两种都吃）。
-      // 只支持 Record 会让这批用户静默不落盘 —— 那正是本轮要治的病。
-      if (Array.isArray(accountsRaw)) {
-        const idx = accountsRaw.findIndex(
-          (e) => asRecord(e)?.id === accountId
-        )
-        if (idx < 0) throw new SkipPersist('account-not-found')
-        const nextArr = [...accountsRaw]
-        nextArr[idx] = patchAccountWithCheckResult(
-          asRecord(accountsRaw[idx]) as Record<string, unknown>,
-          data,
-          now
-        )
-        return { ...prev, accounts: nextArr } as AccountsBlob
-      }
-
-      const accounts = asRecord(accountsRaw)
-      const target = asRecord(accounts?.[accountId])
-      // 盘上已无此账号 = 另一端刚删了它。绝不重建（C1/C3「已删账号复活」）。
-      if (!accounts || !target) throw new SkipPersist('account-not-found')
-
-      return {
-        ...prev,
-        accounts: { ...accounts, [accountId]: patchAccountWithCheckResult(target, data, now) }
-      } as AccountsBlob
-    })
-
-    if (result.ok) return { persisted: true, revision: result.revision }
-    // 不传 expectedRevision ⇒ 收口不会返回 STALE_REVISION（state.ts:170 的仲裁分支
-    // 只在 expectedRevision !== undefined 时进入）。走到这里说明收口语义变了，必须让它响。
-    throw new Error(
-      `[accountService/persistCheckResult] unexpected arbitration result: ${result.code}`
-    )
-  } catch (e) {
-    if (e instanceof SkipPersist) return { persisted: false, reason: e.reason }
-    throw e
-  }
+  // 盘面遍历 / 账号不存在的中止 / 仲裁结果异常，全部收在 ./persistAccountPatch
+  // （与「刷新 Token」共用同一条持久化路径）。这里只提供「覆盖哪几个键」。
+  return persistAccountPatch(
+    accountId,
+    (current) => patchAccountWithCheckResult(current, data, now),
+    'persistCheckResult'
+  )
 }
 
 // ============ 批量检查（background-batch-check）的落盘 ============

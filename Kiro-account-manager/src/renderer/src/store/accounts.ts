@@ -1864,7 +1864,30 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           }
           return { accounts }
         })
-        get().saveToStorage()
+        // ⚠️ 这里**刻意不调 saveToStorage()** —— 落盘已由 main 侧完成。
+        //
+        // `accountService/refresh.ts:refreshAccountToken` 现在会经
+        // `persistRefreshResult` → `applyAccountDataMutation` 把新凭据落盘（IPC 与 web 面板
+        // 共用同一条路径）。上面那次 `set()` 保留，它是桌面端「刷完立刻显示新过期时间」
+        // 响应性的来源 —— UI 不必等盘。但**再落一次盘就是双写**：
+        //
+        //   store 的落盘是**整表覆盖 + 防抖**（saveToStorage → 500ms 窗口 →
+        //   flushSaveImmediately 带 expectedRevision 提交）。main 侧刚写完时 disk revision
+        //   已经 +1，而本窗口的 currentRevision 还是旧值 ⇒ 这次提交必然 STALE ⇒ 走三方合并
+        //   重放，白花一次 IPC + 整表序列化 + 合并，产出的内容与盘上已有的完全一致。
+        //
+        // 那为什么删掉它是安全的（凭据尤其不能出错）:
+        //   - `currentRevision` / `syncBaseSnapshot` 的收敛不依赖这次写：main 侧写入成功后
+        //     广播 `accounts-data-changed`，App.tsx:150 的 consumer 判定为外部写 →
+        //     `reloadFromStorageQuiet` 对齐盘面并更新 base 与 revision。广播万一丢失，
+        //     I3 的 focus / visibilitychange / 短轮询（≤6s）兜底。
+        //   - 期间若有**别的**未落盘编辑，它们的 flush 撞上更高的 disk revision 时走既有的
+        //     三方合并；而 credentials 有 `syncMerge.ts:184` 的**字段级例外**（I-a）：
+        //     「我没改过凭据而别人改了」⇒ 采纳 theirs ⇒ 新 refreshToken 不会被本地陈旧
+        //     快照按回旧值。那个例外存在的理由正是"凭据的权威源在 main 侧"。
+        //
+        // 不动本函数开头的 `updateAccountStatus(id,'refreshing')` 那次落盘：那是多调用方
+        // 共享的通用 setter，改它会溢出本轮范围；它写 status 而非 credentials。已登记为技术债。
         return true
       } else {
         updateAccountStatus(id, 'error', result.error?.message)

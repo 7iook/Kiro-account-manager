@@ -12,6 +12,7 @@
  *   - 仅 Enterprise / external_idp 才调 API 补 profileArn(BuilderId/Social 不调)
  */
 
+import { persistRefreshResult } from './persistRefreshResult'
 import type { AccountLike, AccountRuntimeDeps } from './types'
 
 /** refresh-account-token 的返回形状(与原 handler 逐字段一致) */
@@ -194,13 +195,44 @@ export async function refreshAccountToken(
       // BuilderId/Social 不调 API，不需要返回 profileArn（反代自愈时用 resolveProfileArn 兜底）
     }
 
+    // 落盘 —— 必须在返回成功**之前**。
+    //
+    // 为什么落盘失败要让整次刷新失败：本轮交付的成功态是**用户视角**的「盘上存的
+    // refreshToken 就是本次新签发的那个」。IdP 轮换时旧 refreshToken 一签发新的就当场作废,
+    // 落不了盘 ⇒ 盘上留一个死凭据 ⇒ 下次续期 401 → 停止调度 → 用户得重新登录。
+    // 返回 success 只会让这件事变得更隐蔽（照 check.ts:190 的同一顺序）。
+    //
+    // 与上面的 IDE token 文件写入是**两个关注点**：那边写的是 Kiro IDE 的 SSO 缓存
+    // （且只在"该账号是 IDE 当前激活账号"时写）,这里写的是本应用的 accountData。
+    // 一个账号可以不是 IDE 激活账号（不写 IDE 文件）但凭据依然必须落盘。
+    try {
+      const outcome = await persistRefreshResult(account.id, {
+        accessToken: newAccess,
+        refreshToken: newRefresh,
+        expiresIn,
+        resolvedEnterpriseArn
+      })
+      if (!outcome.persisted && outcome.reason === 'account-not-found') {
+        // 另一端刚把这个账号删了。不是错误 —— 新凭据本身有效,只是没有归属可写。
+        // 绝不重建（那是 C1/C3「已删账号复活」）。
+        console.log(
+          `[IPC] refresh-account-token: account ${account.id} no longer on disk, skipped persist`
+        )
+      }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      console.error('[IPC] refresh-account-token: failed to persist credentials:', e)
+      return { success: false, error: { message: `Token 已刷新但保存失败: ${message}` } }
+    }
+
     return {
       success: true,
       data: {
         accessToken: newAccess,
         refreshToken: newRefresh,
         expiresIn,
-        // Enterprise 自动获取的 profileArn（renderer 需要存储到账号数据）
+        // Enterprise 自动获取的 profileArn。**落盘已由上面的 persistRefreshResult 完成**，
+        // 这里返回它只是为了 renderer 的即时 UI 更新（那次 set() 不再跟 saveToStorage）。
         profileArn: resolvedEnterpriseArn || undefined,
         // 让 renderer 决定是否给用户显示"已同步到 IDE"的反馈
         syncedToIde,

@@ -164,17 +164,27 @@ DTO 覆盖了桌面卡片显示的一切，除 `isBanned`：它原样送 `lastEr
 
 ## 📋 6. 任务清单
 
+> **Evidence 的回捞来源与诚实边界**：本清单原先 8 项只有 commit hash、无 `**Evidence**` 块（异构评审检索得 `NO_EVIDENCE_BLOCKS`）。2026-08-05 补齐时，`verify` 一律**从对应 commit body 里当时真跑过的验证段回捞**（`git log -1 --format=%B <sha>`，各 commit 均含"vitest N passed / M files EXIT=0 + typecheck 双 EXIT=0"字样），`files` 从 `git show --stat <sha>` 回捞。**没有回捞到的一律写 `not recovered`，不补一条像样的命令加一个退出码** —— 伪造的 EXIT 比承认缺口更糟。
+
 - [x] **W1** 跨端并发写入仲裁（四轮异构评审收敛：静默丢弃用户编辑 → 防线只堵一个入口 → 重放 base 取合并产物 → 对象别名污染）—— commit `aa03a94`
+  - **Evidence**: commit `aa03a94` · verify `vitest` → 358 passed / 46 files EXIT=0（基线 304 → +54）· `typecheck:node` + `typecheck:web` → 双 EXIT=0（回捞自 commit body 验证段）· files `src/main/accountService/state.ts:1-207`（revision 乐观锁收口）· `src/renderer/src/store/syncMerge.ts:1-238`（三方合并）· `src/renderer/src/components/SyncErrorNotice.tsx:1-37` · `test/main/accountService/state.test.ts` + `test/renderer/cross-end-sync/{staleReplay,syncMerge,broadcastAndSettings,dirtyWindowGuard,syncErrorNotice}` 6 份 · AC 面板与桌面并发写同一账号时不静默丢弃任一端的用户编辑；冲突由 `SyncErrorNotice` 交用户裁决
 - [x] **W2/W3/W4** 账号业务剥离（三独立工作树并行 · 互斥行区间）—— `5ed3d25` / `2b23d07` / `d05f21b` / 合并 `ef472df`
   - W3 顺带修掉真实产品缺陷：v1.4.5 `d9c3784` 的 PRO+/POWER 识别修复漏传播到 `check-account-status`（用户日常"刷新额度"路径），故 PRO+ 账号一直显示为 Pro
   - W4 更正一处不存在的机制：主 AI 曾写"切号备份至 `kiro_switch_backups`"，实测全仓零命中，该目录由本仓库之外的工具创建 → 切号**无回滚路径可继承**
+  - **Evidence**: commit `5ed3d25`（W3）/ `2b23d07`（W4）/ `d05f21b`（W2）/ merge `ef472df` · verify W3 → `vitest` 386 passed / 47 files EXIT=0 + typecheck 双 EXIT=0 + 生产 caller 亲验在 `index.ts:3845/4073/4074`（非仅 tests）+ accountService 零 electron 依赖；W4 → 407 passed / 49 files EXIT=0 + typecheck 双 EXIT=0；W2 → 415 passed / 51 files EXIT=0 + typecheck 双 EXIT=0 + 零 electron 依赖（三者均标注"主 AI 独立亲跑复核"，回捞自各 commit body）· files W3 `src/main/accountService/{check.ts,parseUsage.ts,refresh.ts,types.ts}` + `index.ts`（-958）· W4 `src/main/accountService/{switch.ts,switchCli.ts,subscription.ts,transfer.ts}` · W2 `src/main/accountService/{accounts.ts,credentials.ts,verify.ts,usage.ts,index.ts}` · AC 账号业务不再依赖 `IpcMainInvokeEvent` / preload，IPC 与 HTTP 两个传输通道能复用同一份实现
 - [x] **W5a** 网络护栏原语抽取 —— `eaa2d18`
+  - **Evidence**: commit `eaa2d18` · verify `vitest` → 549 passed / 58 files EXIT=0（基线 500/56）· typecheck 双 EXIT=0 · **错接线反证**：把 wrapper 改成 `isIPAllowed(clientIP, {})` 即静默失效 IP 白名单，4 个接线测试精确转红（纯函数测试全绿 —— 这正是接线测试存在的理由），已还原并复验（回捞自 commit body）· files `src/main/utils/netGuard.ts:1-177`（新增）· `src/main/proxy/proxyServer.ts`（-131 收口）· `test/main/utils/netGuard.test.ts` + `test/main/proxy/netGuardWiring.test.ts` · AC 护栏原语由反代与面板共用一份，不各写一套 IP/端口判定
 - [x] **W5b** 会话 + 守卫 + 登录限流 —— `2eb325c`
+  - **Evidence**: commit `2eb325c` · verify `vitest` → 555 passed / 61 files EXIT=0（基线 500/56）· `typecheck:node` + `typecheck:web` → 双 EXIT=0（回捞自 commit body）· files `src/main/webPanel/auth.ts:1-211` · `session.ts:1-131` · `loginThrottle.ts:1-116` · `cookie.ts:1-84` · 闸门 `test/main/architecture/webpanel_auth_constraints.test.ts` · AC 负条件 3「绑定 0.0.0.0 时绝不允许无鉴权启动」由 `auth.ts` + 架构闸门共同守住；登录失败有限流
 - [x] **W5c** 脱敏收口 + 静态闸门 —— `9a7291f`
+  - **Evidence**: commit `9a7291f` · verify `vitest` → 541 passed / 60 files EXIT=0 · `typecheck:node` → EXIT=0（commit body 只记了 node 一侧，**web 侧未回捞到** → `typecheck:web: not recovered`）· **闸门真红验证**：闸门精确报出 `dto.ts:229` 违规行及内容，EXIT=1 转红（回捞自 commit body）· files `src/main/webPanel/dto.ts:1-226`（allowlist 投影）· `respond.ts:1-87`（denylist 兜底）· `src/main/utils/redact.ts` · 闸门 `test/main/architecture/webpanel_no_direct_res_end.test.ts` · AC 负条件 4「凭据明文绝不出主进程」——两层（白名单投影 + 无条件脱敏）+ 第三层静态闸门禁止绕过
 - [x] **W6a** HTTP 服务器 + 路由 + 装配接线 —— `a6548c7`
   - 抓到只在组合处存在的缺陷：DTO 的 `hasRefreshToken` 布尔被脱敏层按子串匹配改写成 `'***'`（truthy），两个模块各自测试都抓不到
+  - **Evidence**: commit `a6548c7` · verify `vitest` → 677 passed / 70 files EXIT=0（基线 645/67）· typecheck 双 EXIT=0（回捞自 commit body）· files `src/main/webPanel/server.ts:1-390` · `routes.ts:1-320` · `src/main/ipc/webPanelWiring.ts:1-347`（生产装配）· `src/main/index.ts`（+93 接线）· 组合缺陷回归 `test/main/webPanel/dtoRedactComposition.test.ts` · 装配闸门 `test/main/architecture/webpanel_production_wiring.test.ts` · AC 面板与 IPC 经 `buildPanelRouteDeps` 复用同一批 accountService 函数（生产装配点 `index.ts:4358`），非各自实现
 - [x] **W6b** 桌面设置页开关 —— `8ce132d`
+  - **Evidence**: commit `8ce132d` · verify `vitest` → 714 passed / 4 skipped / 73 files EXIT=0（基线 703/4/72）· typecheck 双 EXIT=0 · 顺带钉住一条真实约束：renderer 不能直接引 main 的类型（`tsconfig.web.json` 不含 `src/main/**`，`@preload` 别名只存在于 `vitest.config.ts` ⇒ 走它会「测试过、typecheck:web 与打包炸」）（回捞自 commit body）· files `src/renderer/src/components/pages/WebPanelCard.tsx:1-455` · `SettingsPage.tsx` · `src/preload/index.{ts,d.ts}` · `i18n/locales/{zh,en}.ts` · `test/renderer/web-panel-settings/WebPanelCard.test.tsx` · AC 用户能在桌面设置页开关面板、看到访问地址与 adminKey
 - [x] **W6c** 独立 Vite 构建 + 打包接通 —— `3d93507`
+  - **Evidence**: commit `3d93507` · verify `vitest` → 654 passed / 68 files EXIT=0（基线 645/67）· **推翻原方案的实测**：给 renderer 加第二入口构建 EXIT=1（Rollup 拒绝 emit `src/webPanel/`）· 真 asar 回放：核到 5 条 webPanel 条目并读取成功 · 顺带修断链：`build:mac` / `build:linux` 原先绕过 `npm run build`，既跳过 typecheck 也让 mac/Linux 安装包静默缺面板资源（回捞自 commit body）· files `vite.webPanel.config.ts:1-71` · `src/main/utils/webPanelAssetRoot.ts:1-106` · `src/webPanel/{index.html,main.tsx,styles.css}` · `package.json`（四个打包脚本全经 `npm run build`）· `tsconfig.{web,node}.json`（纳入 `src/webPanel/**/*`，否则面板源码根本没被检查）· 闸门 `test/main/architecture/webpanel_build_assets.test.ts` · AC 面板产物 `target: ['es2022','safari15.4']`，手机浏览器不因 chrome140 下界白屏；打包后资源在 asar 内可定位
 - [ ] **W7a** 面板 UI —— 已交付待合并（本轮）
 - [ ] **W7b** 静态资源服务 —— 在途
 - [ ] **W8** 真机 e2e（手机浏览器全链路）—— 单测绿 ≠ 接通已证
@@ -182,7 +192,48 @@ DTO 覆盖了桌面卡片显示的一切，除 `isBanned`：它原样送 `lastEr
 
 ---
 
+## 🔗 7. 链路表：「刷新」两条链的 producer → consumer（2026-08-05 补）
+
+> 补的理由：本卡原缺 §0.15B 要求的链路表，而「刷新额度」与「刷新 Token」两条链正是**同一形状的缺陷各出现一次**——业务函数只返回、落盘长在 renderer store 里，面板走 HTTP 调同一函数却没有那个 store。每个 `existing` 跳都给 `file:line` 锚点（可 grep 复核）。
+
+### 链路 A · 刷新额度（W8 已接通 · commit `1305a17`）
+
+| 节点 | producer | consumer |
+|---|---|---|
+| 面板按钮 | `src/webPanel/` UI | `POST /api/accounts/:id/check` |
+| HTTP 路由 | `src/main/webPanel/routes.ts:453`（`case 'POST check'`） | `deps.checkAccountStatus` |
+| 生产装配 | `src/main/ipc/webPanelWiring.ts:314` + `src/main/index.ts:4357` | 同一业务函数 |
+| 业务函数 | `src/main/accountService/check.ts:183`（`checkAccountStatus`） | `persistCheckResult` |
+| 落盘 | `src/main/accountService/persistCheckResult.ts:172`（→ `persistAccountPatch`） | `applyAccountDataMutation` |
+| 写入收口 | `src/main/accountService/state.ts:145`（revision 乐观锁 + 串行锁） | `storeRef.set('accountData')` + 广播 |
+| **最终 sink** | electron-store 磁盘 blob | 面板重新 `GET /api/accounts`（用户重载页面）· 桌面端 `accounts-data-changed` → `reloadFromStorageQuiet` |
+
+### 链路 B · 刷新 Token（本轮接通 · 见下方 Update Log）
+
+| 节点 | producer | consumer |
+|---|---|---|
+| 面板按钮 | `src/webPanel/` UI | `POST /api/accounts/:id/refresh-token` |
+| HTTP 路由 | `src/main/webPanel/routes.ts:462`（`case 'POST refresh-token'`） | `deps.refreshAccountToken` |
+| 生产装配 | `src/main/ipc/webPanelWiring.ts:319` + `src/main/index.ts:4358` | 同一业务函数 |
+| 业务函数 | `src/main/accountService/refresh.ts:47`（`refreshAccountToken`） | `persistRefreshResult` |
+| 落盘 | `src/main/accountService/persistRefreshResult.ts:96` | `persistAccountPatch` |
+| 补丁收口（本轮新增 SSOT） | `src/main/accountService/persistAccountPatch.ts:75` | `applyAccountDataMutation` |
+| 写入收口 | `src/main/accountService/state.ts:145` | `storeRef.set` + 广播 |
+| **最终 sink** | electron-store 磁盘 blob 的 `accounts[id].credentials.refreshToken` | 下一次 OIDC 续期（`refreshTokenByMethod` 用它换新 token）· 面板 DTO `expiresAt`（`dto.ts:182`）· 桌面端广播回流 |
+
+**旁路（刻意不合并 · 两个关注点）**：`refresh.ts:119-170` 条件写 Kiro IDE 的 `kiro-auth-token.json`——仅当该账号是 IDE 当前激活账号（磁盘 refreshToken 匹配 或 `lastSwitchedAccountId` 匹配）。它写的是 **IDE 的 SSO 缓存**，与上表写的 **本应用 accountData** 是不同的 sink；一个账号可以不是 IDE 激活账号（不写 IDE 文件）但凭据依然必须落盘。
+
+**真实 e2e 姿态**：`test/main/accountService/refreshPersistence.test.ts` 真起 `WebPanelServer`（真 `http.Server` + 真 `fetch`）→ 真 POST → 直读盘面断言。**仍未验的一跳**：未在真实 Electron 双进程里跑过「手机点刷新 → 桌面端界面变化」，本仓单测栈不启 electron，这一跳要人工验（与链路 A 同一边界）。
+
+---
+
 ## Update Log
 
 - **2026-08-04 · 本文件重建**。前身从未落盘（详见文件头）。内容来源：已合入 main 的代码与注释、用户对话原话。所有 recon 报告与 reviewer 报告同样从未落盘，其结论已被吸收进本卡对应章节与各次 commit message —— 那些 commit message 是当前唯一可核查的决策记录载体。
 - **落盘纪律**：本文件已 `git add` 提交。今后共享文档一律写主仓、写完即核实、随代码一同提交。
+- **2026-08-05 · executor · 面板刷新 Token 落盘 + 偿还任务清单证据债**。
+  - **代码**：`refreshAccountToken` 原先只返回新凭据不落盘（`refresh.ts` 自己在 return 块注释里把落盘外包给 renderer），面板 `routes.ts:462` 走 HTTP 调它却没有 renderer store ⇒ IdP 轮换出的新 refreshToken 只出现在 HTTP 响应里、随渲染丢弃，盘上留一个已被上游作废的死凭据。新增 `persistRefreshResult.ts`（字段清单逐字段对齐 renderer 基线 `store/accounts.ts:1843-1866`，含 `profileArn` 三级回退次序与 `||` 保留语义）+ `persistAccountPatch.ts`（把「盘面遍历 / 账号不存在中止 / 仲裁异常」从 `persistCheckResult` 抽成两条刷新链共用的 SSOT，避免第二个调用方复制一遍那段 traversal）；`refresh.ts` 在返回成功**之前**落盘，落不了盘即整次刷新失败（照 `check.ts:190` 同一顺序）。桌面 renderer 那次 `saveToStorage()` 删除（双写且更旧的快照会覆盖刚写的），依据是 `syncMerge.ts:184` 对 credentials 的字段级例外——「我没改过凭据而别人改了」采纳 theirs。两个调用方现已收敛到同一条持久化路径。
+  - **验证（真跑）**：新增 `test/main/accountService/refreshPersistence.test.ts` 12 例（真起 `WebPanelServer` + 真 fetch + 直读盘面）。红：8 failed / 4 passed，全部为 `expected 'refresh-v1' to be 'refresh-v2'`（缺持久化，非 setup 错）。绿：12 passed EXIT=0。全量 `npx vitest run` → **88 files / 946 tests passed EXIT=0**（基线 87/934）。`npx tsc --noEmit -p tsconfig.node.json --composite false` EXIT=0 · `-p tsconfig.web.json --composite false` EXIT=0。
+  - **未验**：`unverified: 未在真实 Electron 双进程里跑过「手机点刷新 Token → 桌面端界面同步」`——本仓单测栈不启 electron（与链路 A 同一边界，广播已在测试中确认发出且 payload 不含凭据）。
+  - **文档**：§6 任务清单 8 个 `[x]` 项补齐四要素 `**Evidence**`（commit / verify / files / AC），来源为各 commit body 的验证段与 `git show --stat`；`W5c` 的 `typecheck:web` 当时未记录，写作 `not recovered` 而非补造。新增 §7 链路表（两条刷新链的 producer→consumer + 最终 sink + 未验的一跳）。
+  - **踩到的坑**：直接跑 `npx tsc --noEmit -p tsconfig.web.json` 会报一片 TS6307，那是**缺了项目自己的 `--composite false`**（见 `package.json` 的 `typecheck:web` 脚本），不是代码问题。复核 typecheck 必须用项目脚本的完整参数。
