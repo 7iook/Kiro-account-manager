@@ -28,6 +28,7 @@ import {
   type ProxyStatus
 } from '../api/panel'
 import { PanelApiError } from '../api/client'
+import { formatPercent } from './format'
 
 interface ProxyPanelProps {
   /** 账号列表（已由 App 加载）—— 选号弹窗的候选来源 */
@@ -327,7 +328,7 @@ function AccountPicker({ accounts, selectedId, onClose, onPick }: AccountPickerP
                     </span>
                     {a.usage?.percentUsed !== undefined && (
                       <span className="block text-xs text-slate-500 dark:text-slate-400">
-                        已用 {Math.round(a.usage.percentUsed)}%
+                        已用 {formatPercent(a.usage.percentUsed)}
                       </span>
                     )}
                   </span>

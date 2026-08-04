@@ -4,6 +4,7 @@ import { Card, CardContent, Badge, Button } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account, AccountTag, AccountGroup } from '@/types/account'
+import { formatUsagePercent } from './_helpers'
 import {
   Check,
   RefreshCw,
@@ -681,10 +682,10 @@ export const AccountCard = memo(function AccountCard({
                   "font-mono font-medium tabular-nums",
                   isCritical ? "text-destructive" : isHighUsage ? "text-warning" : "text-foreground"
                 )}>
-                   {(account.usage.percentUsed * 100).toFixed(usagePrecision ? 2 : 0)}%
+                   {formatUsagePercent(account.usage.percentUsed, usagePrecision)}
                    {isCritical && (
                      <span className="ml-1.5 text-[10px] text-red-600 font-semibold">
-                       (+{((account.usage.percentUsed - 1) * 100).toFixed(usagePrecision ? 2 : 0)}% {isEn ? 'over' : '超'})
+                       (+{formatUsagePercent(account.usage.percentUsed - 1, usagePrecision)} {isEn ? 'over' : '超'})
                      </span>
                    )}
                 </span>

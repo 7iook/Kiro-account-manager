@@ -20,7 +20,18 @@
  */
 import { useState, useEffect, useCallback } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, Button, Input, Switch } from '../ui'
-import { Globe, Eye, EyeOff, Copy, Check, RefreshCw, AlertTriangle } from 'lucide-react'
+import {
+  Globe,
+  Eye,
+  EyeOff,
+  Copy,
+  Check,
+  RefreshCw,
+  AlertTriangle,
+  QrCode,
+  ExternalLink
+} from 'lucide-react'
+import { QRCodeSVG } from 'qrcode.react'
 import { useTranslation } from '@/hooks/useTranslation'
 
 /**
@@ -50,6 +61,8 @@ const PLACEHOLDER_STATUS: WebPanelStatus = {
   port: 5590,
   listeningPort: null,
   addresses: [],
+  addressGroups: { recommended: [], virtual: [], loopback: [], degraded: false },
+  defaultAddress: null,
   hasAdminKey: false,
   lastError: null
 }
@@ -373,28 +386,7 @@ export function WebPanelCard(): React.ReactNode {
               {t('settings.webPanel.addressNone')}
             </p>
           ) : (
-            <div className="space-y-2">
-              {status.addresses.map((url) => (
-                <div key={url} className="flex items-center gap-2">
-                  <code className="flex-1 text-sm font-mono bg-muted/50 rounded-lg px-3 py-2 break-all">
-                    {url}
-                  </code>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-7 w-7 shrink-0"
-                    onClick={() => handleCopy(url, url)}
-                    title={t('settings.webPanel.copy')}
-                  >
-                    {copiedField === url ? (
-                      <Check className="h-3.5 w-3.5 text-success" />
-                    ) : (
-                      <Copy className="h-3.5 w-3.5" />
-                    )}
-                  </Button>
-                </div>
-              ))}
-            </div>
+            <PanelAddressBar status={status} />
           )}
           {loopbackOnly && (
             <p className="text-xs text-amber-500 bg-amber-500/10 rounded-lg p-3">
@@ -542,3 +534,326 @@ function StateBadge({
 
 /** 供测试复用的类型别名（同样源自 `window.api` 声明，不是第二份定义） */
 export type { WebPanelStatus, WebPanelConfig }
+
+// ============================================================================
+// 地址栏 —— 多地址选择 + 复制 + 二维码 + 浏览器打开
+// ============================================================================
+
+/**
+ * 记住用户上次选的地址，**按 host（IP）而不是完整 URL 存**。
+ *
+ * 这样换端口后选择依然有效 —— 用户挑的是「哪张网卡」，不是「哪个 URL」。
+ * 照 `codeg-research/src/components/settings/web-service-settings.tsx:49`
+ * 的 `DISPLAY_HOST_STORAGE_KEY` 先例。
+ */
+const DISPLAY_HOST_STORAGE_KEY = 'webPanel.displayHost'
+
+
+/**
+ * 读上次选的 host。**必须容忍 localStorage 抛异常** —— 隐私模式 / 禁用 cookie
+ * 的环境下访问它会 throw，而「记不住上次选择」不该让整个地址栏崩掉。
+ * 写入侧同样姿势（见 `rememberDisplayHost`）。
+ */
+function readSavedDisplayHost(): string | null {
+  try {
+    return window.localStorage.getItem(DISPLAY_HOST_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+function rememberDisplayHost(host: string): void {
+  try {
+    window.localStorage.setItem(DISPLAY_HOST_STORAGE_KEY, host)
+  } catch {
+    // 存不住就算了：下次回到默认选择，不影响本次使用
+  }
+}
+
+/** 虚拟网卡来源 → 展示名。认不出的归「其他」 */
+const VIRTUAL_SOURCE_LABEL: Record<string, string> = {
+  wsl: 'WSL',
+  hyperv: 'Hyper-V',
+  vmware: 'VMware',
+  virtualbox: 'VirtualBox',
+  tailscale: 'Tailscale',
+  other: '其他'
+}
+
+type AddressGroups = WebPanelStatus['addressGroups']
+type AddressItem = AddressGroups['recommended'][number]
+
+/**
+ * 地址栏。
+ *
+ * ## 为什么不平铺
+ *
+ * 主进程分好了组（`addressGroups`）：推荐 = 真实物理网卡，虚拟 = WSL / VMware /
+ * Tailscale 这类手机连不上的地址。本机实测 6 条非回环地址里只有 1 条能扫 ——
+ * 平铺给用户等于让他瞎猜。所以推荐组直接可选，虚拟组默认折叠。
+ *
+ * ## 降级
+ *
+ * `degraded === true` 表示判据没认出任何物理网卡（OUI 表不可能覆盖所有硬件）。
+ * 此时**不显示空的推荐分组**，而是把全部地址平铺出来、不标推荐 ——
+ * 排序不佳只是体验问题，滤掉唯一可用地址是硬故障。
+ *
+ * ## 二维码只承载 URL
+ *
+ * 刻意**不**把 adminKey 编进二维码：二维码会进截图 / 相册 / 聊天记录，
+ * 密钥跟着一起泄漏。用户在手机上自己输密钥。
+ */
+function PanelAddressBar({ status }: { status: WebPanelStatus }): React.ReactNode {
+  const { t } = useTranslation()
+  /**
+   * 分组信息容错：`addressGroups` 是本轮新增字段。
+   *
+   * 为什么必须兜底而不是假定它一定在：这是**跨进程**数据。主进程与 renderer
+   * 版本可能不一致（开发中热重载、或用户装了旧版主进程），字段缺失时整个设置页
+   * 不该白屏。缺失时退化为「把 addresses 平铺、不标推荐」—— 正好等于本轮改造前
+   * 的行为，是安全的降级终点。
+   */
+  const groups: AddressGroups =
+    status.addressGroups ??
+    ({
+      recommended: [],
+      virtual: [],
+      loopback: status.addresses.map((url) => ({
+        url,
+        host: url,
+        interfaceName: '',
+        kind: 'loopback' as const
+      })),
+      // 标记为降级 ⇒ UI 走「全部平铺、不标推荐」分支
+      degraded: status.addresses.length > 0
+    } as AddressGroups)
+  const [selected, setSelected] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
+  const [qrOpen, setQrOpen] = useState(false)
+  const [showVirtual, setShowVirtual] = useState(false)
+
+  // 降级时全部平铺、不分推荐；否则推荐组优先
+  const primary: AddressItem[] = groups.degraded
+    ? [...groups.recommended, ...groups.virtual, ...groups.loopback]
+    : groups.recommended
+  const secondary: AddressItem[] = groups.degraded
+    ? []
+    : [...groups.virtual, ...groups.loopback]
+  const all: AddressItem[] = [...primary, ...secondary]
+
+  /**
+   * 当前地址。优先级：用户本次点选 → 上次记住的 host → 主进程给的
+   * defaultAddress → 首个。`status` 变化（改端口 / 重启）时自动跟随，
+   * 因为这里是每次渲染重算而非 state 缓存 URL。
+   */
+  const current: AddressItem | null = (() => {
+    if (all.length === 0) return null
+    if (selected !== null) {
+      const hit = all.find((a) => a.host === selected)
+      if (hit !== undefined) return hit
+    }
+    const saved = readSavedDisplayHost()
+    if (saved !== null) {
+      const hit = all.find((a) => a.host === saved)
+      if (hit !== undefined) return hit
+    }
+    if (status.defaultAddress !== null) {
+      const hit = all.find((a) => a.url === status.defaultAddress)
+      if (hit !== undefined) return hit
+    }
+    return all[0]
+  })()
+
+  if (current === null) return null
+
+  const handlePick = (item: AddressItem): void => {
+    setSelected(item.host)
+    rememberDisplayHost(item.host)
+    setCopied(false)
+  }
+
+  const handleCopyAddress = (): void => {
+    void navigator.clipboard
+      .writeText(current.url)
+      .then(() => {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 2000)
+      })
+      .catch((error: unknown) => {
+        // 不静默：复制失败要让用户知道，否则他以为复制成功了去手机上粘贴空值
+        console.error('[WebPanelCard] Failed to copy address:', error)
+      })
+  }
+
+  const renderOption = (item: AddressItem): React.ReactNode => {
+    const isCurrent = item.host === current.host
+    const label =
+      item.kind === 'loopback'
+        ? t('settings.webPanel.addressLoopbackTag')
+        : item.kind === 'virtual'
+          ? (VIRTUAL_SOURCE_LABEL[item.virtualSource ?? 'other'] ?? '其他')
+          : null
+    return (
+      <button
+        key={item.url}
+        type="button"
+        onClick={() => handlePick(item)}
+        className={`flex w-full items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left text-sm transition-colors ${
+          isCurrent ? 'border-primary bg-primary/5' : 'border-border hover:bg-muted/50'
+        }`}
+      >
+        <span className="min-w-0 flex-1">
+          <code className="block truncate font-mono text-xs">{item.url}</code>
+          <span className="block truncate text-[10px] text-muted-foreground">
+            {item.interfaceName}
+          </span>
+        </span>
+        {label !== null && (
+          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+            {label}
+          </span>
+        )}
+        {isCurrent && <Check className="h-3.5 w-3.5 shrink-0 text-primary" />}
+      </button>
+    )
+  }
+
+  return (
+    <div className="space-y-2">
+      {/* 当前地址 + 三个动作 */}
+      <div className="flex items-center gap-2">
+        <code className="min-w-0 flex-1 truncate rounded-lg bg-muted/50 px-3 py-2 font-mono text-sm">
+          {current.url}
+        </code>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 shrink-0"
+          onClick={handleCopyAddress}
+          title={t('settings.webPanel.copy')}
+          aria-label={t('settings.webPanel.copy')}
+        >
+          {copied ? (
+            <Check className="h-3.5 w-3.5 text-success" />
+          ) : (
+            <Copy className="h-3.5 w-3.5" />
+          )}
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 shrink-0"
+          onClick={() => setQrOpen(true)}
+          title={t('settings.webPanel.qrcode')}
+          aria-label={t('settings.webPanel.qrcode')}
+        >
+          <QrCode className="h-3.5 w-3.5" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 shrink-0"
+          onClick={() => window.api.openExternal(current.url)}
+          title={t('settings.webPanel.openInBrowser')}
+          aria-label={t('settings.webPanel.openInBrowser')}
+        >
+          <ExternalLink className="h-3.5 w-3.5" />
+        </Button>
+      </div>
+
+      {/* 可选地址列表。只有一个地址时不显示选择器（没什么可选的） */}
+      {all.length > 1 && (
+        <div className="space-y-1.5">
+          {primary.length > 1 || groups.degraded ? (
+            <>
+              {!groups.degraded && (
+                <p className="text-[10px] text-muted-foreground">
+                  {t('settings.webPanel.addressRecommended')}
+                </p>
+              )}
+              {primary.map(renderOption)}
+            </>
+          ) : (
+              null /* 只有一个推荐地址时不必再列一遍选择器 */
+          )}
+
+          {secondary.length > 0 && (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowVirtual((v) => !v)}
+                className="text-[10px] text-muted-foreground underline-offset-2 hover:underline"
+              >
+                {showVirtual
+                  ? t('settings.webPanel.addressHideOthers')
+                  : t('settings.webPanel.addressShowOthers', { count: secondary.length })}
+              </button>
+              {showVirtual && (
+                <>
+                  <p className="text-[10px] text-muted-foreground">
+                    {t('settings.webPanel.addressOthersHint')}
+                  </p>
+                  {secondary.map(renderOption)}
+                </>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {qrOpen && (
+        <AddressQrcodeDialog
+          url={current.url}
+          onClose={() => setQrOpen(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * 二维码弹层。**内容就是地址栏显示的那个字符串本身**（同一个 `current.url`），
+ * 不是另拼一份 —— 否则扫出来的和看到的可能不一致。
+ *
+ * 下方重复展示地址文本，是给「扫不动就手输」留退路（照参照实现
+ * `web-service-settings.tsx:154-186` 的 `AddressQrcodeDialog`）。
+ */
+function AddressQrcodeDialog({
+  url,
+  onClose
+}: {
+  url: string
+  onClose: () => void
+}): React.ReactNode {
+  const { t } = useTranslation()
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div
+        role="presentation"
+        onClick={onClose}
+        className="absolute inset-0 bg-black/50"
+      />
+      <div
+        role="dialog"
+        aria-label={t('settings.webPanel.qrcode')}
+        className="relative w-full max-w-xs rounded-2xl bg-background p-5 shadow-lg"
+      >
+        <div className="flex flex-col items-center gap-3">
+          {/* 白底 + padding：二维码在深色主题下必须保证对比度，否则扫不出来 */}
+          <div className="rounded-xl bg-white p-3">
+            <QRCodeSVG value={url} size={208} marginSize={0} />
+          </div>
+          <code className="w-full break-all text-center font-mono text-xs text-muted-foreground">
+            {url}
+          </code>
+          <p className="text-center text-[11px] text-muted-foreground">
+            {t('settings.webPanel.qrcodeHint')}
+          </p>
+          <Button variant="outline" className="w-full" onClick={onClose}>
+            {t('common.close')}
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}

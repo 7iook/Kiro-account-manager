@@ -329,6 +329,15 @@ const en = {
       addressDesc: 'Type this into the browser on your phone',
       addressNone: 'Not listening — no reachable address yet',
       addressLoopbackOnly: 'Currently bound to this machine only (127.0.0.1), so other devices cannot reach it. Turn on "Allow LAN access" above.',
+      // Multi-address selection + QR code
+      addressRecommended: 'Addresses your phone can reach',
+      addressShowOthers: 'Other addresses ({count})',
+      addressHideOthers: 'Hide other addresses',
+      addressOthersHint: 'These are virtual adapters / local addresses — usually unreachable from a phone',
+      addressLoopbackTag: 'Local',
+      qrcode: 'QR code',
+      qrcodeHint: 'Scan with your phone camera or browser. You will need the access key below after opening.',
+      openInBrowser: 'Open in browser',
       copy: 'Copy',
       copied: 'Copied',
       // Port

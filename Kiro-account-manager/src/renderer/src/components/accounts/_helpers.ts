@@ -189,3 +189,35 @@ export function formatDateSafe(d: unknown): string {
     return ''
   }
 }
+
+// ============ 额度百分比（单位收口 · SSOT） ============
+
+/**
+ * `Account['usage'].percentUsed` 的单位是 **0~1 小数**（写入侧唯一口径，见
+ * `main/accountService/check.ts:127`：`totalCurrent / totalLimit`）。
+ *
+ * 为什么必须收口成一个函数：这个字段曾经有两种单位并存 —— `RegisterPage.tsx`
+ * 四处写 `Math.round(x*100)` 存百分数，其余写小数。显示层于是也分裂成
+ * 「乘 100」与「不乘」两派，用户看到的是「已用永远 0%」（小数派账号走到不乘的
+ * 显示点）或「已用 8500%」（百分数派账号走到乘的显示点）。
+ * 写入侧已统一为小数，显示侧一律走本函数，别再各自 `* 100`。
+ *
+ * @param percentUsed 0~1 小数；`undefined` / 非有限值视为未知
+ * @returns 百分数数值（42 而非 0.42）。**不裁剪上限** —— 超额时 120 是用户
+ *          要知道的事实（口径与面板 `webPanel/ui/format.ts:formatPercent` 一致）
+ */
+export function usagePercentValue(percentUsed: number | undefined): number {
+  if (percentUsed === undefined || !Number.isFinite(percentUsed)) return 0
+  return percentUsed * 100
+}
+
+/**
+ * 额度百分比的显示文本。`usagePrecision` 开关沿用既有行为：
+ * 开 → 两位小数，关 → 整数（各调用点原本就是 `toFixed(usagePrecision ? 2 : 0)`）。
+ */
+export function formatUsagePercent(
+  percentUsed: number | undefined,
+  usagePrecision: boolean
+): string {
+  return `${usagePercentValue(percentUsed).toFixed(usagePrecision ? 2 : 0)}%`
+}

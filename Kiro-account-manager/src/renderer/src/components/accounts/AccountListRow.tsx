@@ -30,7 +30,8 @@ import {
   StatusLabelsZh,
   StatusLabelsEn,
   formatTokenExpiry,
-  isBannedError
+  isBannedError,
+  usagePercentValue
 } from './_helpers'
 
 interface AccountListRowProps {
@@ -112,7 +113,9 @@ function AccountListRowComponent({
     }
     return Math.floor(value).toLocaleString()
   }
-  const percentUsed = account.usage.percentUsed * 100
+  // 百分数值走共用 helper 换算（percentUsed 是 0~1 小数）——
+  // 别在这里自己 * 100，那就是第四份散落的单位知识。
+  const percentUsed = usagePercentValue(account.usage.percentUsed)
   const isHighUsage = percentUsed > 80
   const isCritical = percentUsed > 100
 

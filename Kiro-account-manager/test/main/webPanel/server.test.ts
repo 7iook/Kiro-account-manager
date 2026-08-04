@@ -43,7 +43,7 @@ function fixtureBlob(): unknown {
         isActive: true,
         tags: ['t1'],
         subscription: { type: 'Pro', title: 'Kiro Pro', daysRemaining: 12 },
-        usage: { current: 30, limit: 100, percentUsed: 30 },
+        usage: { current: 30, limit: 100, percentUsed: 0.3 },
         credentials: {
           accessToken: TOKEN_SECRET,
           refreshToken: REFRESH_SECRET,

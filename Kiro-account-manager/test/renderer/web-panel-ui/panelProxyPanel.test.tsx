@@ -25,7 +25,7 @@ function accounts(): AccountListItem[] {
       tags: [],
       hasRefreshToken: true,
       canRefreshViaOidc: true,
-      usage: { percentUsed: 30 }
+      usage: { percentUsed: 0.3 }
     },
     {
       id: 'acc-b',

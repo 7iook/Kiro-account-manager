@@ -329,6 +329,15 @@ const zh = {
       addressDesc: '在手机浏览器里输入这个地址',
       addressNone: '尚未监听，暂无可访问地址',
       addressLoopbackOnly: '当前仅绑定本机（127.0.0.1），其他设备无法访问。打开上方「允许局域网访问」即可。',
+      // 多地址选择 + 二维码
+      addressRecommended: '手机可访问的地址',
+      addressShowOthers: '其他地址（{count}）',
+      addressHideOthers: '收起其他地址',
+      addressOthersHint: '以下是虚拟网卡 / 本机地址，手机通常连不上',
+      addressLoopbackTag: '本机',
+      qrcode: '二维码',
+      qrcodeHint: '用手机相机或浏览器扫码打开。打开后需输入下方的访问密钥。',
+      openInBrowser: '在浏览器中打开',
       copy: '复制',
       copied: '已复制',
       // 端口

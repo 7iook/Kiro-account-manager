@@ -76,13 +76,16 @@ export function HomePage() {
     })
 
     const remaining = totalLimit - totalUsed
-    const percentUsed = totalLimit > 0 ? (totalUsed / totalLimit) * 100 : 0
+    // 字段名带 Pct 后缀使单位自解释：这是 **百分数**（42 而非 0.42）。
+    // 它与单个账号的 `usage.percentUsed`（0~1 小数）同名不同单位,
+    // 曾经在同一个文件里两种口径并存（:45 用小数阈值、本处用百分数）。
+    const percentUsedPct = totalLimit > 0 ? (totalUsed / totalLimit) * 100 : 0
 
     return {
       totalLimit,
       totalUsed,
       remaining,
-      percentUsed,
+      percentUsedPct,
       validAccountCount
     }
   }, [accounts])
@@ -285,16 +288,16 @@ export function HomePage() {
                   <BarChart3 className="h-4 w-4 text-purple-500" />
                   <span className="text-xs text-muted-foreground">{isEn ? 'Usage %' : '使用率'}</span>
                 </div>
-                <p className="text-xl font-bold">{usageStats.percentUsed.toFixed(usagePrecision ? 2 : 1)}%</p>
+                <p className="text-xl font-bold">{usageStats.percentUsedPct.toFixed(usagePrecision ? 2 : 1)}%</p>
               </div>
             </div>
             {/* 进度条 - 超额时双段显示 */}
             {(() => {
-              const isOverQuota = usageStats.percentUsed > 100
-              const overPercent = isOverQuota ? usageStats.percentUsed - 100 : 0
+              const isOverQuota = usageStats.percentUsedPct > 100
+              const overPercent = isOverQuota ? usageStats.percentUsedPct - 100 : 0
               const overAmount = isOverQuota ? Math.abs(usageStats.remaining) : 0
               // 超额段视觉宽度：按超额比例占整条进度条比例，最多 60% 避免完全遮盖
-              const overBarWidth = isOverQuota ? Math.min((overPercent / usageStats.percentUsed) * 100, 60) : 0
+              const overBarWidth = isOverQuota ? Math.min((overPercent / usageStats.percentUsedPct) * 100, 60) : 0
               const precision = usagePrecision ? 2 : 1
 
               return (
@@ -308,11 +311,11 @@ export function HomePage() {
                       <span className={cn(
                         "font-bold px-2 py-0.5 rounded-md",
                         isOverQuota && "bg-red-500/15 text-red-600 dark:text-red-400",
-                        !isOverQuota && usageStats.percentUsed >= 80 && "bg-orange-500/15 text-orange-600 dark:text-orange-400",
-                        !isOverQuota && usageStats.percentUsed >= 50 && usageStats.percentUsed < 80 && "bg-yellow-500/15 text-yellow-600 dark:text-yellow-400",
-                        !isOverQuota && usageStats.percentUsed < 50 && "bg-green-500/15 text-green-600 dark:text-green-400"
+                        !isOverQuota && usageStats.percentUsedPct >= 80 && "bg-orange-500/15 text-orange-600 dark:text-orange-400",
+                        !isOverQuota && usageStats.percentUsedPct >= 50 && usageStats.percentUsedPct < 80 && "bg-yellow-500/15 text-yellow-600 dark:text-yellow-400",
+                        !isOverQuota && usageStats.percentUsedPct < 50 && "bg-green-500/15 text-green-600 dark:text-green-400"
                       )}>
-                        {usageStats.percentUsed.toFixed(precision)}%
+                        {usageStats.percentUsedPct.toFixed(precision)}%
                       </span>
                     </span>
                   </div>
@@ -322,11 +325,11 @@ export function HomePage() {
                       className={cn(
                         "absolute inset-y-0 left-0 transition-all",
                         isOverQuota && "bg-red-500",
-                        !isOverQuota && usageStats.percentUsed >= 80 && "bg-orange-500",
-                        !isOverQuota && usageStats.percentUsed >= 50 && usageStats.percentUsed < 80 && "bg-yellow-500",
-                        !isOverQuota && usageStats.percentUsed < 50 && "bg-green-500"
+                        !isOverQuota && usageStats.percentUsedPct >= 80 && "bg-orange-500",
+                        !isOverQuota && usageStats.percentUsedPct >= 50 && usageStats.percentUsedPct < 80 && "bg-yellow-500",
+                        !isOverQuota && usageStats.percentUsedPct < 50 && "bg-green-500"
                       )}
-                      style={{ width: `${Math.min(usageStats.percentUsed, 100)}%` }}
+                      style={{ width: `${Math.min(usageStats.percentUsedPct, 100)}%` }}
                     />
                     {/* 超额段 - 深红条纹动画从右侧叠加 */}
                     {isOverQuota && (

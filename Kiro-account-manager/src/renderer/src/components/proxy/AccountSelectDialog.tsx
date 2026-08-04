@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react'
 import { X, Search, Check, User, CreditCard, Zap, Mail, AlertCircle, Ban } from 'lucide-react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Input, Badge } from '../ui'
+import { usagePercentValue } from '../accounts/_helpers'
 import type { Account } from '../../types/account'
 
 interface AccountSelectDialogProps {
@@ -41,15 +42,16 @@ export function AccountSelectDialog({
     onOpenChange(false)
   }
 
-  const getUsagePercent = (acc: Account): number => {
-    const usage = acc.usage
-    if (!usage) return 0
-    // 直接通过 current/limit 计算百分比，确保准确性
-    if (usage.limit > 0) {
-      return Math.min(100, (usage.current / usage.limit) * 100)
-    }
-    return usage.percentUsed || 0
-  }
+  /**
+   * 额度百分比。**唯一权威源是 `usage.percentUsed`**（0~1 小数），走共用 helper 换算。
+   *
+   * 这里原本有第二条路：`limit > 0` 时自算 `(current/limit)*100`、否则读字段。
+   * 删掉自算的理由是它与字段会给出不同答案 —— 自算被 `Math.min(100, …)` 裁到
+   * 100，字段不裁；超额账号在本弹层显示 100% 而在账号卡显示 120%，同一账号两个读数。
+   * 写入侧已统一为小数（见 `_helpers.ts:usagePercentValue` 注释），字段可信，
+   * 两条路并存只剩漂移风险。
+   */
+  const getUsagePercent = (acc: Account): number => usagePercentValue(acc.usage?.percentUsed)
 
   const getUsageText = (acc: Account): string => {
     const usage = acc.usage
@@ -249,13 +251,14 @@ export function AccountSelectDialog({
                           </span>
                         </div>
                         
-                        {/* 使用量进度条 */}
+                        {/* 使用量进度条。宽度裁到 100%（getUsagePercent 不再自带裁剪）,
+                            但颜色阈值用未裁剪值 —— 超额 120% 属于“危险”而非“刚好满” */}
                         <div className="mt-2 w-full bg-muted rounded-full h-1.5 overflow-hidden">
                           <div 
                             className={`h-full transition-all ${
                               usagePercent > 80 ? 'bg-destructive' : usagePercent > 50 ? 'bg-warning' : 'bg-success'
                             }`}
-                            style={{ width: `${usagePercent}%` }}
+                            style={{ width: `${Math.min(usagePercent, 100)}%` }}
                           />
                         </div>
                         

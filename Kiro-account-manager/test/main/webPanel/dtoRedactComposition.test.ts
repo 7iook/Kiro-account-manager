@@ -30,7 +30,7 @@ const RAW_ACCOUNT = {
   tags: ['work'],
   machineId: 'a'.repeat(64),
   subscription: { type: 'Pro', title: 'Kiro Pro', daysRemaining: 20 },
-  usage: { current: 10, limit: 100, percentUsed: 10, baseLimit: 100, baseCurrent: 10 },
+  usage: { current: 10, limit: 100, percentUsed: 0.1, baseLimit: 100, baseCurrent: 10 },
   credentials: {
     accessToken: 'header.payload.signature-like-value',
     refreshToken: 'refresh-secret-value',

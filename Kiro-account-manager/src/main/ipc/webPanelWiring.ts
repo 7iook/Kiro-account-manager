@@ -16,6 +16,12 @@ import { networkInterfaces } from 'node:os'
 import { WebPanelServer, type WebPanelConfig } from '../webPanel/server'
 import { PanelAuth, type AdminKeyStore } from '../webPanel/auth'
 import { PANEL_PATH_PREFIX } from '../webPanel/cookie'
+import {
+  classifyAddresses,
+  pickDefaultAddress,
+  type AddressClassification,
+  type RawInterfaceAddress
+} from '../webPanel/addressClassify'
 import type { PanelRouteDeps, PanelAccountIdentity } from '../webPanel/routes'
 
 /** electron-store 的最小接口（与 accountService/state.ts:StoreRef 同一风格） */
@@ -59,8 +65,22 @@ export interface WebPanelStatus {
   port: number
   /** 实际监听端口（port:0 时才与配置不同） */
   listeningPort: number | null
-  /** 局域网可访问的完整地址列表（供手机端输入 / 生成二维码） */
+  /**
+   * 局域网可访问的完整地址列表（供手机端输入 / 生成二维码）。
+   *
+   * 保持 `string[]` 不变 —— 它是跳过 IPC 的既有契约，设置页与 19 例测试都在用。
+   * 分组 / 标注信息走下面的 `addressGroups`，两者同源（同一次枚举）。
+   */
   addresses: string[]
+  /**
+   * 分类后的地址分组：推荐（真实物理网卡）/ 虚拟（WSL / VMware / Tailscale …）/ 回环。
+   *
+   * 为何不直接把 `addresses` 改成结构体：那是跳 IPC 的破坏性改动，会连带
+   * preload 类型与全部 fixture。并列一个新字段，旧消费点零改动。
+   */
+  addressGroups: AddressClassification
+  /** 默认展示 / 二维码应用哪个地址（降级时也能给出一个）。无地址时为 null */
+  defaultAddress: string | null
   hasAdminKey: boolean
   /** 最近一次启动失败的原因（决策卡 §5 场景 S3：不能显示「已启用」却其实没监听） */
   lastError: string | null
@@ -130,13 +150,16 @@ export class WebPanelWiring {
     const config = this.readConfig()
     const addr = this.server.getListeningAddress()
     const port = addr?.port ?? config.port
+    const built = buildPanelAddresses(config.host, port)
     return {
       running: this.server.isRunning(),
       enabled: config.enabled,
       host: config.host,
       port: config.port,
       listeningPort: addr?.port ?? null,
-      addresses: buildPanelAddresses(config.host, port),
+      addresses: built.addresses,
+      addressGroups: built.groups,
+      defaultAddress: built.defaultAddress,
       hasAdminKey: this.auth.hasAdminKey(),
       lastError: this.lastError
     }
@@ -280,28 +303,126 @@ function toMessage(error: unknown): string {
 }
 
 /**
- * 枚举面板的可访问地址。
+ * 枚举面板的可访问地址，并按「手机是否真连得上」分组。
  *
  * 绑定 `0.0.0.0` / `::` 时列出所有非回环 IPv4 网卡地址 —— 用户需要知道
  * 「在手机浏览器里该输哪个」，而 `0.0.0.0` 本身不是可输入的地址。
+ *
+ * ## 为什么不再平铺
+ *
+ * 原实现的判据是 `family === 'IPv4' && !entry.internal`，与参照实现
+ * `codeg-research/src-tauri/src/web/mod.rs:417` 等价。在真实开发机上这会吐出
+ * 6 条地址（WSL / VMware ×2 / Hyper-V / Tailscale / 无线网卡），其中只有 1 条
+ * 手机连得上 —— 让用户从 6 个里瞎猜等于没做这个功能。
+ * 分类判据下沉到 `webPanel/addressClassify.ts`（纯函数 + 单测）。
+ *
+ * ## 两条既有语义必须保住
+ *
+ * 1. **绑非通配地址时只返回那一个地址**（绑 `127.0.0.1` 就只给本机地址，
+ *    此时二维码给手机扫无意义，UI 据 `addressGroups.recommended` 为空体现）。
+ * 2. **回环兜底无条件追加** —— 没有可用网卡时至少给一个能自测的地址。
+ *
+ * @returns `addresses` 保持原 `string[]` 形状（跨 IPC 契约不动），
+ *          `groups` 提供分组/标注，`defaultAddress` 给默认选中项
  */
-export function buildPanelAddresses(host: string, port: number): string[] {
-  const suffix = `:${port}${PANEL_PATH_PREFIX}`
+export function buildPanelAddresses(
+  host: string,
+  port: number
+): { addresses: string[]; groups: AddressClassification; defaultAddress: string | null } {
+  const buildUrl = (h: string): string => `http://${h}:${port}${PANEL_PATH_PREFIX}`
   const isWildcard = host === '0.0.0.0' || host === '::' || host === ''
-  if (!isWildcard) return [`http://${host}${suffix}`]
 
-  const out: string[] = []
-  const ifaces = networkInterfaces()
-  for (const entries of Object.values(ifaces)) {
-    for (const entry of entries ?? []) {
-      if (entry.family === 'IPv4' && !entry.internal) {
-        out.push(`http://${entry.address}${suffix}`)
-      }
+  if (!isWildcard) {
+    // 绑固定地址：只有这一个地址可用。归入 loopback 组（不推荐手机扫）当且仅当
+    // 它确实是回环，否则视为用户显式指定的物理地址。
+    const single = buildUrl(host)
+    const isLoopbackHost = host === '127.0.0.1' || host === 'localhost' || host === '::1'
+    const item = {
+      url: single,
+      host,
+      interfaceName: isLoopbackHost ? 'loopback' : 'explicit-bind',
+      kind: (isLoopbackHost ? 'loopback' : 'physical') as 'loopback' | 'physical'
+    }
+    return {
+      addresses: [single],
+      groups: {
+        recommended: isLoopbackHost ? [] : [item],
+        virtual: [],
+        loopback: isLoopbackHost ? [item] : [],
+        degraded: false
+      },
+      defaultAddress: single
     }
   }
-  // 回环兜底：没有可用网卡时至少给一个能自测的地址
-  out.push(`http://127.0.0.1${suffix}`)
-  return out
+
+  const entries: RawInterfaceAddress[] = []
+  for (const [interfaceName, list] of Object.entries(networkInterfaces())) {
+    for (const entry of list ?? []) {
+      entries.push({
+        interfaceName,
+        address: entry.address,
+        family: entry.family === 'IPv4' ? 'IPv4' : 'IPv6',
+        internal: entry.internal,
+        mac: entry.mac,
+        netmask: entry.netmask
+      })
+    }
+  }
+
+  const groups = classifyAddresses(entries, buildUrl)
+
+  // 回环兜底：保住原行为（`out.push('http://127.0.0.1…')` 无条件追加）。
+  // 走 groups 而不是直接拼字符串，保证 addresses 与 groups 同源。
+  const loopbackUrl = buildUrl('127.0.0.1')
+  if (!groups.loopback.some((a) => a.url === loopbackUrl)) {
+    groups.loopback.push({
+      url: loopbackUrl,
+      host: '127.0.0.1',
+      interfaceName: 'loopback',
+      kind: 'loopback'
+    })
+  }
+
+  const addresses = [
+    ...groups.recommended.map((a) => a.url),
+    ...groups.virtual.map((a) => a.url),
+    ...groups.loopback.map((a) => a.url)
+  ]
+
+  const probedHost = probeDefaultRouteHost(entries)
+  const picked = pickDefaultAddress(groups, { probedHost })
+
+  return { addresses, groups, defaultAddress: picked?.url ?? null }
+}
+
+/**
+ * 探测「哪张网卡通外网」—— 用默认路由的源 IP 作为可达性证据。
+ *
+ * ## 为什么不照搬 codeg-research 的 UDP-connect
+ *
+ * 参照实现 `mod.rs:449-462` 用 `UdpSocket::bind` + `connect` 读 `local_addr`。
+ * Rust 的 `std::net::UdpSocket` 这两个调用都是**同步**的，所以那段代码成立。
+ * Node 的 `dgram` 对应 API 是**异步**的（`bind` / `connect` 都要等事件），
+ * 而 `getStatus()` 是同步的 —— 直接移植会拿到未就绪的 socket 或抛异常。
+ * 强行改成异步会把 `getStatus()` 及其 IPC 契约全部染成 Promise，代价远大于收益。
+ *
+ * ## 改用的判据
+ *
+ * `os.networkInterfaces()` 已经给出每张网卡的 `netmask`。真实局域网网卡的掩码
+ * 是 /24 之类的正常子网，而隧道口（Tailscale）是 /32 —— 单地址子网不可能是
+ * 一个能容纳手机的局域网。这条判据同步可得，且与「通外网」高度相关。
+ *
+ * 仅用于**降级时**挑默认地址（OUI 判据认不出物理网卡的场合）；非降级时
+ * 推荐组首个即默认，不依赖本函数。
+ */
+function probeDefaultRouteHost(entries: RawInterfaceAddress[]): string | null {
+  for (const entry of entries) {
+    if (entry.family !== 'IPv4' || entry.internal) continue
+    // /32（255.255.255.255）= 单地址子网,隧道口特征,不是局域网
+    if (entry.netmask === '255.255.255.255') continue
+    return entry.address
+  }
+  return null
 }
 
 /**
