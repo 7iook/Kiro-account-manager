@@ -4,9 +4,14 @@
 // 避免凭据明文落到磁盘日志或在界面/控制台暴露。
 //
 // 设计：
-//   - redactString：处理裸字符串里的代理 URL 账密、Bearer token、长 JWT 串
+//   - redactString：处理裸字符串里的代理 URL 账密、Bearer token、长 JWT 串、`ksk_` 网页密钥
 //   - redactValue：递归处理对象/数组，对"敏感键名"整体打码，并对字符串值套用 redactString
 //   - 防御递归深度与循环引用，避免日志路径上出问题
+//
+// 两类识别互补，缺一不可：
+//   - **键名级**（SENSITIVE_KEYS）：accessToken / refreshToken / clientSecret / csrfToken 等
+//   - **值级**（redactString 规则 3、3.5）：JWT 与 `ksk_` 密钥靠值形状识别 ——
+//     它们可能出现在任意非敏感键名下（note / raw / 日志消息），键名匹配拦不住。
 
 /** 命中即整体打码的敏感键名（小写匹配） */
 const SENSITIVE_KEYS = [
@@ -18,6 +23,7 @@ const SENSITIVE_KEYS = [
   'authorization', 'auth',
   'apikey', 'api_key', 'x-api-key',
   'clientsecret', 'client_secret',
+  'csrftoken', 'csrf_token',
   'secret', 'epin', 'cookie', 'set-cookie',
   'proxyauthorization', 'proxy-authorization'
 ]
@@ -54,8 +60,16 @@ export function redactString(input: string): string {
   // 3) JWT（三段 base64url）整体打码
   out = out.replace(/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g, (m) => maskMiddle(m, 6, 4))
 
+  // 3.5) 网页 API Key（`ksk_` 前缀的不透明长串）—— **值级**识别。
+  //   与上面所有规则的区别：它不靠键名、也不是 JWT 三段式，只能靠值前缀认。
+  //   若 ksk_ 作为裸值出现在非敏感键名下（note / raw / 日志消息），键名匹配拦不住。
+  //   ⚠️ 阈值 {16,}：仓内既有测试夹具与错误文案是 `ksk_test` / `ksk_x` / 「应以 ksk_ 开头」
+  //   （`accountService/verify.ts:137`、`test/main/api-key-validation/*`），
+  //   真实密钥远长于此。定 16 位下界既覆盖真密钥又不误伤这些短夹具与提示文案。
+  out = out.replace(/\bksk_[A-Za-z0-9_-]{16,}/g, (m) => maskMiddle(m, 7, 3))
+
   // 4) 形如 accessToken=xxx / "refreshToken":"xxx" 的内联键值（兜底，针对已被 JSON.stringify 的串）
-  out = out.replace(/("?(?:access_?token|refresh_?token|id_?token|password|api_?key|client_?secret|secret|epin)"?\s*[:=]\s*"?)([^",}\s]+)("?)/gi,
+  out = out.replace(/("?(?:access_?token|refresh_?token|id_?token|csrf_?token|password|api_?key|client_?secret|secret|epin)"?\s*[:=]\s*"?)([^",}\s]+)("?)/gi,
     (_m, prefix, val, suffix) => `${prefix}${maskMiddle(String(val))}${suffix}`)
 
   return out
