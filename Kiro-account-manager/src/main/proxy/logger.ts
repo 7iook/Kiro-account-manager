@@ -63,6 +63,15 @@ class ProxyLogger {
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
       this.currentLogFile = path.join(this.config.logDir, `proxy-${timestamp}.log`)
       this.logStream = fs.createWriteStream(this.currentLogFile, { flags: 'a' })
+      // 文件流是独立的错误边界:磁盘满 / 权限撤销 / 句柄失效都会**异步** emit('error')。
+      // 无监听器时 EventEmitter 直接 throw → 冒到全局 fatal → onFatal 又回来写日志,
+      // 可能形成二次异常。故这里就地承接:关掉流并降级为「只进内存 store」,不外泄。
+      this.logStream.on('error', (err) => {
+        this.logStream = null
+        this.config.enabled = false
+        // 用 originalError 语义:这条必须能看见,但不能再触发文件写入
+        console.error('[ProxyLogger] Log file stream error, file logging disabled:', err)
+      })
       this.currentFileSize = 0
 
       this.info('Logger', 'Log file initialized', { file: this.currentLogFile })

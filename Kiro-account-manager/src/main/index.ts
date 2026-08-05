@@ -51,6 +51,7 @@ import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { installIpcSizeGuard } from './utils/emitToRenderer'
+import { installStdioGuard } from './utils/stdioGuard'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 // 局域网 web 面板装配(W6)。装配逻辑收在 ipc/webPanelWiring.ts:
@@ -145,6 +146,45 @@ import {
 app.commandLine.appendSwitch('disable-background-timer-throttling')
 app.commandLine.appendSwitch('disable-renderer-backgrounding')
 app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
+
+// ============ stdio 错误收口:管道断开不得崩主进程 ============
+//
+// 2026-08-05 修复用户两个弹窗「Uncaught Exception: Error: EPIPE broken pipe, write」
+// (RCA: .agent-workspace/.archive/2026-08-05/main-process-epipe-crash/)
+//
+// 必须在这里、app ready 之前装配 —— 打包版无 TTY 启动时,启动早期的日志
+// 就已经能触发 EPIPE。晚一步装配等于漏掉那个窗口。
+//
+// onFatal 承接 Electron 原本的行为:我们一注册 uncaughtException 监听,
+// Electron lib/browser/init.ts 里的 `listenerCount > 1 → return` 就让它自带的
+// showErrorBox 永久沉默了。所以非管道类真错误必须由这里补回可见性 + 落盘,
+// 否则会把「可见崩溃」变成「静默猝死」(详见 stdioGuard.ts 顶部长注释)。
+//
+// 落盘走 proxyLogStore 而非 proxyLogger:后者的文件流默认 enabled:false 且
+// 全仓从未调用 configure(),写不进磁盘;proxyLogStore 有 flushSaveNow() 强制落盘。
+// ready 之前 store 尚未 initialize,此时 add() 只进内存 —— 故这里显式 flush,
+// 且无论如何都先弹窗(弹窗不依赖任何初始化)。
+installStdioGuard({
+  onFatal: (err, origin) => {
+    const e = err instanceof Error ? err : new Error(String(err))
+    const stack = e.stack || `${e.name}: ${e.message}`
+    try {
+      proxyLogStore.add({
+        timestamp: new Date().toISOString(),
+        level: 'ERROR',
+        category: 'Main',
+        message: `[FATAL][${origin}] ${e.message}`,
+        data: { stack }
+      })
+      // 立刻落盘:进程可能马上就没了,等 3s 的定时保存等不到
+      void proxyLogStore.flushSaveNow()
+    } catch { /* 留痕失败不得二次崩溃 */ }
+    // 补回 Electron 被我们抑制掉的那个弹窗(仅真错误,stdio EPIPE 不会走到这里)
+    try {
+      dialog.showErrorBox('A JavaScript error occurred in the main process', `${origin}:\n${stack}`)
+    } catch { /* ignore */ }
+  }
+})
 
 // ============ 自动更新配置 ============
 autoUpdater.autoDownload = false
