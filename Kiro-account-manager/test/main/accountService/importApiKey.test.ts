@@ -305,6 +305,24 @@ describe('importApiKeys · 原子性与落盘形状', () => {
     expect(acc.machineId).toBe('f'.repeat(64))
   })
 
+  it('usage.percentUsed 是 0~1 比例（全仓 SSOT 口径），不是 0-100 百分数', async () => {
+    // fixture: currentUsage 5 / usageLimit 100 ⇒ 比例 0.05。
+    //
+    // 为什么必须钉住:消费侧一律按比例解读 —— renderer `usagePercentValue = percentUsed * 100`、
+    // 面板 `formatPercent(v) = Math.round(v * 100)%`。若这里写 0-100 的百分数(旧实现
+    // `Math.round((current / limit) * 100)` 得 5),再乘 100 就显示成 500%。
+    // 这一处是 fce8c89 从老 AddAccountDialog 逐字搬过来的漏网点:老代码里该占位值很快被
+    // checkAccountStatus 覆盖成比例,单位错误被掩盖;导入后 check 一旦不跑(store 竞态),
+    // 它就直接留在盘上。既有守护见 test/renderer/usage-percent-ssot/percentUsedUnit.test.tsx。
+    const disk = fakeDisk()
+    await importApiKeys(deps({ applyMutation: disk.applyMutation }), { rawInput: KEY_A })
+    const acc = Object.values(accountsOf(disk.blob))[0]
+    const usage = acc.usage as Record<string, number>
+    expect(usage.current).toBe(5)
+    expect(usage.limit).toBe(100)
+    expect(usage.percentUsed).toBeCloseTo(0.05, 6)
+  })
+
   it('保留盘上其它顶层字段与既有账号（不是整表覆盖成只剩新账号）', async () => {
     const disk = fakeDisk({
       revision: 2,

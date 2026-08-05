@@ -283,6 +283,37 @@ async function handleImport(
   if (!existing) importInFlight.set(key, task)
 
   const result = await task
+
+  // 导入成功的账号立刻拉一次真实额度 —— 与桌面端 `AddAccountDialog` 导入后
+  // `void checkAccountStatus(r.accountId)` 对称。`importApiKey.ts` 只写额度**占位值**
+  // ({ current: 0, limit: 0 },注释「导入后由调用方触发 check」),面板此前完全没有这一步,
+  // 于是手机端导入的账号一直显示 0/0 直到用户手动点一次刷新。
+  //
+  // 这不是「在 handler 里重写业务判定」(不变量 1 禁止的是第二个判重/四态真源),
+  // 而是调用方编排 —— 判定仍然只在共享层那一份。
+  //
+  // fire-and-forget:不阻塞本次响应(20 个 key 就要串 20 次上游往返,手机端会以为卡死);
+  // 额度拉取失败也不该翻转「已导入」这个既成事实,但必须留痕,不做无声失败。
+  const importedIds = result.results
+    .map((r) => r.accountId)
+    .filter((id): id is string => typeof id === 'string' && id.length > 0)
+  if (importedIds.length > 0) {
+    void (async () => {
+      try {
+        // 此处读盘必然能看到新账号:importApiKeys 已 await 完成写盘,不存在桌面端那种
+        // 「广播尚未处理完」的竞态(面板每次都从盘取真值,不走 renderer store)。
+        const blob = await deps.loadAccountsBlob()
+        for (const id of importedIds) {
+          const account = findAccountRecord(blob, id)
+          if (!account) continue
+          await singleFlight(`check:${id}`, () => deps.checkAccountStatus(account))
+        }
+      } catch (error) {
+        console.warn('[Panel] post-import usage refresh failed:', error)
+      }
+    })()
+  }
+
   // 逐条结果原样回（label 已是掩码，业务层保证不含明文）。
   // 即使一条都没成功也回 200 —— 「3 个里 2 个已存在」不是 HTTP 层的错误，
   // 是需要逐条展示给用户的业务结果。

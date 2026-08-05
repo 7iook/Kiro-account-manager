@@ -7,7 +7,7 @@
  *
  * 姿态照 `staticAssets.server.test.ts`：真服务器、真 cookie、真 CSRF 头。
  */
-import { describe, it, expect, afterEach, beforeEach } from 'vitest'
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
 import { WebPanelServer } from '../../../src/main/webPanel/server'
 import { PanelAuth } from '../../../src/main/webPanel/auth'
 import { PANEL_PATH_PREFIX } from '../../../src/main/webPanel/cookie'
@@ -46,6 +46,8 @@ function makeDisk(): {
 let disk: ReturnType<typeof makeDisk>
 let verifyResult: () => Promise<VerifyApiKeyResult>
 let checkedIds: string[]
+/** 导入后是否真的触发了额度刷新(fire-and-forget)—— 记录被 checkAccountStatus 打到的账号 id */
+let checkCalledIds: string[]
 
 function stubRouteDeps(): PanelRouteDeps {
   return {
@@ -65,7 +67,10 @@ function stubRouteDeps(): PanelRouteDeps {
       for (const r of result.results) if (r.accountId) checkedIds.push(r.accountId)
       return result
     },
-    checkAccountStatus: async () => ({ success: true }),
+    checkAccountStatus: async (account) => {
+      checkCalledIds.push(String((account as { id?: unknown })?.id ?? '(no-id)'))
+      return { success: true }
+    },
     refreshAccountToken: async () => ({ success: true }),
     switchAccountToIde: async () => ({ success: true }),
     switchAccountToCli: async () => ({ success: true }),
@@ -117,6 +122,7 @@ function get(path: string): Promise<Response> {
 beforeEach(async () => {
   disk = makeDisk()
   checkedIds = []
+  checkCalledIds = []
   verifyResult = async () => ({
     state: 'VALID',
     success: true,
@@ -144,6 +150,28 @@ describe('POST /panel/api/accounts · 手机端导入 ksk_', () => {
     const list = (await listRes.json()) as { accounts: Array<{ id: string; idp?: string }> }
     expect(list.accounts).toHaveLength(1)
     expect(list.accounts[0].idp).toBe('ApiKey')
+  })
+
+  it('导入成功后自动拉一次真实额度 —— 手机端不再停在 0/0（与桌面端对称）', async () => {
+    // 病灶:`importApiKey.ts` 只写额度**占位值**({ current: 0, limit: 0 },注释
+    // 「导入后由调用方触发 check」)。桌面端 AddAccountDialog 有 `void checkAccountStatus(id)`,
+    // 面板此前完全没有这一步 ⇒ 手机端导入的账号一直显示 0/0 直到用户手动点刷新。
+    const res = await post('/api/accounts', { apiKeys: KEY_A })
+    expect(res.status).toBe(200)
+
+    // fire-and-forget:响应先回,额度刷新在后台跑(20 个 key 不该串 20 次上游往返阻塞手机端)
+    await vi.waitFor(() => expect(checkCalledIds).toContain('acc-new-1'), { timeout: 2000 })
+  })
+
+  it('一条都没导进去时不触发额度刷新（不白打一次上游）', async () => {
+    verifyResult = async () => ({ state: 'INVALID', success: false, error: '密钥无效或已吊销' })
+
+    const res = await post('/api/accounts', { apiKeys: KEY_A })
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { imported: number }).imported).toBe(0)
+
+    await new Promise((r) => setTimeout(r, 120))
+    expect(checkCalledIds).toHaveLength(0)
   })
 
   it('重复粘贴同一个 key → 不产生第二条记录', async () => {

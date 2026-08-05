@@ -2017,10 +2017,29 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   },
 
   checkAccountStatus: async (id) => {
-    const { accounts, updateAccountStatus } = get()
-    const account = accounts.get(id)
+    const { updateAccountStatus } = get()
+    let account = get().accounts.get(id)
 
-    if (!account) return
+    // store 可能还没追上主进程的盘面:ksk_ 导入下沉共享层后(fce8c89),renderer 不再本地
+    // addAccount,新账号靠 main 侧写盘 + `accounts-data-changed` 广播 → App.tsx:150 →
+    // reloadFromStorageQuiet 带进来。而 AddAccountDialog 在 importApiKeys resolve 的
+    // **同一个 tick** 就调本函数,那条跨进程异步链(广播→读盘→解密→set)往往还没跑完,
+    // accounts.get(id) 于是为 undefined。旧实现在此直接 return —— IPC 从未发出、main 侧
+    // 的 applyAccountDataMutation 落盘也从未发生 ⇒ 额度永远停在 importApiKey.ts 的占位值
+    // { current: 0, limit: 0 },即用户看到的 0/0(手动点「检查账户信息」却能刷出来)。
+    //
+    // 自愈收口在本函数:先对齐一次盘面再重试。所有调用方受益 —— 不必让每个调用方各自
+    // await 广播(那样判据散落多处,且新增调用方仍会再踩一次同一个竞态)。
+    if (!account) {
+      await get().reloadFromStorageQuiet()
+      account = get().accounts.get(id)
+    }
+
+    if (!account) {
+      // 不再静默:本次 0/0 排查因零日志只能靠通读源码定位,留痕是下次可诊断的前提。
+      console.warn(`[Account] checkAccountStatus: account not found after reload, id=${id}`)
+      return
+    }
 
     // 网页 API Key(ksk_)账户：静态凭证无 token 刷新,但 getUsageLimits(TokenType: API_KEY)可拉真实额度/订阅/邮箱。
     // 走正常路径 —— 主进程 check-account-status 对 api_key 已有专属分支(仅额度,不刷 token,不误标封禁)。
