@@ -293,6 +293,17 @@ const KIRO_ENDPOINTS = [
     name: 'AmazonQ',
     protocol: 'generateAssistantResponse' as const
   },
+  // eu 侧唯一可用的 V1 host。实测 2026-08-05(三把真实 ksk,含一把健康 EU key):
+  //   q.eu-central-1              → 200 流式正常            ← 本端点
+  //   codewhisperer.eu-central-1  → ECONNRESET(确实停服,故不登记)
+  // 与 US 侧两个 V1 的差异:只有 q 有 eu 变体,codewhisperer 没有。
+  {
+    url: 'https://q.eu-central-1.amazonaws.com/generateAssistantResponse',
+    origin: 'AI_EDITOR',
+    amzTarget: 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse',
+    name: 'AmazonQ-EU',
+    protocol: 'generateAssistantResponse' as const
+  },
   {
     url: 'https://q.us-east-1.amazonaws.com/SendMessageStreaming',
     origin: 'CLI',
@@ -1788,14 +1799,21 @@ function getAuthHeaders(account: ProxyAccount, endpoint: typeof KIRO_ENDPOINTS[0
 // 获取排序后的端点列表(根据 account.region 与首选端点配置)
 // 2026-07 迁移后的策略:
 //   - V2 端点(runtime.*.kiro.dev) 总是优先,按 account.region 选单一 EU/US endpoint
-//   - V1 端点作 fallback(仅 us,eu 侧 V1 已停服),preferredEndpoint 只影响 V1 内部顺序
+//   - V1 端点作 fallback,按 region 取对应变体(us：codewhisperer + q；eu：仅 q,
+//     codewhisperer.eu 实测 ECONNRESET 已停服)；preferredEndpoint 只影响 V1 内部顺序
 //   - amazonq-cli 保留单端点不回退行为
-function getSortedEndpoints(
+export function getSortedEndpoints(
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli',
-  region?: string
+  region?: string,
+  isApiKeyAuth?: boolean
 ): typeof KIRO_ENDPOINTS {
   // AmazonQ CLI 模式：只用这一个端点，失败不回退
-  if (preferredEndpoint === 'amazonq-cli') {
+  //
+  // 例外 —— ksk_(TokenType=API_KEY)账号:该端点明确拒绝 API key 认证。
+  // 实测 2026-08-05:q.eu-central-1/SendMessageStreaming + Bearer ksk_… →
+  //   403 {"message":"API key authentication is not supported for this operation"}
+  // “单端点不回退”的语义对它就是 100% 必败且无退路,故忽略这个偏好。
+  if (preferredEndpoint === 'amazonq-cli' && !isApiKeyAuth) {
     return KIRO_ENDPOINTS.filter(ep => ep.name === 'AmazonQCLI')
   }
 
@@ -1806,17 +1824,25 @@ function getSortedEndpoints(
     return wantEuRegion ? ep.name === 'KiroRuntime-EU' : ep.name === 'KiroRuntime-US'
   })
 
-  // V1 端点(CodeWhisperer / AmazonQ)全部硬编码 us-east-1:
-  //   - US 账户 V2 失败可 fallback 到 V1(US token 认可 V1 us 端点,有价值)
-  //   - EU 账户 V2 失败 fallback 到 V1 us **必 403 Invalid token**(跨区认证不通),
-  //     反而消耗 errorCount 冷却时间、污染日志、误触发挂起门槛(RCA 2026-08-03
-  //     hold-gate-fallback-cross-region 现场证据:EU 账户 KiroRuntime-EU 429 撞爆
-  //     10 次 → fallback CodeWhisperer(us-east-1) → 403 → 单账号池 shouldHold=false
-  //     → 立即报错 → 用户看到 AI SUB 莫名中断)。
-  //   故 EU 账户不加 V1 fallback,让 429 撞爆直接进入上层挂起决策。
-  const v1Endpoints = wantEuRegion ? [] : KIRO_ENDPOINTS.filter(ep =>
-    ep.name !== 'AmazonQCLI' && !ep.name.startsWith('KiroRuntime')
-  )
+  // V1 端点按 region 取对应变体 —— **绝不跨区**:
+  //   US 账户 → codewhisperer.us + q.us(两个都实测 200)
+  //   EU 账户 → 仅 q.eu-central-1(实测 200);codewhisperer.eu 已停服(ECONNRESET),不登记
+  //
+  // 为什么 EU 从前是空数组:RCA 2026-08-03 hold-gate-fallback-cross-region 现场是
+  //   「EU 账户 KiroRuntime-EU 429 撞爆 10 次 → fallback CodeWhisperer(us-east-1) → 403
+  //    → 单账号池 shouldHold=false → 立即报错 → 用户看到 AI SUB 莫名中断」。
+  // 那次结论「EU 账户 fallback 到 V1 **us** 必 403 Invalid token」**完全正确**,三把 ksk
+  // 实测复现(q.us / cw.us 对 EU token 一律 "bearer token invalid")。但它被记成了
+  // 「eu 侧 V1 已停服」并落成空数组 —— 那句话只对 codewhisperer.eu 成立,q.eu 一直是活的
+  // (REST 侧 index.ts:KIRO_REST_API_ENDPOINTS_V1_FALLBACK 早就在用它取 usage)。
+  //
+  // 代价:EU 账户唯一端点抽风时无路可走。实测 2026-08-05 当日 KiroRuntime-EU 非 200 率
+  // **41%**(n=29),而 KiroRuntime-US 仅 1%(n=325)—— 41 倍差距,且 EU 失败后直接抛给客户端。
+  const v1Endpoints = wantEuRegion
+    ? KIRO_ENDPOINTS.filter(ep => ep.name === 'AmazonQ-EU')
+    : KIRO_ENDPOINTS.filter(ep =>
+        ep.name !== 'AmazonQCLI' && !ep.name.startsWith('KiroRuntime') && ep.name !== 'AmazonQ-EU'
+      )
 
   // V1 内部按 preferredEndpoint 排序(codewhisperer/amazonq 二选一优先)
   if (preferredEndpoint && v1Endpoints.length > 0) {
@@ -1907,7 +1933,7 @@ export async function callKiroApiStream(
   // Fix:6ab368b 只修了 verify/GetUsageLimits,stream 阶段仍用 account.region — 本轮补齐。
   const parsedArnRegion = parseRegionFromProfileArn(account.profileArn)
   const dataPlaneRegion = parsedArnRegion || account.region
-  const endpoints = getSortedEndpoints(preferredEndpoint, dataPlaneRegion)
+  const endpoints = getSortedEndpoints(preferredEndpoint, dataPlaneRegion, account.authMethod === 'api_key')
 
   // [DIAG] 端点路由诊断(排查"切到 US2 后间歇性 400":暴露是哪个账户/arn/region 被路由到哪个端点)
   if (kiroApiDebugEnabled) {
