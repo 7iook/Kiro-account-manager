@@ -2,7 +2,7 @@
 //
 // 方案 §3 配置校验:非有限值/越界一律 clamp 到默认并 warn,校验唯一收口在 config 归一化处(SSOT)。
 //   - holdPingIntervalMs: clamp [1000, 40000];非有限→默认 10000
-//   - holdMaxWaitMs / holdTotalBudgetMs: clamp [10000, 1740000];且 holdMaxWaitMs ≤ holdTotalBudgetMs
+//   - holdMaxWaitMs / holdTotalBudgetMs: clamp [10000, 21600000];且 holdMaxWaitMs ≤ holdTotalBudgetMs
 //   - holdGraceMs: clamp [1000, 60000] 且 < holdTotalBudgetMs
 import { describe, it, expect } from 'vitest'
 import { normalizeHoldConfig, HOLD_DEFAULTS } from '@main/proxy/holdConfig'
@@ -25,8 +25,14 @@ describe('normalizeHoldConfig · 挂起门闸配置 clamp / 跨字段校验', ()
     expect(normalizeHoldConfig({ holdPingIntervalMs: NaN }).pingIntervalMs).toBe(10000)
   })
 
-  it('holdTotalBudgetMs 越上限(9999999)→ clamp 到 1740000', () => {
-    expect(normalizeHoldConfig({ holdTotalBudgetMs: 9999999 }).totalBudgetMs).toBe(1740000)
+  it('holdTotalBudgetMs 越上限(99999999)→ clamp 到 21600000(6h)', () => {
+    expect(normalizeHoldConfig({ holdTotalBudgetMs: 99999999 }).totalBudgetMs).toBe(21600000)
+  })
+
+  // 回归护栏(2026-08-06 实测):上限曾写死 1740000(29min),依据是「客户端 30min 硬顶」的误读。
+  // 生产日志实证曾成功挂起 4172s(69.5min),故 1h 以上的预算必须能被接受、不得被 clamp 掉。
+  it('holdTotalBudgetMs 设 2h → 原样保留(不被 clamp 回 29min)', () => {
+    expect(normalizeHoldConfig({ holdTotalBudgetMs: 7200000 }).totalBudgetMs).toBe(7200000)
   })
 
   it('holdMaxWaitMs > holdTotalBudgetMs → maxWaitMs 收敛到 totalBudgetMs', () => {

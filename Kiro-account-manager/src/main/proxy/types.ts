@@ -663,9 +663,12 @@ export interface ProxyConfig {
   holdWhenNoAccount?: boolean
   /** 挂起期间 SSE ping 心跳间隔 ms(默认 10000;clamp [1000,40000],<45s watchdog) */
   holdPingIntervalMs?: number
-  /** 单次挂起最长等待 ms(默认 600000=10min;clamp [10000,1740000] 且 ≤ holdTotalBudgetMs) */
+  /** 兜底轮询周期 ms(默认 600000=10min;clamp [10000,21600000] 且 ≤ holdTotalBudgetMs)。
+   *  注意:这不是单请求挂起上限 —— 上限由 holdTotalBudgetMs 定;本值是「多久没被事件唤醒就主动复查一次池」。 */
   holdMaxWaitMs?: number
-  /** 从 RECEIVED 起的绝对 deadline ms(默认 1680000=28min;clamp [10000,1740000],< 客户端 30min 硬顶) */
+  /** 从 RECEIVED 起的绝对 deadline ms(默认 1680000=28min;clamp [10000,21600000]=最长 6h)。
+   *  实测 2026-08-06:真实可挂时长由客户端 API_TIMEOUT_MS + idle watchdog(~5min 无正文即重连)共同决定,非本值;
+   *  生产实证曾挂 4172s(69.5min)后成功放行续接。详见 holdConfig.ts BUDGET_MAX 注释。 */
   holdTotalBudgetMs?: number
   /** deadline 剩余不足此值即触发超时收尾 ms(默认 15000;clamp [1000,60000] 且 < holdTotalBudgetMs) */
   holdGraceMs?: number

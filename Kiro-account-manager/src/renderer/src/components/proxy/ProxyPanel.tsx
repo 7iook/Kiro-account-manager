@@ -1308,6 +1308,73 @@ export function ProxyPanel() {
                   />
                 </div>
               </div>
+              {/* 挂起门闸参数（仅在门闸开启时可编辑；运行时热生效，故不受 isRunning 限制） */}
+              <div className="col-span-3 grid grid-cols-3 gap-x-3 items-end">
+                <div className="space-y-1.5">
+                  <Label htmlFor="holdTotalBudgetMin" className="text-xs" title={isEn ? 'Max total time one request may stay held, from the moment it arrived (all retries and holds share this budget; it never resets). Default 28 min, up to 6 h. Note: the client may still drop and auto-reconnect roughly every 5 min while held — that is the client idle watchdog, not this budget.' : '单个请求从进来那一刻起最多可以挂多久（多次重试/多次挂起共享同一预算，全程不重置）。默认 28 分钟，最长 6 小时。注意：挂起期间客户端仍可能每约 5 分钟断开并自动重连，那是客户端自身的空闲看门狗，不是这个预算用完了。'}>{isEn ? 'Hold Budget (min)' : '挂起预算（分钟）'}</Label>
+                  <Input
+                    id="holdTotalBudgetMin"
+                    type="number"
+                    min={1}
+                    max={360}
+                    step={1}
+                    value={Math.round((config.holdTotalBudgetMs ?? 1680000) / 60000)}
+                    onChange={(e) => {
+                      const min = parseInt(e.target.value) || 28
+                      const ms = min * 60000
+                      setConfig(prev => ({ ...prev, holdTotalBudgetMs: ms }))
+                      window.api.proxyUpdateConfig({ holdTotalBudgetMs: ms })
+                    }}
+                    disabled={!config.holdWhenNoAccount}
+                    className="h-9"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="holdMaxWaitMin" className="text-xs" title={isEn ? 'How long to wait before re-checking the account pool on its own, when no event woke the held request up. This is a safety-net poll interval, NOT the hold time limit — it covers cases like a quota window recovering on its own. Default 10 min.' : '当没有任何事件唤醒挂起请求时，隔多久主动复查一次账号池。这是兜底轮询周期，不是挂起时长上限 —— 用于覆盖「额度到点自己恢复」这类无事件场景。默认 10 分钟。'}>{isEn ? 'Recheck Every (min)' : '兜底复查（分钟）'}</Label>
+                  <Input
+                    id="holdMaxWaitMin"
+                    type="number"
+                    min={1}
+                    max={360}
+                    step={1}
+                    value={Math.round((config.holdMaxWaitMs ?? 600000) / 60000)}
+                    onChange={(e) => {
+                      const min = parseInt(e.target.value) || 10
+                      const ms = min * 60000
+                      setConfig(prev => ({ ...prev, holdMaxWaitMs: ms }))
+                      window.api.proxyUpdateConfig({ holdMaxWaitMs: ms })
+                    }}
+                    disabled={!config.holdWhenNoAccount}
+                    className="h-9"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="holdTimeoutAction" className="text-xs" title={isEn ? 'What to do when the hold budget finally runs out. Keep waiting = never give up on its own (the client decides when to stop). Report error = tell the client it failed so it can retry. Finish cleanly = end the reply with a short notice.' : '挂起预算最终用完时怎么收尾。继续等 = 自己绝不放弃（由客户端决定何时停）。报错 = 告诉客户端失败了、让它自己重试。优雅结束 = 回一句提示后干净收尾。'}>{isEn ? 'When Budget Ends' : '预算用完时'}</Label>
+                  {/* Select 组件不支持 disabled（共享 UI，不为本处单独改动其契约）→
+                      门闸关闭时渲染只读占位，保持与左侧两个输入框一致的"不可编辑"观感。 */}
+                  {config.holdWhenNoAccount ? (
+                    <Select
+                      value={config.holdTimeoutAction ?? 'keep_blocking'}
+                      options={[
+                        { value: 'keep_blocking', label: isEn ? 'Keep waiting' : '继续等', description: isEn ? 'Never give up on its own' : '自己绝不放弃' },
+                        { value: 'error', label: isEn ? 'Report error' : '报错', description: isEn ? 'Let the client retry' : '让客户端自己重试' },
+                        { value: 'graceful_stop', label: isEn ? 'Finish cleanly' : '优雅结束', description: isEn ? 'End with a short notice' : '回一句提示后收尾' }
+                      ]}
+                      onChange={(value) => {
+                        const action = value as 'keep_blocking' | 'error' | 'graceful_stop'
+                        setConfig(prev => ({ ...prev, holdTimeoutAction: action }))
+                        window.api.proxyUpdateConfig({ holdTimeoutAction: action })
+                      }}
+                    />
+                  ) : (
+                    <div className="flex items-center h-9 px-3 rounded-md border border-input bg-transparent opacity-50">
+                      <span className="text-xs text-muted-foreground">
+                        {isEn ? 'Keep waiting' : '继续等'}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </div>
               {/* Agent Mode + Workspace Path（Steering 文件注入） */}
               <div className="col-span-3 grid grid-cols-3 gap-x-3 items-end">
                 <div className="space-y-1.5">

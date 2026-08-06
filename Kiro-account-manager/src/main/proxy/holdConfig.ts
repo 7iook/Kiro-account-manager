@@ -10,8 +10,8 @@ import type { HoldGateRuntimeConfig, HoldTimeoutAction } from './holdGate'
 /** 挂起门闸运行配置默认值(方案 §3 表)。 */
 export const HOLD_DEFAULTS: HoldGateRuntimeConfig = {
   pingIntervalMs: 10000, // 10s < 45s watchdog
-  maxWaitMs: 600000, // 10min
-  totalBudgetMs: 1680000, // 28min < 客户端 30min 硬顶
+  maxWaitMs: 600000, // 10min · 兜底轮询周期(非单请求挂起上限,上限由 totalBudgetMs 定)
+  totalBudgetMs: 1680000, // 28min · 保持默认不变(升到 6h 需用户显式设,避免静默改行为)
   graceMs: 15000, // 15s
   timeoutAction: 'keep_blocking'
 }
@@ -20,7 +20,15 @@ export const HOLD_DEFAULTS: HoldGateRuntimeConfig = {
 const PING_MIN = 1000
 const PING_MAX = 40000 // < 45s watchdog
 const BUDGET_MIN = 10000
-const BUDGET_MAX = 1740000 // 29min,硬留 1min < 客户端 30min 顶
+// 实测 2026-08-06(claude-cli/2.1.220 · 探针实验):客户端总超时由 API_TIMEOUT_MS 决定,
+// 默认 600000(10min),可由用户上调(本机实测设为 1800000=30min 生效)。旧注释写的
+// 「客户端 30min 顶」源自误读 —— 那个 1800000 是 429 退避时长常量,不是请求超时。
+// 真正掐断挂起的是客户端 idle watchdog:v2.1.196 起默认开启,无语义正文字节则 ~5min
+// 断开重连(实测掐断周期恒定 310s,ping 心跳不算正文、挡不住它)。
+// 故预算上限不再假设客户端顶,取 6h —— 与客户端 rate-limit reset 上限同量级;
+// 真实可挂时长由「客户端 API_TIMEOUT_MS」与「idle watchdog 重连」共同决定,非本值。
+// 生产实证:曾成功挂起 4172s(69.5min)后放行续接,故上限必须 > 1h。
+const BUDGET_MAX = 21600000 // 6h
 const GRACE_MIN = 1000
 const GRACE_MAX = 60000
 
