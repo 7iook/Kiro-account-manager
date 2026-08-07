@@ -2456,6 +2456,36 @@ export function classifyKiroStopReason(
   return mk('incomplete', true)
 }
 
+/**
+ * 断点尾部形态取样(2026-08-07 · 诊断 GPT 中途硬断)。
+ *
+ * 只返回**形状**,绝不返回原文 —— 请求正文属用户隐私,日志会进 UI 面板并可能被截图外传。
+ * 判断依据:上游「发完才关流」的尾部通常以句末标点收束;「传输中被掐断」的尾部
+ * 常停在半个词/半个标识符/中文句中,或以逗号、连接词类字符结尾。
+ *
+ * @returns endsSentence 是否以句末标点收束 · tailClass 末字符类别 · tailLen 取样长度
+ */
+export function sampleTailShape(text: string): {
+  endsSentence: boolean
+  tailClass: string
+  tailLen: number
+} {
+  const trimmed = (text || '').replace(/\s+$/u, '')
+  if (!trimmed) return { endsSentence: false, tailClass: 'empty', tailLen: 0 }
+  const last = trimmed[trimmed.length - 1]!
+  // 句末标点(中英双语):这些结尾强烈暗示上游把话说完了
+  const endsSentence = /[。！？.!?；;」』】)\]}]/u.test(last)
+  const tailClass =
+    endsSentence ? 'sentence_end'
+    : /[,、，:：]/u.test(last) ? 'comma'        // 停在逗号 = 话没说完
+    : /[\p{Script=Han}]/u.test(last) ? 'han'    // 停在汉字中间
+    : /[A-Za-z]/u.test(last) ? 'latin'          // 停在半个英文词
+    : /[0-9]/u.test(last) ? 'digit'
+    : /[`'"*_~#>|/\\-]/u.test(last) ? 'markup'  // 停在 markdown/代码标记里
+    : 'other'
+  return { endsSentence, tailClass, tailLen: trimmed.length }
+}
+
 // 解析 AWS Event Stream 二进制格式
 async function parseEventStream(
   body: ReadableStream<Uint8Array>,
@@ -2501,6 +2531,15 @@ async function parseEventStream(
   let diagToolInputParseFailures = 0               // tool input JSON 解析失败次数
   let diagFramesParsed = 0
   let diagLastTotalLength = 0
+  // ===== 断点形态取证补强(2026-08-07 · 用户报「GPT 中途硬断,最后一句说个『继续』就没了」)=====
+  // 现有埋点能答「断在哪」(exit 四态 + residualBytes),不能答「断之前上游是发完了还是被掐断」——
+  // 而这两者处置相反(前者=模型行为,反代无解;后者=传输层,可重试)。补两组读数:
+  //   A 尾部形态:断点前最后一段正文的**形状**(长度/是否完整句尾/末尾字符类别),不落原文
+  //   B 时间轴:首字节→末 chunk→流终止 的间隔。末 chunk 到终止有明显静默 = 上游挂起后超时;
+  //            紧邻 = 上游主动关流(模型自己收尾)
+  let diagFirstByteAt = 0        // 首个 chunk 到达时刻(ms,performance 单调时钟)
+  let diagLastChunkAt = 0        // 最后一个 chunk 到达时刻
+  let diagChunkCount = 0         // 上游 chunk 数(区分「一次性返回」与「真流式」)
   
   // 初始化 input tokens 估算（优先级链路：tokenUsage > contextUsage 反推 > tiktoken > 字符系数）
   // 这里只是兜底初值，后续真实事件会覆盖
@@ -2796,6 +2835,11 @@ async function parseEventStream(
       }
     }
     const hasSemanticOutput = totalOutputChars > 0 || processedIds.size > 0 || leakedTools.length > 0
+    // 断点形态(2026-08-07):尾部只落形状不落原文;时间轴用于区分「上游主动关流」与「挂起后超时」
+    const tail = sampleTailShape(collectedOutputText)
+    const nowAt = performance.now()
+    const silenceMs = diagLastChunkAt > 0 ? Math.round(nowAt - diagLastChunkAt) : -1
+    const streamSpanMs = diagFirstByteAt > 0 ? Math.round(diagLastChunkAt - diagFirstByteAt) : -1
     const line = `[STREAM-END] exit=${exitReason} residualBytes=${residual}`
       + ` claimedTotalLength=${claimedTotalLength} framesParsed=${diagFramesParsed}`
       + ` lastFrameLength=${diagLastTotalLength}`
@@ -2803,6 +2847,8 @@ async function parseEventStream(
       + ` semanticOutput=${hasSemanticOutput} outChars=${totalOutputChars} toolsDone=${processedIds.size}`
       + ` toolNames=[${diagToolNames.join(',')}] toolInputParseFail=${diagToolInputParseFailures}`
       + ` jsonSyntaxErrSwallowed=${diagJsonSyntaxErrors} leakCarryLeft=${leakCarry.length}`
+      + ` tailClass=${tail.tailClass} tailEndsSentence=${tail.endsSentence} tailLen=${tail.tailLen}`
+      + ` chunks=${diagChunkCount} streamSpanMs=${streamSpanMs} silenceBeforeEndMs=${silenceMs}`
       + ` events=${JSON.stringify(diagEventCounts)}`
       + (residual > 0 ? ` residualHead=${residualHead}` : '')
       + (errInfo ? ` err=${errInfo}` : '')
@@ -2824,6 +2870,11 @@ async function parseEventStream(
       if (done) {
         break
       }
+
+      // [STREAM-END] 取证:chunk 时间轴(纯读数,不影响控制流)
+      diagChunkCount++
+      diagLastChunkAt = performance.now()
+      if (diagFirstByteAt === 0) diagFirstByteAt = diagLastChunkAt
 
       // 合并缓冲区
       const newBuffer = new Uint8Array(buffer.length + value.length)
@@ -3429,6 +3480,18 @@ async function parseEventStream(
     throwIfAborted(signal)
     // [STREAM-END] 取证:residual>0 = 上游流在半截帧处断掉,但当前代码仍走 onComplete → 客户端收 end_turn
     emitStreamEndDiag(buffer.length > 0 ? 'eof_with_truncated_frame' : 'clean_eof')
+    // 2026-08-07 观测(尚未改处置):半截帧 EOF 是「上游流被硬掐断」的确证信号,
+    // 而 classifyKiroStopReason 只看 stopReason、看不到 residual —— 于是这里仍会
+    // 以 complete/tool_use 收场,客户端判本轮正常完成 → 静默停止(与 1d74a05 修掉的
+    // CONTENT_FILTERED 同一个病灶,但这条分支当时 458 条实测 residual 全为 0 未暴露)。
+    // 先只打独立告警确认这条分支是否真被命中;命中后再决定是否纳入 terminal 分类,
+    // 避免重蹈 e106792「基于未验证假设改行为、最后整块回滚」。
+    if (buffer.length > 0) {
+      proxyLogger.warn('Kiro', `[STREAM-TRUNCATED-FRAME] 上游在半截帧处断流但被当成正常完成:`
+        + ` residualBytes=${buffer.length} outChars=${totalOutputChars}`
+        + ` disposition=${usage.terminal?.disposition ?? 'none'}`
+        + ` stopReason=${diagUpstreamStopReason ?? 'ABSENT'}`)
+    }
     proxyLogger.info('Kiro', 'Stream complete, final usage', usage)
     onComplete(usage)
   } catch (error) {
