@@ -18,13 +18,28 @@ export interface PoolAccountRef {
 }
 
 /**
- * 反代服务实例的最小形状(账号池查询)。
+ * 反代服务实例的最小形状(账号池查询 + 真实额度回喂)。
  * getAccount 返回 `| null | undefined` 两种空值:ProxyServer 实际返回 null,
  * 这里放宽以兼容(调用方一律 `?.proxyUrl`,两者行为相同)。
  */
 export interface ProxyServerRef {
   getAccountPool: () => {
     getAccount: (id: string) => PoolAccountRef | null | undefined
+    /**
+     * 把刚从上游拿到的真实额度喂回池 —— 池据此在**请求打过去之前**就知道号已用光,
+     * 而不是等一个 402 失败请求才知道(见 `proxy/accountPool.ts:updateQuota` 注释)。
+     *
+     * 声明在这里而非 import 池类型:业务层不得依赖 `proxy/*`(会形成
+     * accountService→proxy 反向依赖)。`resetAt` 是 **epoch ms**,ISO→epoch 的
+     * 转换责任在调用方(盘上/上游是 ISO string)。
+     */
+    updateQuota: (
+      accountId: string,
+      used: number,
+      limit: number,
+      resetAt?: number,
+      observedAt?: number
+    ) => void
   }
 }
 

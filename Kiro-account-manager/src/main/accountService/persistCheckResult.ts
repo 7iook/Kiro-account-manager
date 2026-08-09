@@ -40,6 +40,69 @@
 import { applyAccountDataMutation, type AccountsBlob } from './state'
 import { persistAccountPatch, asRecord, type PersistOutcome } from './persistAccountPatch'
 import type { CheckAccountStatusData } from './check'
+import type { ProxyServerRef } from './types'
+import { nextObservationVersion } from '../utils/observationClock'
+
+/**
+ * 把刚落盘的真实额度同时喂进反代账号池 —— **`updateQuota` 的唯一生产调用方**。
+ *
+ * ## 为什么收口在落盘层
+ *
+ * 池此前只能从一个 402 失败请求得知「这个号没额度了」（`accountPool.recordError`），
+ * 于是每次换号先赔一个失败请求。真实余量本来就在手上 —— 刷新额度的响应里 ——
+ * 只是从来没人把它交给池（`updateQuota` 自 v1.6.0 起零生产调用方）。
+ *
+ * 落盘层是「刚从上游拿到真实额度」的**唯一**汇聚点：桌面单账号检查、面板 HTTP、
+ * 批量检查三条路都经这里。挂在这里 ⇒ 恰好一个写者。
+ *
+ * **刻意不挂在别处**：`quotaUsed/quotaLimit` 与 `quotaExhaustedAt` 是同一状态机的字段，
+ * 而 `recordError`（402 打标）/ `recordSuccess`（清误标）已经是两个写者。再加一个不同
+ * 新鲜度的写者就会出现「A 说 90/100、B 说 20/100，谁赢取决于调度顺序」，而赢错一次的
+ * 代价是账号被钉死到 `quotaResetAt`（`recordSuccess` 的 realQuotaUsedUp 短路刻意不清
+ * 真实额度数据）。池侧的 `observedAt` 仲裁是第二道保险，不是替代。
+ *
+ * ## 失败语义:绝不让喂池失败拖垮落盘
+ *
+ * 额度已经落盘是**既成事实**，喂池只是让反代早一点知道。这里 catch 后只记日志：
+ * 抛出去会让「刷新额度」整体失败（`check.ts:197` 把落盘异常翻译成用户可见错误），
+ * 那是用一个次要动作的失败否掉一个已经成功的主要动作。**绝不静默** —— 日志是唯一出口。
+ *
+ * @param proxy 反代实例；未运行时为 null/undefined ⇒ 整体 no-op（不是错误）
+ * @param nextResetDate 上游给的下次重置时刻（**ISO string**）；这里转成 epoch ms 传给池
+ * @param observedVersion 这份数据的**观测版本** —— 由 `nextObservationVersion()` 在上游请求
+ *   **发出前**铸造并一路带到这里,供池侧丢弃迟到的旧响应。
+ *
+ *   ⚠️ **绝不在这里现取** `Date.now()`:那记录的是完成顺序,而先发出的慢响应会晚于
+ *   后发出的快响应完成,于是旧数据反而拿到更大的值并覆盖新数据(决策卡 T-9)。
+ *   缺省(未传)⇒ 回落到 `nextObservationVersion()`,即「就当它是此刻发起的观测」——
+ *   不比修复前更差,但也拿不到因果顺序,故所有生产调用方都应显式传入。
+ */
+export function feedQuotaToPool(
+  proxy: ProxyServerRef | null | undefined,
+  accountId: string | undefined,
+  usage: { current?: number; limit?: number; nextResetDate?: string } | null | undefined,
+  observedVersion: number = nextObservationVersion()
+): void {
+  if (!proxy || !accountId || !usage) return
+  const { current, limit } = usage
+  // 准入(数值合法性 / 占位值 {0,0} / 时序)由池侧 `updateQuota` 统一把关 ——
+  // 判据只该有一份。这里只做「类型是不是数」这一层，避免把 undefined 送进去。
+  if (typeof current !== 'number' || typeof limit !== 'number') return
+
+  try {
+    const pool = proxy.getAccountPool()
+    // 上游/盘上是 ISO string，池里是 epoch ms（沿 `verify.ts:447` 既有写法）。
+    // 无效日期 → undefined，绝不把 NaN 写进池（那会让恢复判据静默失效）。
+    const resetAtMs = usage.nextResetDate ? new Date(usage.nextResetDate).getTime() : undefined
+    const resetAt = resetAtMs !== undefined && Number.isFinite(resetAtMs) ? resetAtMs : undefined
+    pool.updateQuota(accountId, current, limit, resetAt, observedVersion)
+  } catch (e) {
+    console.error(
+      `[accountService/feedQuotaToPool] failed to feed quota for ${accountId} (额度已落盘，池未更新):`,
+      e
+    )
+  }
+}
 
 /**
  * 落盘结果 —— 调用方（业务函数）据此决定日志级别，不用 try/catch 猜。
@@ -168,20 +231,38 @@ export function patchAccountWithCheckResult(
  *
  * @param accountId 账号 id（调用方入参快照里的 id）
  * @param data 成功的 check 结果
+ * @param proxy 反代实例（可选）；给了就把真实额度同时喂进账号池，让反代**在下一个请求
+ *   打过去之前**就知道这个号还剩多少。未运行 / 不传 ⇒ 只落盘，行为与此前一致。
  * @throws 写盘异常向上抛 —— 调用方负责记录（绝不在这里吞掉后假装成功）
+ * @param observedVersion 这份额度的观测版本（`nextObservationVersion()`，由
+ *   `check.ts:checkAccountStatus` 在**上游请求发出前**铸造）。缺省 ⇒ 此刻铸造一个
+ *   （行为不劣于修复前，但失去因果顺序）。
  */
 export async function persistCheckResult(
   accountId: string | undefined,
-  data: CheckAccountStatusData
+  data: CheckAccountStatusData,
+  proxy?: ProxyServerRef | null,
+  observedVersion?: number
 ): Promise<PersistCheckOutcome> {
   const now = Date.now()
   // 盘面遍历 / 账号不存在的中止 / 仲裁结果异常，全部收在 ./persistAccountPatch
   // （与「刷新 Token」共用同一条持久化路径）。这里只提供「覆盖哪几个键」。
-  return persistAccountPatch(
+  const outcome = await persistAccountPatch(
     accountId,
     (current) => patchAccountWithCheckResult(current, data, now),
     'persistCheckResult'
   )
+
+  // 只在真的落盘成功后才喂池 —— 盘上没有的数字不该在池里生效（账号可能刚被另一端删了）。
+  //
+  // ⚠️ 喂池传的是 `observedVersion`（请求发出前铸造）而**不是** `now`（落盘时刻）：
+  // 后者表示完成顺序，先发出的慢响应会因为完成得晚而拿到更大的值，从而用旧额度
+  // 覆盖新额度。`now` 仍用于落盘的 `lastCheckedAt`（那里要的确实是"何时刷的"）。
+  if (outcome.persisted) {
+    feedQuotaToPool(proxy, accountId, data.usage, observedVersion)
+  }
+
+  return outcome
 }
 
 // ============ 批量检查（background-batch-check）的落盘 ============
@@ -236,7 +317,19 @@ export interface BatchCheckResultData {
 
 /** 一条批量结果（成功 / 失败两种形状，与 emit 的 payload 同构） */
 export type BatchCheckItem =
-  | { id: string; success: true; data: BatchCheckResultData }
+  | {
+      id: string
+      success: true
+      data: BatchCheckResultData
+      /**
+       * 这份额度的**观测版本**（`nextObservationVersion()`，在该账号的上游请求发出前取）。
+       *
+       * 随条目走而不是按批走:切片内各账号并发、上游快慢不同,按批共用一个版本会让
+       * 同一账号在相邻两轮批量间失去可比顺序。缺省(旧调用方 / 事件回放)⇒ 落盘层
+       * 回落到发起时刻,行为不劣于修复前。
+       */
+      observedVersion?: number
+    }
   | { id: string; success: false; error?: string }
 
 /**
@@ -321,25 +414,34 @@ export function patchAccountWithBatchResult(
  *
  * 单次 `applyAccountDataMutation` 覆盖 N 个账号 ⇒ 一次 revision 递增 + 一条广播。
  *
+ * @param proxy 反代实例（可选）；给了就把这一片的真实额度也喂进账号池。
+ *   批量与单账号必须走同一条喂池路径 —— 漏了会表现成「单个刷新有效、批量刷新无效」的
+ *   诡异不一致，而用户最常用的恰恰是批量刷新。
  * @returns 实际写进盘的账号数；`0` 表示这一片没有任何账号仍在盘上（全被删了）—— 不写盘、不广播
  * @throws 写盘异常向上抛，调用方决定是否中断
  */
-export async function persistBatchCheckResults(items: BatchCheckItem[]): Promise<number> {
+export async function persistBatchCheckResults(
+  items: BatchCheckItem[],
+  proxy?: ProxyServerRef | null
+): Promise<number> {
   if (items.length === 0) return 0
 
   const now = Date.now()
   try {
     let applied = 0
+    const persistedIds: string[] = []
     const result = await applyAccountDataMutation((prev) => {
       const accounts = asRecord(prev.accounts)
       if (!accounts) throw new SkipPersist('account-not-found')
 
       const next: Record<string, unknown> = { ...accounts }
+      persistedIds.length = 0
       for (const item of items) {
         const target = asRecord(next[item.id])
         // 盘上已无此账号 = 另一端删了它。跳过，绝不重建。
         if (!target) continue
         next[item.id] = patchAccountWithBatchResult(target, item, now)
+        persistedIds.push(item.id)
         applied++
       }
 
@@ -349,7 +451,18 @@ export async function persistBatchCheckResults(items: BatchCheckItem[]): Promise
       return { ...prev, accounts: next } as AccountsBlob
     })
 
-    if (result.ok) return applied
+    if (result.ok) {
+      // 只喂真的落了盘的那些账号；失败项（`success:false`）本就不带 usage，
+      // feedQuotaToPool 会因 usage 缺失而 no-op —— 失败绝不能被当成「额度归零」写进池。
+      const persisted = new Set(persistedIds)
+      for (const item of items) {
+        if (!item.success || !persisted.has(item.id)) continue
+        // 版本随**条目**走（该账号自己的上游请求发出前铸造），不是 `now`：
+        // 切片内各账号并发、上游快慢不同，用落盘时刻会让先发出的慢响应赢。
+        feedQuotaToPool(proxy, item.id, item.data?.usage, item.observedVersion)
+      }
+      return applied
+    }
     throw new Error(
       `[accountService/persistBatchCheckResults] unexpected arbitration result: ${result.code}`
     )

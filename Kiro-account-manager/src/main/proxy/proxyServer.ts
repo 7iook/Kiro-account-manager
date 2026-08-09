@@ -77,7 +77,32 @@ export interface ProxyServerEvents {
   onPoolEmpty?: () => Promise<void> // 账号池为空时触发（冷启动懒加载）
   // 挂起门闸:当前被挂起(HELD)请求数变化时触发,驱动前端徽标/放行按钮态
   // 方案:.archive/2026-07-28/hold-gate-blocking/hold-gate-blocking-design.md §5
-  onHeldRequestsChanged?: (info: { count: number }) => void
+  onHeldRequestsChanged?: (info: HeldRequestsInfo) => void
+}
+
+/**
+ * 挂起自动放行读数(决策卡 hold-gate-auto-release §3 字段契约 · 三字段钉死)。
+ *
+ * 语义纪律(消除三端各自猜测):
+ * - `nextAutoReleaseAt` 的 `null` = 「没有下一次」(关闭 / 无挂起条目 / 反代未运行)。
+ *   **禁用 `0` 表达「无」** —— `0` 是合法 epoch。
+ * - 只推**绝对**时间戳:倒计时由前端 `nextAutoReleaseAt - Date.now()` 本地每秒渲染,
+ *   主进程不推倒计时数值(推送是事件驱动、倒计时是连续量)→ 推送频率不变。
+ * - `autoReleaseCount` 口径 = 一次 timer 触发 +1(哪怕该次放了 0 个条目),手动放行不计入。
+ */
+export interface HoldAutoReleaseState {
+  /** 调度器当前是否生效 = 自动放行配置值 && 挂起门闸总开关。 */
+  autoReleaseEnabled: boolean
+  /** 下次自动放行的绝对 epoch ms;`null` = 没有下一次。 */
+  nextAutoReleaseAt: number | null
+  /** 本次反代启动以来的自动放行**周期次数**(非条目数)。 */
+  autoReleaseCount: number
+}
+
+/** `onHeldRequestsChanged` 推送形状 + `proxy-get-held-requests` 返回形状(同一形状,单一构造点)。 */
+export interface HeldRequestsInfo extends HoldAutoReleaseState {
+  /** 当前挂起中的请求数。 */
+  count: number
 }
 
 type ModelModality = 'text' | 'audio' | 'image' | 'video' | 'pdf'
@@ -444,7 +469,7 @@ export class ProxyServer {
   /** 手动放行所有挂起请求(前端"放行"按钮 → IPC)。@returns 实际放行数(幂等,无挂起时 0)。 */
   releaseHeldRequests(): number {
     const released = this.holdGate.releaseAll()
-    this.events.onHeldRequestsChanged?.({ count: this.holdGate.getHeldCount() })
+    this.events.onHeldRequestsChanged?.(this.buildHeldRequestsInfo())
     return released
   }
 
@@ -458,9 +483,42 @@ export class ProxyServer {
     return this.holdGate
   }
 
+  /**
+   * 挂起自动放行状态(前端倒计时 + 累计次数 · 决策卡 §3 读数链路节点 2)。
+   *
+   * `autoReleaseEnabled` 取**生效值** = 自动放行配置值 && `holdWhenNoAccount`:
+   * 门闸总开关关闭时压根没有挂起条目可放,界面必须显示「未生效」而非「已开启」
+   * (决策卡 Must NOT #5:界面显示已开启而实际不执行)。
+   *
+   * 开关值读 `holdRuntimeConfig` 而非另走 HoldGate getter:该对象与 HoldGate 持有的是
+   * **同一引用**(构造时注入 + updateConfig 原地 `Object.assign`),故两侧视角不会漂移,
+   * 且少一个跨模块符号依赖。
+   */
+  getHoldAutoReleaseState(): HoldAutoReleaseState {
+    return {
+      autoReleaseEnabled: this.holdRuntimeConfig.autoReleaseEnabled && !!this.config.holdWhenNoAccount,
+      // null = 没有下一次;不做 `?? 0` 之类的兜底 —— 0 是合法 epoch,会被前端当成 1970 年。
+      nextAutoReleaseAt: this.holdGate.getNextAutoReleaseAt(),
+      autoReleaseCount: this.holdGate.getAutoReleaseCount()
+    }
+  }
+
+  /**
+   * 挂起读数的**单一构造点**:IPC 拉取与 `onHeldRequestsChanged` 两个发射点共用它。
+   *
+   * 为什么不在各处手抄字段:决策卡 §3 第 6 跳的失败行为是「两个发射点形状不一致 →
+   * 前端字段时有时无」。收口成一个方法后,该失败形态在结构上不可能出现。
+   */
+  private buildHeldRequestsInfo(): HeldRequestsInfo {
+    return {
+      count: this.holdGate.getHeldCount(),
+      ...this.getHoldAutoReleaseState()
+    }
+  }
+
   /** 触发挂起数变化事件(task#3 在 enterHold/abort 后调,驱动前端徽标)。 */
   emitHeldRequestsChanged(): void {
-    this.events.onHeldRequestsChanged?.({ count: this.holdGate.getHeldCount() })
+    this.events.onHeldRequestsChanged?.(this.buildHeldRequestsInfo())
   }
 
   /**
@@ -595,6 +653,13 @@ export class ProxyServer {
           outputTokens: 0,
           startTime: Date.now()
         }
+        // 挂起门闸的会话态同口径归零(自动放行累计次数 + 残留条目 + 调度器)。
+        // 门闸实例在构造函数里建一次、**不随 stop/start 重建**,故不显式复位就会把上一会话的
+        // 累计次数带进新会话(界面显示 2 而不是 0)。决策卡 §3 字段契约:「反代停止归零」。
+        this.holdGate.resetSessionState()
+        // 归零后立刻推一次:桌面端只在挂载时拉取一次、之后靠推送更新,若不推,界面会一直
+        // 显示上一会话的累计值,直到下次挂起活动才被动刷新 —— 内存里归零 ≠ 用户看到 0。
+        this.emitHeldRequestsChanged()
         this.events.onStatusChange?.(true, this.config.port)
         // v1.7.6 能力路由 cold-start bootstrap: 反代启动 + 能力路由开关打开 → fire-and-forget 全池同步
         // 不 await, 让 start() resolve 后 UI 立即可用; 同步完成前请求走 filterByModel 会看到 unknown,
@@ -716,7 +781,12 @@ export class ProxyServer {
         this.sockets.clear()
         if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null }
         if (this.sessionSnapshotTimer) { clearInterval(this.sessionSnapshotTimer); this.sessionSnapshotTimer = null }
+        // 挂起门闸同 activeRequests / sockets 一起收尾:清残留条目 + 停调度器与兜底轮询 + 计数归零。
+        // 上面 activeRequests.forEach(abort) 已给客户端发过停服信号,门闸这一步只做作废(不发 hooks)。
+        // 不做会留下一个对着「已停的服务」定时放行的 interval,且下次 start 继承旧累计次数。
+        this.holdGate.resetSessionState()
         this.events.onStatusChange?.(false, this.config.port)
+        this.emitHeldRequestsChanged()
         resolve()
       }
 
@@ -761,10 +831,20 @@ export class ProxyServer {
     // HoldGate 持有同一对象 → 对之后 enterHold 的新请求即时生效。仅当传入任一 hold* 字段时才重算。
     const HOLD_KEYS: Array<keyof ProxyConfig> = [
       'holdWhenNoAccount', 'holdPingIntervalMs', 'holdMaxWaitMs', 'holdTotalBudgetMs',
-      'holdGraceMs', 'holdTimeoutAction', 'holdAutoResumeOnAvailable'
+      'holdGraceMs', 'holdTimeoutAction', 'holdAutoResumeOnAvailable',
+      // 自动放行两键必须在册:漏了则界面显示新值、运行中的门闸仍用旧值,且**静默无报错**
+      // (决策卡 §3 运行时链路第 1 跳的失败行为)。
+      'holdAutoReleaseEnabled', 'holdAutoReleaseIntervalMs'
     ]
     if (HOLD_KEYS.some(k => k in config)) {
       Object.assign(this.holdRuntimeConfig, normalizeHoldConfig(this.config))
+      // D1 裁决:改间隔必须**重建 timer**。
+      // 上面的原地 Object.assign 只让「字段值」热生效;已在跑的 setInterval 周期是
+      // 创建那一刻定死的,不重建会表现为「改了没反应」,用户只能靠重启反代碰运气。
+      this.holdGate.applyAutoReleaseConfig({
+        enabled: this.holdRuntimeConfig.autoReleaseEnabled && !!this.config.holdWhenNoAccount,
+        intervalMs: this.holdRuntimeConfig.autoReleaseIntervalMs
+      })
     }
     if (config.injectExecutionDirective !== undefined) {
       setInjectExecutionDirective(!!config.injectExecutionDirective)
@@ -4718,8 +4798,20 @@ export class ProxyServer {
     const entry = this.sessionAffinity.get(sessionHint)
     if (entry) {
       const account = this.accountPool.getAccount(entry.accountId)
-      // 校验账号仍可用且未被封禁
-      if (account && !this.accountPool.isSuspended(account) && account.isAvailable !== false) {
+      // 校验账号仍可用:未被封禁、未额度耗尽、未被显式标记不可用。
+      //
+      // isQuotaExhausted 必须在列 —— 它与 isSuspended 并列构成池对「长期不可用」的
+      // 判定(见 accountPool.hasBlockedAccount / isAccountAvailable,二者同为 SSOT)。
+      // 漏掉它的后果:账号 402 额度耗尽换号后,带固定 session id 的客户端仍被粘到旧号,
+      // 每个请求先发一发注定 402 的上游调用再进重试循环,持续到 600s TTL 过期;
+      // 而反应式换号路径(:1670 等)不经 activation.ts、不调 invalidateSessionAffinity,
+      // 没有任何下游机制能抵消。suspend 分支之所以自愈,正因为它的判据在这里。
+      if (
+        account &&
+        !this.accountPool.isSuspended(account) &&
+        !this.accountPool.isQuotaExhausted(account) &&
+        account.isAvailable !== false
+      ) {
         entry.lastAt = Date.now()
         return account
       }

@@ -138,9 +138,26 @@ export class AccountPool {
   // 如果传入的 account 已带 suspended 字段（启动复原场景），保留其 suspended 状态
   addAccount(account: ProxyAccount): void {
     const suspended = this.isSuspended(account)
+    // 已在池的账号被重复 addAccount = 一次**全量重同步**（启动 / 改配置 / 面板 syncPool /
+    // 热切换，共 6 个生产调用点）。入参来自盘上映射 `toProxyAccountShared`，它**不产出任何
+    // quota 字段** —— 于是重置式写入会把运行期积累的额度状态抹回 undefined。
+    //
+    // 后果是「改完就静默失效」那一类：真实额度刚喂进池，下一次同步就没了，
+    // isQuotaExhausted 的第三条判据重新变成永远为 false，本轮交付等于没做。
+    // 402 打的 quotaExhaustedAt 同族同理 —— 抹掉它等于「重同步一下就把耗尽的号放回轮询」。
+    //
+    // 用 `??` 而非无条件保留：启动复原时入参**自带** quota 字段（那是盘上的权威值），
+    // 必须以入参为准；只有入参没说的时候才保留池内既有值。
+    // 与 upsertAccount(:201-219) 剔除运行期状态字段是同一意图，这里是它的 addAccount 侧对偶。
+    const prev = this.accounts.get(account.id)
     this.notifyIfBecameAvailable(() => {
       this.accounts.set(account.id, {
         ...account,
+        quotaUsed: account.quotaUsed ?? prev?.quotaUsed,
+        quotaLimit: account.quotaLimit ?? prev?.quotaLimit,
+        quotaResetAt: account.quotaResetAt ?? prev?.quotaResetAt,
+        quotaUpdatedAt: account.quotaUpdatedAt ?? prev?.quotaUpdatedAt,
+        quotaExhaustedAt: account.quotaExhaustedAt ?? prev?.quotaExhaustedAt,
         isAvailable: !suspended,
         requestCount: 0,
         errorCount: 0,
@@ -599,10 +616,43 @@ export class AccountPool {
     })
   }
 
-  // 更新账号配额信息
-  updateQuota(accountId: string, used: number, limit: number, resetAt?: number): void {
+  /**
+   * 从上游权威额度数据更新账号配额 —— 「账号已用光」这条判据的**唯一**主动数据源。
+   *
+   * 生产调用方唯一:`accountService/persistCheckResult` 落盘收口(经注入的 sink)。
+   * 刻意只有一个写者:`quotaUsed/quotaLimit` 与 `quotaExhaustedAt` 是同一状态机的字段,
+   * 而 `recordError`(402 打标)/ `recordSuccess`(清误标)已经是两个写者。再加不同新鲜度的
+   * 第三个写者就会出现「A 说 90/100、B 说 20/100,谁赢取决于调度顺序」,而赢错一次的代价是
+   * 账号被钉死到 quotaResetAt(recordSuccess 的 realQuotaUsedUp 短路刻意不清真实额度数据)。
+   *
+   * @param used 已用额度(credits,可带小数)
+   * @param limit 额度上限(credits)
+   * @param resetAt 上游给的下次重置时刻(**epoch ms**;盘上/上游是 ISO string,转换在调用方做)
+   * @param observedAt 这份数据的**观测版本**;用于丢弃并发刷新中迟到的旧响应。
+   *   由调用方在**上游请求发出前**铸造(`utils/observationClock.nextObservationVersion`),
+   *   不是写入时刻 —— 写入时刻表示完成顺序,而先发出的慢响应会晚于后发出的快响应完成,
+   *   于是旧数据反而拿到更大的值。这个值**只可用于互相比较**,不是时间(同毫秒并发时会
+   *   比真实墙钟大),绝不可拿去显示或算时间差。
+   */
+  updateQuota(accountId: string, used: number, limit: number, resetAt?: number, observedAt: number = Date.now()): void {
     const account = this.accounts.get(accountId)
     if (!account) return
+
+    // ---- 准入:坏数据一律不写(守在入口,而不是靠远处的判据兜住)----
+    //
+    // limit <= 0 不是「额度为零」而是「还没查过」:importApiKey 导入 ksk_ 后额度是占位的
+    // {current:0, limit:0}(webPanel/routes.ts:297 注释)。把它当额度写入 = 凭空造一个额度事实;
+    // 更要紧的是「一池未刷新的新账号」会整池看起来全部耗尽 → availableCount 归零 →
+    // 挂起门闸冻结所有请求(RCA 2026-08-04 的用户可感知形态:「账号明明正常却被拦住」)。
+    //
+    // NaN 同样必须拒:它会让 `used >= limit` 恒为 false,判据静默失效而无任何报错。
+    if (!Number.isFinite(limit) || limit <= 0) return
+    if (!Number.isFinite(used) || used < 0) return
+
+    // ---- 时序仲裁:迟到的旧响应不得覆盖新数据 ----
+    // checkAccountStatus 并发执行,singleFlight 只按 id 去重、跨轮次不保序 ⇒ 一个慢响应
+    // 回来就能把新数字按回旧值。相等放行(同毫秒不算迟到)。
+    if (account.quotaUpdatedAt !== undefined && observedAt < account.quotaUpdatedAt) return
 
     const wasExhausted = this.isQuotaExhausted(account)
     this.notifyIfBecameAvailable(() => {
@@ -610,7 +660,15 @@ export class AccountPool {
         ...account,
         quotaUsed: used,
         quotaLimit: limit,
-        quotaResetAt: resetAt,
+        quotaUpdatedAt: observedAt,
+        // 上游给了重置时刻就以它为准;没给则**保留既有值**,绝不抹成 undefined。
+        // quotaResetAt 是 isQuotaExhausted 的第一条判据(见 :410),也是 recordError
+        // 在 402 时按 quotaResetMs 写入的唯一自动恢复时刻 —— 无条件覆盖会让调用方
+        // 在拿不到上游 nextResetDate 时(按现签名调 updateQuota(id,used,limit))
+        // 悄悄抹掉它,该账号退化成「只能靠 used<limit 或人工 reset 恢复」,时间到点永不自愈。
+        // 与同文件既定约定一致:recordSuccess(:507) 刻意保留该字段、recordError(:578)
+        // 仅在缺失/已过期时才顺延、AVAILABILITY_FIELDS(:182) 将其列为受保护可用性字段。
+        quotaResetAt: resetAt ?? account.quotaResetAt,
         // 如果配额从耗尽恢复，清除耗尽标记
         quotaExhaustedAt: (used < limit) ? undefined : account.quotaExhaustedAt
       })
@@ -698,11 +756,144 @@ export class AccountPool {
   }
 
   // 清空所有账号
+  //
+  // ⚠️ 全量重同步(clear→addAccount)**不要**直接用这个方法 —— 用 {@link replaceAll}。
+  // 本方法是无条件遗忘:清空后 addAccount 里的 `prev` 必然为 undefined,于是那里的
+  // `?? prev` 保留法结构上失效,运行期状态(真实额度 / 402 耗尽标记 / 风控挂起 /
+  // 断路器计数)全部随之消失。留它是因为"忘掉一切"本身是合法语义(测试 / 显式清池)。
   clear(): void {
     this.accounts.clear()
     this.accountStats.clear()
     this.swrr.reset()
     this.currentIndex = 0
+  }
+
+  /**
+   * 按新名单**整池重建**,并按 id 迁移运行期状态 —— 全量重同步的唯一入口。
+   *
+   * ## 为什么必须是池自己的方法,而不是调用方各自 clear + addAccount
+   *
+   * 生产有四个「按盘上账号重建整池」的点(自启动 / replace 热替换 /
+   * `proxy-sync-accounts` IPC / 面板 syncPool)。它们此前各写一遍
+   * `pool.clear(); accounts.forEach(a => pool.addAccount(a))`,而 `clear()` 清空了
+   * `accounts` ⇒ `addAccount` 的 `?? prev` 无源可读 ⇒ 每次重同步抹掉全部运行期状态。
+   * 那个缺陷的用户可感知形态是:面板点一次「同步池」,刚喂进去的真实额度和 402
+   * 打的耗尽标记一起消失,已耗尽的号重新进入轮询,而挂起门闸的「池空了吗」判据
+   * 从一份被抹干净的状态上算出来。
+   *
+   * 收口成一个方法而不是在四处各自记得保留:调用方"记得"是靠不住的,
+   * 第五个调用点出现时又会漏一次(Globalrules §4.3 SSOT)。
+   *
+   * ## 迁移哪些字段:判据是「谁是这份数据的权威源」
+   *
+   * 入参来自 `toProxyAccountShared`(activation.ts:223-265),它只产出**凭据与路由**
+   * (token / region / profileArn / proxyUrl / weight / groupId)。凡是它不产出、
+   * 只有运行期才知道的字段,盘上就没有权威值,重建时抹掉等于凭空丢事实:
+   *
+   *   - 额度四件套 `quotaUsed/quotaLimit/quotaResetAt/quotaUpdatedAt` —— 唯一来源是
+   *     上游测活(`updateQuota`);`quotaUpdatedAt` 必须一起迁,否则时序仲裁失去基准,
+   *     一个迟到的旧响应就能把新数字按回去。
+   *   - `quotaExhaustedAt` —— 402 打的耗尽标记。
+   *   - 风控挂起三件套 `suspendedAt/suspendReason/suspendMessage` + `isAvailable` ——
+   *     需人工解封,抹掉 = 「同步一下池就把封号放回轮询」(RCA §4.2b,
+   *     `.archive/2026-07-28/proxy-hot-switch-single-account/`)。与额度同等对待,
+   *     因为两者都是"只有运行期知道、且抹掉会让坏号被选中"的状态。
+   *   - 断路器 `errorCount` + `lastUsed` —— 必须**成对**迁移:退避窗口是
+   *     `now - lastUsed < base * 2^(errorCount-1)`(见 :356-372),只迁一个会让
+   *     窗口算错。抹掉 = 每次重同步都免费清零重试预算,一个持续失败的号
+   *     被无限重试而永远等不到退避。
+   *   - `modelCapabilities/lastListModelsAt/lastListModelsStatus` —— 来自
+   *     ListAvailableModels 探测,抹掉会让已探明的号退回 unknown 态并重新探测一轮。
+   *
+   * **刻意不迁移**(有意归零,不是遗漏):
+   *   - `requestCount` 与 `accountStats` —— 它们是"本轮池的统计",重建整池即新一轮;
+   *     `addAccount` 一直是这个语义,这里不改。注意 `lastUsed` 不属此列:它同时是
+   *     退避时钟,不是纯统计。
+   *   - `cooldownUntil` —— 全仓无写入点(只在 `describeBlockedAccounts` / `getQuotaStatus`
+   *     读、`reset()` 清),迁一个恒为 undefined 的字段是假装在处理它。真正生效的
+   *     冷却是 errorCount 指数退避。若将来有了写入点,它属于断路器族,应一起迁。
+   *   - 会话粘性(`proxyServer.sessionAffinity`)—— 不在账号对象里,由
+   *     `invalidateSessionAffinity` 独立管理,换号语义各调用点不同,不该由池代劳。
+   *
+   * @param accounts 新名单(通常是 `buildProxyAccountsFromStore` 的产物)
+   * @returns 本次重建后的池大小
+   */
+  replaceAll(accounts: readonly ProxyAccount[]): number {
+    // 迁移源必须在清空**之前**取快照 —— 这正是原缺陷的成因
+    const carry = new Map(this.accounts)
+    const carryStats = new Map(this.accountStats)
+
+    this.notifyIfBecameAvailable(() => {
+      // clear/addAccount 各自都带 notifyIfBecameAvailable,嵌套会在中间态(池已清空)
+      // 上算 availableCount。这里在外层包一次,内部走不通知的私有写入。
+      this.accounts.clear()
+      this.accountStats.clear()
+      this.swrr.reset()
+      this.currentIndex = 0
+
+      for (const account of accounts) {
+        const prev = carry.get(account.id)
+        this.accounts.set(account.id, this.mergeRuntimeState(account, prev))
+        // 统计沿用旧条目里的 requests/tokens/errors 归零语义,与 addAccount 一致,
+        // 但 lastUsed 跟随账号对象上的退避时钟,避免两处时间基准分叉。
+        this.accountStats.set(account.id, {
+          requests: 0,
+          tokens: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          errors: 0,
+          lastUsed: carryStats.get(account.id)?.lastUsed ?? 0,
+          avgResponseTime: 0,
+          totalResponseTime: 0
+        })
+      }
+    })
+
+    const migrated = accounts.filter((a) => carry.has(a.id)).length
+    console.log(
+      `[AccountPool] Pool rebuilt: ${accounts.length} accounts ` +
+      `(${migrated} kept runtime state, ${accounts.length - migrated} new, ${carry.size - migrated} dropped)`
+    )
+    return this.accounts.size
+  }
+
+  /**
+   * 把旧成员的运行期状态并进新映射产物。字段取舍的理由见 {@link replaceAll}。
+   *
+   * 一律用 `入参 ?? 旧值`:入参**说了**就以入参为准(启动复原时盘上带的是权威值),
+   * 只有入参没说的时候才保留池内既有值。
+   */
+  private mergeRuntimeState(account: ProxyAccount, prev: ProxyAccount | undefined): ProxyAccount {
+    if (!prev) {
+      // 新号入池:与 addAccount 同语义(按入参重算可用性,统计归零)
+      return { ...account, isAvailable: !this.isSuspended(account), requestCount: 0, errorCount: 0, lastUsed: 0 }
+    }
+    const merged: ProxyAccount = {
+      ...account,
+      // 额度族
+      quotaUsed: account.quotaUsed ?? prev.quotaUsed,
+      quotaLimit: account.quotaLimit ?? prev.quotaLimit,
+      quotaResetAt: account.quotaResetAt ?? prev.quotaResetAt,
+      quotaUpdatedAt: account.quotaUpdatedAt ?? prev.quotaUpdatedAt,
+      quotaExhaustedAt: account.quotaExhaustedAt ?? prev.quotaExhaustedAt,
+      // 风控挂起族(与额度同等对待,理由见 replaceAll 文档)
+      suspendedAt: account.suspendedAt ?? prev.suspendedAt,
+      suspendReason: account.suspendReason ?? prev.suspendReason,
+      suspendMessage: account.suspendMessage ?? prev.suspendMessage,
+      // 断路器族:成对迁移,否则退避窗口算错
+      errorCount: account.errorCount ?? prev.errorCount,
+      lastUsed: account.lastUsed ?? prev.lastUsed,
+      // 能力探测族
+      modelCapabilities: account.modelCapabilities ?? prev.modelCapabilities,
+      lastListModelsAt: account.lastListModelsAt ?? prev.lastListModelsAt,
+      lastListModelsStatus: account.lastListModelsStatus ?? prev.lastListModelsStatus,
+      // 刻意归零:本轮池的统计(见 replaceAll「刻意不迁移」)
+      requestCount: 0
+    }
+    // isAvailable 由合并后的挂起状态决定,不能按入参重算 —— 盘上映射不带 suspendedAt,
+    // 按它算会得出 true,那正是「切一下账号就静默解除风控封禁」那条 RCA 的成因。
+    merged.isAvailable = this.isSuspended(merged) ? false : (account.isAvailable ?? prev.isAvailable ?? true)
+    return merged
   }
 
   // 获取账号数量

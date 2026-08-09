@@ -50,6 +50,128 @@ import type { ProxyAccount, ProxyConfig } from './types'
 export const UNGROUPED_SENTINEL = '__ungrouped__'
 
 /**
+ * 后端侧封禁信号识别 —— 池准入的排除判据（主进程侧唯一真源）。
+ *
+ * 关键词集合是三份既有实现的并集：`index.ts:2476 isBannedAccountErrorMain`（主进程）、
+ * `renderer/components/accounts/_helpers.ts:167 isBannedError`、
+ * `webPanel/ui/format.ts:66 isBannedError`（后两份是浏览器侧渲染用，无法被主进程 import）。
+ *
+ * 判 `lastError` 文本而不是判 `status`：`status` 是显示字段，
+ * `persistCheckResult.ts:325` 的失败分支把**网络错误也写成 `'error'`**，
+ * 而封禁与否只有 `lastError` 里的上游原文能区分。
+ */
+export function isBackendRejectedError(lastError: unknown): boolean {
+  if (typeof lastError !== 'string' || lastError.length === 0) return false
+  const e = lastError.toLowerCase()
+  return (
+    e.includes('accountsuspendedexception') ||
+    e.includes('account suspended') ||
+    e.includes('temporarily_suspended') ||
+    e.includes('temporarily suspended') ||
+    e.includes('permanently_suspended') ||
+    e.includes('account_locked') ||
+    (e.includes('user id is') && e.includes('suspended')) ||
+    e.includes('已封禁') ||
+    // check.ts:601 在上游 userStatus 非 Active/Stale 时写下这条（Suspended / Disabled 等）
+    e.includes('用户状态异常') ||
+    /\b423\b/.test(e)
+  )
+}
+
+/** 一条被挡在池外的记录 —— 静默缩池是这个缺陷最贵的部分，必须能自证 */
+export interface PoolAdmissionSkip {
+  id: string
+  email?: string
+  reason: 'no_credentials' | 'backend_rejected'
+  detail?: string
+}
+
+/**
+ * 池准入判据：**有可用凭据 且 未被上游明确拒绝**。
+ *
+ * ## 为什么不判 `status === 'active'`（这一行曾经就是那么写的）
+ *
+ * `status` 是**显示字段**，它在 `fab59a8` 里被顺手当成了可用性闸门（该行零注释，
+ * 与同文件 `:220-224`、`accountPool.ts:194-199` 那些带 RCA 引用的刻意设计形成对比）。
+ * 而它的写入者语义各异：`persistCheckResult.ts:325` 的 `!item.success` 分支不区分
+ * 「被封禁」和「网当时没通」——`check.ts` 那个 catch-all 里的超时 / DNS 失败 /
+ * 连接被拒全部落成 `status:'error'`。
+ *
+ * 后果是已实证的：**一次断网时的后台批量测活足以把全部账号永久踢出反代池**，
+ * 而没有任何路径会自动把 `status` 写回 `'active'`（只有 UI 手点：
+ * `AccountCard.tsx:189` / `AccountListRow.tsx:266` / `store/accounts.ts:2300`）。
+ * 用户看到的是「池空」，而非「5 个号因为上次的网络抖动被挡在外面」。
+ *
+ * ## 排除项仍然守住原过滤器守住的那个性质
+ *
+ * 原 `status !== 'active'` 实际挡住两类东西，两类都保留：
+ *   1. 无 `accessToken` 的半条记录 → 仍挡（`toProxyAccountShared` 也会返回 null 兜底）
+ *   2. 已知被后端封禁的号 → 仍挡，判据换成 `lastError` 里的封禁原文（见
+ *      {@link isBackendRejectedError}）。这与 `index.ts:2566` 自动刷新调度器
+ *      早已在用的判据一致 —— 那里判的就是 `isBannedAccountErrorMain(acc.lastError)`
+ *      而不是 `status`，说明「用 lastError 判封禁」在本仓已是既有姿势。
+ *
+ * 被放进来的是 `status:'error'`(网络形状) / `'expired'` / `'unknown'` / `'refreshing'`：
+ * token 过期由池内 `isAccountAvailable` + `refreshToken` 自愈（`accountPool.ts:340-348`），
+ * 真封禁则由运行期 `markSuspended` 在第一次请求撞上 423 时接管 —— 那才是权威机制。
+ *
+ * ## 不碰运行期挂起
+ *
+ * 本判据只读盘上记录（`credentials` / `lastError`），**不产出也不清除**
+ * `suspendedAt` / `quotaExhaustedAt` / `isAvailable`。入池仍走 `upsertAccount`
+ * （`activation.ts:227` / 它会剔除运行期状态字段），所以「切一下账号就静默解除
+ * 运行期风控封禁」那条 RCA（`accountPool.ts:194-199`）不会被重新打开。
+ *
+ * @returns `undefined` = 准入；否则给出排除原因（供日志点名）
+ */
+export function checkPoolAdmission(record: Record<string, unknown>): PoolAdmissionSkip | undefined {
+  const id = asString(record.id)
+  if (!id) return undefined // 无 id 的脏条目由调用方在映射前跳过，不进准入统计
+  const email = asString(record.email)
+  const base = email !== undefined ? { id, email } : { id }
+
+  const cred = asRecord(record.credentials) ?? {}
+  if (!asString(cred.accessToken)) {
+    return { ...base, reason: 'no_credentials' }
+  }
+
+  const lastError = record.lastError
+  if (isBackendRejectedError(lastError)) {
+    return {
+      ...base,
+      reason: 'backend_rejected',
+      detail: typeof lastError === 'string' ? lastError.slice(0, 120) : undefined
+    }
+  }
+
+  return undefined
+}
+
+/**
+ * 把「被挡在池外的号」写进日志 —— 三个水合入口共用同一套措辞。
+ *
+ * 为什么必须有这一行：`describeBlockedAccounts()`（`accountPool.ts:454`）遍历的是
+ * `this.accounts.values()`，**被水合闸门滤掉的号根本不在池里**，所以永远不会出现在
+ * 那份「被封禁清单」里 —— 诊断信号恰好在最需要它的场景下消失。用户只能看到「池空」。
+ *
+ * @param source 水合入口标识（autostart / lazy-refill / panel-sync），便于定位是哪条路
+ */
+export function logPoolAdmissionSkips(skipped: PoolAdmissionSkip[], source: string): void {
+  if (skipped.length === 0) return
+  const detail = skipped
+    .map((s) => {
+      const who = s.email || s.id.slice(0, 8)
+      return s.reason === 'no_credentials'
+        ? `${who}: 无凭据`
+        : `${who}: 已被上游拒绝(${s.detail || '?'})`
+    })
+    .join(' · ')
+  console.warn(
+    `[PoolAdmission] ${source}: ${skipped.length} 个账号未入反代池 —— ${detail}`
+  )
+}
+
+/**
  * 编排所需的宿主能力。由 `index.ts` 用真实 `proxyServer` + `store` 注入。
  *
  * 抽成接口而不是直接 import 模块级 `proxyServer`：`index.ts` 里的
@@ -167,31 +289,43 @@ function resolveBoundProxyUrl(accountId: string, ctx: ProxyBindingContext): stri
 /**
  * 从盘上账号表构建池成员列表（同步整池用）。
  *
- * 过滤条件对齐既有两处内联映射：`status === 'active'` 且有 `accessToken`。
+ * 准入判据见 {@link checkPoolAdmission} —— **有凭据 且 未被上游明确拒绝**，
+ * 不是 `status === 'active'`（那会让一次断网测活把好号永久钉在池外）。
  * 脏条目跳过而不抛 —— 一条坏数据不该让整次同步失败（那会表现成"池是空的
  * 但启动成功"，即空池启动）。
+ *
+ * @param onSkipped 被挡在池外的号（不含分组未命中）；不传则静默 —— 生产调用方
+ *   应当传 {@link logPoolAdmissionSkips}，静默缩池是本缺陷最难诊断的部分
  */
 export function buildProxyAccountsFromStore(
   records: Record<string, unknown> | undefined,
-  ctx: ProxyBindingContext = {}
+  ctx: ProxyBindingContext = {},
+  onSkipped?: (skipped: PoolAdmissionSkip[]) => void
 ): ProxyAccount[] {
   if (!records) return []
   const groupFilter = ctx.groupIds ? new Set(ctx.groupIds) : null
   const out: ProxyAccount[] = []
+  const skipped: PoolAdmissionSkip[] = []
   for (const raw of Object.values(records)) {
     const a = asRecord(raw)
     if (!a) continue
-    if (asString(a.status) !== 'active') continue
     const id = asString(a.id)
     if (!id) continue
+    // 分组过滤先行：不在选定分组里不算「被挡在池外」，那是用户自己的选择，不该报警
     if (groupFilter) {
       const gid = asString(a.groupId)
       const hit = gid ? groupFilter.has(gid) : groupFilter.has(UNGROUPED_SENTINEL)
       if (!hit) continue
     }
+    const skip = checkPoolAdmission(a)
+    if (skip) {
+      skipped.push(skip)
+      continue
+    }
     const mapped = toProxyAccountShared(a, resolveBoundProxyUrl(id, ctx))
     if (mapped) out.push(mapped)
   }
+  if (skipped.length > 0) onSkipped?.(skipped)
   return out
 }
 

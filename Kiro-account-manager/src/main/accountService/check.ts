@@ -31,6 +31,7 @@ import type {
   BatchSummary,
   UserInfoLike
 } from './types'
+import { nextObservationVersion } from '../utils/observationClock'
 
 /** check-account-status 成功返回的 data 形状(与原 handler 逐字段一致) */
 export interface CheckAccountStatusData {
@@ -184,6 +185,10 @@ export async function checkAccountStatus(
   deps: AccountRuntimeDeps,
   account: AccountLike
 ): Promise<CheckAccountStatusResult> {
+  // 观测版本在**请求发出之前**取 —— 它标的是「这份额度是什么时候的事实」,
+  // 而不是「什么时候写完的」。上游快慢不一:先发出的请求可能最后才回来,
+  // 那时 Date.now() 更大,于是旧事实会覆盖新事实(决策卡 T-9 修的正是这个)。
+  const observedVersion = nextObservationVersion()
   const result = await performAccountStatusCheck(deps, account)
   if (!result.success) return result
 
@@ -194,7 +199,12 @@ export async function checkAccountStatus(
   // 用户看到一个重载即消失的数字 —— 正是本轮在修的那个 bug,只是变得更隐蔽。
   // 现实成因就两种:收口的 store 未注入（装配次序 bug）/ 写盘异常（磁盘满）,两者都该响。
   try {
-    const outcome = await persistCheckResult(account.id, result.data)
+    const outcome = await persistCheckResult(
+      account.id,
+      result.data,
+      deps.proxyServer,
+      observedVersion
+    )
     if (!outcome.persisted && outcome.reason === 'account-not-found') {
       // 另一端刚把这个账号删了。不是错误 —— 数据本身有效,只是没有归属可写。
       // 绝不重建（那是 C1/C3「已删账号复活」）。
@@ -435,6 +445,11 @@ export async function backgroundBatchCheck(
 
     await Promise.allSettled(
       batch.map(async (account) => {
+        // 每个账号**各自**发一次上游请求 ⇒ 各自一个观测版本,在自己的请求发出前取。
+        // 不能整批共用一个:切片内是 Promise.allSettled 并发,各账号的上游快慢不同,
+        // 共用一个版本等于宣称「这一批的额度是同一时刻的事实」,并让同一账号在
+        // 相邻两轮批量间失去可比顺序(下一轮的慢响应会与上一轮同分,写入侧相等即放行)。
+        const observedVersion = nextObservationVersion()
         try {
           const { accessToken, authMethod, provider } = account.credentials
 
@@ -619,7 +634,7 @@ export async function backgroundBatchCheck(
             success: true,
             data: resultData
           })
-          sliceResults.push({ id: account.id, success: true, data: resultData })
+          sliceResults.push({ id: account.id, success: true, data: resultData, observedVersion })
         } catch (e) {
           failed++
           completed++
@@ -639,7 +654,7 @@ export async function backgroundBatchCheck(
     // 结果已通过事件到达 UI，下次刷新会重新取到。绝不静默：日志是唯一可观测出口。
     if (sliceResults.length > 0) {
       try {
-        const applied = await persistBatchCheckResults(sliceResults)
+        const applied = await persistBatchCheckResults(sliceResults, deps.proxyServer)
         console.log(
           `[BackgroundCheck] Persisted ${applied}/${sliceResults.length} results of this slice`
         )
