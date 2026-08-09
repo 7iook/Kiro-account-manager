@@ -108,6 +108,14 @@ export interface PanelRouteDeps {
   proxyStart: () => Promise<ServiceLike>
   /** 停止反代 */
   proxyStop: () => Promise<ServiceLike>
+  /**
+   * 立刻放行全部挂起请求（挂起门闸的「放行」动作）。
+   *
+   * 复用既有 `ProxyServer.releaseHeldRequests()`，与桌面端按钮、自动放行调度器
+   * 同一入口。面板刻意**只有这一个动作**、不接受任何配置参数 —— 改间隔 / 改开关
+   * 留在桌面端（同上文「为什么没有 proxyUpdateConfig」的同一理由）。
+   */
+  proxyReleaseHeld: () => Promise<ServiceLike>
 }
 
 /** 已解析的请求上下文（路径已去掉 `/panel` 前缀） */
@@ -405,6 +413,13 @@ async function routeProxyApi(
     // 只同步池，不启动（用户改了账号后想刷新池）
     case '/api/proxy/sync-pool':
       respondProxy(res, await singleFlight('proxy-sync-pool', () => deps.proxySyncPool()))
+      return true
+
+    // 立刻放行全部挂起请求。**不接受任何参数** —— 面板只有「放一次」这个动作，
+    // 间隔与开关留在桌面端。单飞去重：手机连点共享同一次执行，
+    // 否则第二次点到的是已被第一次清空的集合，用户看到「放行了 0 个」而困惑。
+    case '/api/proxy/release-held':
+      respondProxy(res, await singleFlight('proxy-release-held', () => deps.proxyReleaseHeld()))
       return true
 
     // 选号。走编排的三步，不在这里拆开调

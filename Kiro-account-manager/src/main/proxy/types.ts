@@ -449,6 +449,14 @@ export interface ProxyAccount {
   quotaLimit?: number
   quotaExhaustedAt?: number // 配额耗尽时间戳
   quotaResetAt?: number // 下次配额重置时间
+  /**
+   * `quotaUsed/quotaLimit` 这份数据的**观测时刻**(上游响应到手的时间),不是写入时间。
+   *
+   * 用途是时序仲裁:`checkAccountStatus` 是并发的(singleFlight 只按 id 去重、跨轮次不保序),
+   * 没有它时一个慢响应回来就能把新数字按回旧值。`updateQuota` 据此丢弃迟到的旧响应。
+   * 兼作日志自证依据 —— 判「这个号额度耗尽」时能说出结论基于何时的数据。
+   */
+  quotaUpdatedAt?: number
   // 长期封禁追踪（区分于临时 errorCount 冷却）
   // Kiro 后端 TEMPORARILY_SUSPENDED / AccountSuspendedException 等风控触发时设置
   // 需要联系 AWS Support 人工解封，账号池会持续跳过直到 clearSuspended
@@ -676,6 +684,16 @@ export interface ProxyConfig {
   holdTimeoutAction?: HoldTimeoutAction
   /** 池出现可用号时自动放行(默认 true) */
   holdAutoResumeOnAvailable?: boolean
+  /** 自动定时放行开关(默认 true)。开启后即使池仍无可用号,也会按间隔周期性放行挂起请求 ——
+   *  放行本身就是目的:它产生客户端可见的流活动,重置客户端 idle watchdog 的 ~10min 计时
+   *  (用户 2026-08-09 实测确立:受限状态下手动点放行即重置该窗口)。ping 心跳做不到这件事。
+   *  注意仅在 holdWhenNoAccount 开启时有对象可放;且 holdTimeoutAction 非 keep_blocking 时,
+   *  预算到点条目已被认领移出集合 → 自动放行到点认领不到,循环终止。 */
+  holdAutoReleaseEnabled?: boolean
+  /** 自动定时放行间隔 ms(默认 480000=8min;clamp [60000, holdTotalBudgetMs])。
+   *  下限 60s:每轮放行都真发一次上游请求,过短会加深 429 误标风险。
+   *  8min 而非客户端 10min 极限:留 120s 余量吸收上游首字节延迟。详见 holdConfig.ts 常量段。 */
+  holdAutoReleaseIntervalMs?: number
 }
 
 export interface TlsConfig {

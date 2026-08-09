@@ -4,6 +4,7 @@ import { electronAPI } from '@electron-toolkit/preload'
 // `WebPanelStatus` 定义在 wiring，`WebPanelConfig` 定义在 server —— 各从其真正来源取
 import type { WebPanelStatus } from '../main/ipc/webPanelWiring'
 import type { WebPanelConfig } from '../main/webPanel/server'
+import type { HeldRequestsInfo } from '../main/proxy/proxyServer'
 
 // Custom APIs for renderer
 const api = {
@@ -852,7 +853,7 @@ const api = {
   },
 
   // 挂起门闸:查询当前挂起中的请求数
-  proxyGetHeldRequests: (): Promise<{ count: number }> => {
+  proxyGetHeldRequests: (): Promise<HeldRequestsInfo> => {
     return ipcRenderer.invoke('proxy-get-held-requests')
   },
 
@@ -1123,8 +1124,8 @@ const api = {
   },
 
   // 监听挂起请求数变化事件(驱动挂起数徐标 + 放行按钮启用态)
-  onProxyHeldRequestsChanged: (callback: (info: { count: number }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, info: { count: number }): void => {
+  onProxyHeldRequestsChanged: (callback: (info: HeldRequestsInfo) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, info: HeldRequestsInfo): void => {
       callback(info)
     }
     ipcRenderer.on('proxy-held-requests-changed', handler)

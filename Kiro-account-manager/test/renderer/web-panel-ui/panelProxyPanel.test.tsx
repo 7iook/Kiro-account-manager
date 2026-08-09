@@ -10,7 +10,7 @@
  * 「未运行」—— 显示「运行中」就是乐观更新，正是桌面设置页犯过的那个 bug。
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ProxyPanel } from '../../../src/webPanel/ui/ProxyPanel'
 import type { AccountListItem } from '../../../src/main/webPanel/dto'
@@ -59,6 +59,9 @@ interface StatusShape {
   totalRequests?: number
   successRequests?: number
   failedRequests?: number
+  autoReleaseEnabled?: boolean
+  nextAutoReleaseAt?: number | null
+  autoReleaseCount?: number
 }
 
 /** 可编程的假服务端。`statusQueue` 让每次 GET /status 返回不同读数 */
@@ -66,6 +69,7 @@ function stubServer(opts: {
   status: StatusShape | StatusShape[]
   startResponse?: { ok: boolean; body?: unknown; status?: number }
   activateResponse?: { ok: boolean; body?: unknown; status?: number }
+  releaseResponse?: { ok: boolean; body?: unknown; status?: number }
 }) {
   const statuses = Array.isArray(opts.status) ? [...opts.status] : [opts.status]
   const calls: Array<{ method: string; url: string; headers: Record<string, string> }> = []
@@ -94,7 +98,11 @@ function stubServer(opts: {
         availableCount: s.availableCount ?? 2,
         totalRequests: s.totalRequests ?? 0,
         successRequests: s.successRequests ?? 0,
-        failedRequests: s.failedRequests ?? 0
+        failedRequests: s.failedRequests ?? 0,
+        autoReleaseEnabled: s.autoReleaseEnabled ?? false,
+        // null = 没有下一次。刻意不用 ?? 0 —— 0 是合法 epoch，会渲染成巨大负倒计时
+        nextAutoReleaseAt: s.nextAutoReleaseAt ?? null,
+        autoReleaseCount: s.autoReleaseCount ?? 0
       })
     }
     if (url.endsWith('/proxy/start')) {
@@ -103,6 +111,10 @@ function stubServer(opts: {
     }
     if (url.endsWith('/proxy/stop')) return json({ success: true, running: false })
     if (url.endsWith('/proxy/sync-pool')) return json({ success: true, poolSize: 2 })
+    if (url.endsWith('/proxy/release-held')) {
+      const r = opts.releaseResponse ?? { ok: true, body: { success: true, released: 2 } }
+      return json(r.body ?? { success: true }, r.ok ? 200 : (r.status ?? 409))
+    }
     if (url.endsWith('/proxy/active-account')) {
       const r = opts.activateResponse ?? {
         ok: true,
@@ -309,3 +321,203 @@ describe('反代面板 · 停止的在飞请求提示', () => {
 
 /** 消除未使用告警：noop 保留给将来需要空回调的用例 */
 void noop
+
+describe('反代面板 · 自动放行读数与手动放行（决策卡 §3 手机端契约）', () => {
+  it('显示倒计时与累计放行次数', async () => {
+    const { fetchMock } = stubServer({
+      status: {
+        running: true,
+        autoReleaseEnabled: true,
+        // 距今 125 秒 → 2:05
+        nextAutoReleaseAt: Date.now() + 125_000,
+        autoReleaseCount: 6
+      }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPanel()
+
+    await waitFor(() => expect(screen.getByText('2:05')).toBeTruthy())
+    // 累计次数是「本次启动以来的周期次数」，不是条目数
+    await waitFor(() => expect(screen.getByText('6')).toBeTruthy())
+  })
+
+  it('倒计时本地自减，不靠轮询服务端拿数值', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      const { fetchMock, calls } = stubServer({
+        status: {
+          running: true,
+          autoReleaseEnabled: true,
+          nextAutoReleaseAt: Date.now() + 125_000,
+          autoReleaseCount: 1
+        }
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      renderPanel()
+      await waitFor(() => expect(screen.getByText('2:05')).toBeTruthy())
+      const statusCallsBefore = calls.filter((c) => c.url.endsWith('/proxy/status')).length
+
+      // 推进假时钟必须包在 act 里：这一步会触发倒计时心跳的 setNow，
+      // 那是组件内的状态更新。不包住 React 会打 "not wrapped in act(...)" 告警，
+      // 而告警噪声会掩盖以后真正的异步缺陷（届时新告警混在旧告警里看不出来）。
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000)
+      })
+
+      // 承重判据：数字自己走了，且期间**没有**新的 status 请求 ——
+      // 若靠轮询，服务端请求数会随倒计时刷新率增长（决策卡：推送只给绝对时间戳）
+      await waitFor(() => expect(screen.getByText('2:02')).toBeTruthy())
+      expect(calls.filter((c) => c.url.endsWith('/proxy/status')).length).toBe(statusCallsBefore)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('没有下一次放行时不显示 0 或负倒计时', async () => {
+    const { fetchMock } = stubServer({
+      status: { running: true, autoReleaseEnabled: true, nextAutoReleaseAt: null, autoReleaseCount: 3 }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPanel()
+
+    await waitFor(() => expect(screen.getByText(/自动放行/)).toBeTruthy())
+    // null 必须显示成「-」而不是 0:00 —— 0 是合法 epoch，把「无」当 0 会渲染 1970 年
+    expect(screen.queryByText('0:00')).toBeNull()
+    expect(screen.queryByText(/-\d/)).toBeNull()
+  })
+
+  it('时间戳已过期（时钟回拨/事件延迟）→ 显示「即将放行」而不是负数', async () => {
+    const { fetchMock } = stubServer({
+      status: {
+        running: true,
+        autoReleaseEnabled: true,
+        nextAutoReleaseAt: Date.now() - 5000,
+        autoReleaseCount: 2
+      }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPanel()
+    await waitFor(() => expect(screen.getByText('即将放行')).toBeTruthy())
+  })
+
+  it('点放行 → 只发一个 POST /proxy/release-held，且回报实际放行数', async () => {
+    const { fetchMock, calls } = stubServer({
+      status: { running: true, autoReleaseEnabled: true, nextAutoReleaseAt: Date.now() + 60_000 },
+      releaseResponse: { ok: true, body: { success: true, released: 3 } }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { onNotice } = renderPanel()
+    await waitFor(() => expect(screen.getByText(/运行中/)).toBeTruthy())
+
+    await userEvent.click(screen.getByRole('button', { name: '立即放行' }))
+
+    await waitFor(() => expect(onNotice).toHaveBeenCalled())
+    expect(String(onNotice.mock.calls[0][0])).toContain('3')
+    const releaseCalls = calls.filter((c) => c.url.endsWith('/proxy/release-held'))
+    expect(releaseCalls.length).toBe(1)
+    expect(releaseCalls[0].method).toBe('POST')
+    // 写操作必须带 CSRF 头，否则服务端一律 401
+    expect(releaseCalls[0].headers['X-Panel-Request']).toBe('1')
+  })
+
+  it('放行了 0 个不当失败处理（幂等语义，只是当时没东西可放）', async () => {
+    const { fetchMock } = stubServer({
+      status: { running: true, autoReleaseEnabled: true, nextAutoReleaseAt: Date.now() + 60_000 },
+      releaseResponse: { ok: true, body: { success: true, released: 0 } }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { onNotice, onError } = renderPanel()
+    await waitFor(() => expect(screen.getByText(/运行中/)).toBeTruthy())
+
+    await userEvent.click(screen.getByRole('button', { name: '立即放行' }))
+
+    await waitFor(() => expect(onNotice).toHaveBeenCalled())
+    // released=0 走的是提示而非错误出口
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it('反代未运行 → 放行按钮禁用（服务端会 409，先把原因说在前面）', async () => {
+    const { fetchMock } = stubServer({ status: { running: false } })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPanel()
+    await waitFor(() => expect(screen.getByText('未运行')).toBeTruthy())
+    expect(screen.getByRole('button', { name: '立即放行' }).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('放行失败（409）经统一错误出口上报，组件不自渲染 alert', async () => {
+    const { fetchMock } = stubServer({
+      status: { running: true },
+      releaseResponse: { ok: false, status: 409, body: { code: 'PROXY_NOT_RUNNING' } }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { onError } = renderPanel()
+    await waitFor(() => expect(screen.getByText(/运行中/)).toBeTruthy())
+
+    await userEvent.click(screen.getByRole('button', { name: '立即放行' }))
+
+    await waitFor(() => expect(onError).toHaveBeenCalled())
+    // 组件刻意不渲染自己的 role="alert"（App 顶部那一个是错误展示的唯一收口点）
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('放行按钮是手机可点的触控尺寸（h-11，与其它控件一致）', async () => {
+    const { fetchMock } = stubServer({ status: { running: true } })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPanel()
+    await waitFor(() => expect(screen.getByText(/运行中/)).toBeTruthy())
+    expect(screen.getByRole('button', { name: '立即放行' }).className).toContain('h-11')
+  })
+})
+
+describe('反代面板 · 跨放行周期后与服务端重新对齐', () => {
+  /**
+   * 承重用例：本地倒计时走过 `nextAutoReleaseAt` 之后，界面必须显示**服务端的新读数**，
+   * 而不是永久停在「即将放行 + 旧次数」。
+   *
+   * 这是手机面板与桌面端的结构性差异：桌面端消费推送事件
+   * (`onProxyHeldRequestsChanged`) 所以周期一过自然拿到新值；面板没有这条推送通道，
+   * 挂载后若不重新取数，它对服务端状态的认知就永久停在挂载那一刻。
+   *
+   * 判据刻意选**服务端独有的信息**（T2 时刻 + 次数 N+1）：这两个值本地无从推算，
+   * 只可能来自一次新的 `GET /proxy/status`。若断言「即将放行」消失就够，
+   * 那本地清空状态也能骗过测试。
+   */
+  it('倒计时到点后重新取数，显示服务端的新周期与新次数（不停在「即将放行」）', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      const t0 = Date.now()
+      const { fetchMock, calls } = stubServer({
+        status: [
+          // 挂载读数：T1 = 2 秒后放行，已放行 4 次
+          { running: true, autoReleaseEnabled: true, nextAutoReleaseAt: t0 + 2000, autoReleaseCount: 4 },
+          // 服务端在 T1 放行了一次并排好下一周期：T2 = 挂载后 62 秒，次数 5
+          { running: true, autoReleaseEnabled: true, nextAutoReleaseAt: t0 + 62_000, autoReleaseCount: 5 }
+        ]
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      renderPanel()
+
+      await waitFor(() => expect(screen.getByText('0:02')).toBeTruthy())
+      const statusCallsBefore = calls.filter((c) => c.url.endsWith('/proxy/status')).length
+
+      // 走过 T1（本地时钟越过 nextAutoReleaseAt）
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000)
+      })
+
+      // 判据一：确实又问了一次服务端
+      await waitFor(() =>
+        expect(calls.filter((c) => c.url.endsWith('/proxy/status')).length).toBeGreaterThan(
+          statusCallsBefore
+        )
+      )
+      // 判据二：显示的是服务端的新次数（5），不是挂载时那个 4
+      await waitFor(() => expect(screen.getByText('5')).toBeTruthy())
+      // 判据三：新周期的倒计时重新走起来，而不是永久「即将放行」
+      await waitFor(() => expect(screen.queryByText('即将放行')).toBeNull())
+      expect(screen.getByText(/^0?5[0-8]$|^0:5\d$/)).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

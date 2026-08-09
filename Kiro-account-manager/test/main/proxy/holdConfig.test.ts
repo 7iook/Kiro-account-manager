@@ -71,14 +71,21 @@ describe('normalizeHoldConfig · 挂起门闸配置 clamp / 跨字段校验', ()
       holdMaxWaitMs: 300000,
       holdTotalBudgetMs: 900000,
       holdGraceMs: 20000,
-      holdTimeoutAction: 'graceful_stop'
+      holdTimeoutAction: 'graceful_stop',
+      // 自动放行两字段也给合法值:enabled 取 false(与默认 true 相反,证明是读输入而非落默认);
+      // interval 取 120000(在 [60000, 预算] 内、且低于 Layer C 兼容阈 150000,不触发 warn)。
+      holdAutoReleaseEnabled: false,
+      holdAutoReleaseIntervalMs: 120000
     })
+    // 整对象断言(非 toMatchObject)是刻意的:字段被静默新增时这里必须红。
     expect(r).toEqual({
       pingIntervalMs: 8000,
       maxWaitMs: 300000,
       totalBudgetMs: 900000,
       graceMs: 20000,
-      timeoutAction: 'graceful_stop'
+      timeoutAction: 'graceful_stop',
+      autoReleaseEnabled: false,
+      autoReleaseIntervalMs: 120000
     })
   })
 })

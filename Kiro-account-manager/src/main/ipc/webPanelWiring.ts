@@ -454,6 +454,8 @@ export function buildPanelRouteDeps(impl: {
   proxyActivateAccount: (accountId: string) => Promise<unknown>
   proxyStart: () => Promise<unknown>
   proxyStop: () => Promise<unknown>
+  /** 立刻放行全部挂起请求（面板唯一的挂起门闸动作，不含任何配置写入） */
+  proxyReleaseHeld: () => Promise<unknown>
 }): PanelRouteDeps {
   const asService = <A extends unknown[]>(
     fn: (...args: A) => Promise<unknown>
@@ -477,6 +479,7 @@ export function buildPanelRouteDeps(impl: {
     proxySyncPool: asService(impl.proxySyncPool),
     proxyActivateAccount: asService(impl.proxyActivateAccount),
     proxyStart: asService(impl.proxyStart),
-    proxyStop: asService(impl.proxyStop)
+    proxyStop: asService(impl.proxyStop),
+    proxyReleaseHeld: asService(impl.proxyReleaseHeld)
   }
 }

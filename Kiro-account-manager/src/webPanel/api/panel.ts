@@ -241,6 +241,34 @@ export interface ProxyStatus {
   totalRequests: number
   successRequests: number
   failedRequests: number
+
+  /**
+   * 自动定时放行是否启用。
+   *
+   * 这是**调度器的真实读数**，不是配置值 —— 「配置开着」与「调度器真的在跑」是
+   * 两件事（挂起门闸本身关掉时，自动放行没有对象可放）。所以界面显示「已开启」
+   * 的判据只能是它。
+   *
+   * 三个自动放行字段**必填**：服务端 `panelProxyDeps.ts:PanelProxyStatus` 在所有
+   * 分支（含反代未初始化）都发全字段，这里如实照抄那个契约。留 `?` 会让「将来
+   * 某次改动漏发字段」编译期无声，而 UI 的 `?? 0` / 默认关闭会把契约漂移渲染成
+   * 一个合法业务态（「未开启」「已放行 0 次」）—— 用户看到一个平静的错误读数。
+   */
+  autoReleaseEnabled: boolean
+  /**
+   * 下次自动放行的**绝对** epoch ms；`null` = 没有下一次。
+   *
+   * ⚠️ 倒计时由本地 `nextAutoReleaseAt - Date.now()` 每秒渲染，**不轮询服务端**。
+   * 服务端只给绝对时间戳：倒计时是连续量，轮询它会让请求频率被刷新率绑架。
+   *
+   * `null` 是**取值**而非「字段缺失」，故必填且保留 `| null` —— 「没有下一次」由
+   * 服务端明确表态，不靠字段不存在暗示。`null` 与 `0` 语义也不同：`0` 是合法
+   * epoch（1970），把「无」表达成 `0` 会渲染出一个巨大的负倒计时。
+   * 判空必须用 `== null`，不能用 falsy 判断。
+   */
+  nextAutoReleaseAt: number | null
+  /** 本次反代启动以来自动放行的**周期次数**（不是条目数）；手动放行不计入 */
+  autoReleaseCount: number
 }
 
 export async function fetchProxyStatus(): Promise<ProxyStatus> {
@@ -286,4 +314,27 @@ export async function setProxyActiveAccount(
   accountId: string
 ): Promise<{ mode?: 'single' | 'multi'; accountId?: string; email?: string }> {
   return panelRequest('POST', '/proxy/active-account', { accountId })
+}
+
+/**
+ * 立刻放行全部挂起请求。
+ *
+ * 账号不可用时反代会把客户端请求挂起等待恢复；「放行」让它们立刻用新号重试。
+ * 服务端调的是与桌面端按钮、自动放行调度器**同一个**入口（`releaseAll()`）。
+ *
+ * **不接受任何参数** —— 手机端只有「立刻放一次」这一个动作，改间隔 / 改开关留在
+ * 桌面端（与 `startProxy` 同一理由：配置类副作用从手机误触代价大于收益）。
+ *
+ * 语义要点：
+ * - 没有挂起条目时返回 `{ released: 0 }` 而**不是错误** —— 放行本身是幂等的。
+ *   所以 UI 不能把 `released === 0` 当失败处理，它只是「当时没东西可放」。
+ * - 反代未运行 → 409 `PROXY_NOT_RUNNING`（由 `PanelApiError` 承载）。
+ *
+ * `released` **必填**：`panelRequest` 已把所有非 2xx 归一成抛异常，所以本函数只在
+ * 成功路径 resolve，而服务端成功路径（`panelProxyDeps.ts:proxyReleaseHeld`）恒带
+ * 该字段。留 `?` 会让「将来漏发它」编译期无声，UI 的 `?? 0` 再把它渲染成
+ * 「当前没有挂起的请求」—— 一句看起来完全正常的话，掩盖掉放行数其实未知这件事。
+ */
+export async function releaseHeldRequests(): Promise<{ released: number }> {
+  return panelRequest('POST', '/proxy/release-held')
 }

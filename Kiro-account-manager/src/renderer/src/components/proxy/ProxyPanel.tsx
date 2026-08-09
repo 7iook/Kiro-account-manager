@@ -121,6 +121,9 @@ interface ProxyConfig {
   holdGraceMs?: number
   holdTimeoutAction?: 'keep_blocking' | 'error' | 'graceful_stop'
   holdAutoResumeOnAvailable?: boolean
+  // 自动放行:挂起期间定时放行一次,让客户端看守的空闲计时重置(决策卡 2026-08-09 §3)
+  holdAutoReleaseEnabled?: boolean
+  holdAutoReleaseIntervalMs?: number
 }
 
 // 反代请求日志：模块级持久化 + 单次订阅，避免切到其它页面 unmount 后日志清空、中间请求事件丢失
@@ -159,6 +162,57 @@ function ensureProxyResponseListenerRegistered(): void {
   })
 }
 
+/**
+ * 自动放行间隔的**生效值**(镜像后端 `holdConfig.ts` 的 clamp,决策卡 2026-08-09 §1「边界值归一化」)。
+ *
+ * 为什么界面要算一遍:后端会把间隔夹到 `[60s, holdTotalBudgetMs]`,若界面只把用户输入原样存下、
+ * 照原样显示,用户会看到一个「他填了但根本不生效」的数字,而且无从自查 —— 所以这里把生效值算出来,
+ * 与输入不一致时在界面上直说。**这不是第二个真源**:判定权仍在后端,这里只做提示,
+ * 落库的仍是用户原始输入(后端 clamp 后再用)。若后端 clamp 规则变了,这里要跟着改。
+ *
+ * 公式一并覆盖两种边界:预算 < 60s 时结果收敛到预算值(预算优先,绝不让间隔超预算)。
+ */
+function effectiveAutoReleaseIntervalMs(rawMs: number, totalBudgetMs: number): number {
+  return Math.min(Math.max(rawMs, 60000), totalBudgetMs)
+}
+
+/**
+ * 自动放行倒计时(独立组件 —— 每秒 tick 只重渲染这一个 span,不带着整页跟着跳)。
+ *
+ * 主进程只推**绝对时间戳** `nextAutoReleaseAt`(epoch ms),连续量在本地算:
+ * 推送是事件驱动的,倒计时不是,让主进程每秒推一个数字既无必要也会把推送频率放大。
+ *
+ * 三种显示态(决策卡 2026-08-09 §3「语义纪律」):
+ * - `null` = 没有下一次(开关关 / 无挂起条目 / 反代未运行)→ 「—」。**不能用 0 表达"无"**,0 是合法 epoch。
+ * - 余量 <= 0(时钟回拨 / 事件延迟)→ 「即将放行」,不显示负号。
+ * - 其余 → mm:ss。
+ */
+function AutoReleaseCountdown({ nextAt, isEn }: { nextAt: number | null; isEn: boolean }): React.JSX.Element {
+  const [remainMs, setRemainMs] = useState(() => (nextAt === null ? null : nextAt - Date.now()))
+
+  useEffect(() => {
+    if (nextAt === null) {
+      setRemainMs(null)
+      return
+    }
+    // 立即算一次,避免挂到下一秒才出现数字
+    setRemainMs(nextAt - Date.now())
+    const timer = setInterval(() => setRemainMs(nextAt - Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [nextAt])
+
+  if (remainMs === null) {
+    return <span className="tabular-nums text-muted-foreground">—</span>
+  }
+  if (remainMs <= 0) {
+    return <span className="text-warning">{isEn ? 'releasing…' : '即将放行'}</span>
+  }
+  const totalSec = Math.floor(remainMs / 1000)
+  const mm = Math.floor(totalSec / 60)
+  const ss = totalSec % 60
+  return <span className="tabular-nums">{`${mm}:${ss.toString().padStart(2, '0')}`}</span>
+}
+
 export function ProxyPanel() {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
@@ -167,6 +221,10 @@ export function ProxyPanel() {
   const [capabilitySyncInflight, setCapabilitySyncInflight] = useState(false)
   // 挂起门闸:当前被挂起(HELD)的请求数(徽标 + 放行按钮启用态)
   const [heldCount, setHeldCount] = useState(0)
+  // 自动放行读数(主进程推送)。`null` = 没有下一次,与「0」严格区分,见 AutoReleaseCountdown 注释。
+  const [nextAutoReleaseAt, setNextAutoReleaseAt] = useState<number | null>(null)
+  // 本次「启动服务 → 停止服务」之间的自动放行周期数,反代停止即归零(与 sessionStats 同生命周期)
+  const [autoReleaseCount, setAutoReleaseCount] = useState(0)
   const [config, setConfig] = useState<ProxyConfig>({
     enabled: false,
     port: 5580,
@@ -445,10 +503,22 @@ export function ProxyPanel() {
     })
 
     // 挂起门闸:订阅挂起数变化 + 初次拉取当前值
-    const unsubHeld = window.api.onProxyHeldRequestsChanged((info) => {
+    // 形状按决策卡 §3 读数契约:`count` 之外还带三个自动放行字段。主进程侧(W2)扩形状前它们是
+    // undefined,故这里用可选字段读取 —— 扩之前后都编译得过,不需要断言,也不会因为一端先落地而报错。
+    const applyHeldInfo = (info: {
+      count: number
+      nextAutoReleaseAt?: number | null
+      autoReleaseCount?: number
+    }): void => {
       setHeldCount(info.count)
+      // `?? null`:把「主进程还没扩这个字段」(undefined)与「明确没有下一次」(null)归一成同一显示态「—」
+      setNextAutoReleaseAt(info.nextAutoReleaseAt ?? null)
+      setAutoReleaseCount(info.autoReleaseCount ?? 0)
+    }
+    const unsubHeld = window.api.onProxyHeldRequestsChanged((info) => {
+      applyHeldInfo(info)
     })
-    void window.api.proxyGetHeldRequests().then(r => setHeldCount(r.count)).catch(() => {})
+    void window.api.proxyGetHeldRequests().then(applyHeldInfo).catch(() => {})
 
     return () => {
       unsubRequest()
@@ -1375,6 +1445,82 @@ export function ProxyPanel() {
                   )}
                 </div>
               </div>
+              {/* 自动放行(挂起期间定时放行一次,让客户端的空闲看守重新计时)
+                  与上方三个门闸参数同理:运行时热生效,故同样不受 isRunning 限制。 */}
+              {(() => {
+                const autoOn = config.holdAutoReleaseEnabled !== false
+                const gateOn = config.holdWhenNoAccount === true
+                const rawMs = config.holdAutoReleaseIntervalMs ?? 480000
+                const budgetMs = config.holdTotalBudgetMs ?? 1680000
+                const effMs = effectiveAutoReleaseIntervalMs(rawMs, budgetMs)
+                const clamped = effMs !== rawMs
+                const timeoutAction = config.holdTimeoutAction ?? 'keep_blocking'
+                // 只有 keep_blocking 下预算耗尽的条目才「留在集合且未认领」,自动放行才有对象可放。
+                // error / graceful_stop 在预算到点时已认领并移出集合 → 自动放行到点认领不到,循环就断了。
+                const actionBreaksLoop = timeoutAction !== 'keep_blocking'
+                return (
+                  <div className={`col-span-3 flex items-center gap-3 flex-wrap p-2 rounded-md bg-warning/[0.04] border border-warning/20 ${gateOn ? '' : 'opacity-50'}`}>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <Switch
+                        id="holdAutoReleaseEnabled"
+                        checked={autoOn}
+                        onCheckedChange={(checked) => {
+                          setConfig(prev => ({ ...prev, holdAutoReleaseEnabled: checked }))
+                          window.api.proxyUpdateConfig({ holdAutoReleaseEnabled: checked })
+                        }}
+                        disabled={!gateOn}
+                      />
+                      <Label htmlFor="holdAutoReleaseEnabled" className="text-sm cursor-pointer font-medium" title={isEn ? 'While a request is held, release it on a timer so the client\'s idle watchdog restarts its countdown instead of dropping the request. Only useful while the Hold Gate is on.' : '挂起期间每隔一段时间自动放行一次,让客户端自身的空闲看守重新计时、不把请求掐掉。仅在挂起门闸开启时有意义。'}>
+                        {isEn ? 'Auto Release' : '自动放行'}
+                      </Label>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <Label htmlFor="holdAutoReleaseIntervalMin" className="text-xs text-muted-foreground" title={isEn ? 'How often to release while held. Clamped to at least 1 min and at most the hold budget. Default 8 min — the client default watchdog is about 10 min, so this leaves ~2 min of headroom.' : '挂起期间每隔多久放行一次。下限 1 分钟、上限不超过挂起预算。默认 8 分钟 —— 客户端默认看守约 10 分钟,留约 2 分钟余量。'}>
+                        {isEn ? 'Every (min)' : '间隔(分钟)'}
+                      </Label>
+                      <Input
+                        id="holdAutoReleaseIntervalMin"
+                        type="number"
+                        min={1}
+                        max={360}
+                        step={1}
+                        value={Math.round(rawMs / 60000)}
+                        onChange={(e) => {
+                          const min = parseInt(e.target.value) || 8
+                          const ms = min * 60000
+                          setConfig(prev => ({ ...prev, holdAutoReleaseIntervalMs: ms }))
+                          window.api.proxyUpdateConfig({ holdAutoReleaseIntervalMs: ms })
+                        }}
+                        disabled={!gateOn || !autoOn}
+                        className="w-16 h-7 text-xs"
+                      />
+                      {clamped && (
+                        <span className="text-xs text-warning" title={isEn ? 'The value you entered is outside the allowed range, so the effective interval differs.' : '你填的值超出允许范围,实际生效的是这个值。'}>
+                          {isEn ? `→ actually ${Math.round(effMs / 60000)} min` : `→ 实际按 ${Math.round(effMs / 60000)} 分钟`}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <Label className="text-xs text-muted-foreground" title={isEn ? 'Time until the next automatic release. A dash means there is no next one (switch off, nothing held, or proxy stopped).' : '距下一次自动放行的剩余时间。「—」表示没有下一次(开关关闭、当前无挂起条目,或反代未运行)。'}>
+                        {isEn ? 'Next in' : '下次放行'}
+                      </Label>
+                      <span className="text-xs font-bold">
+                        <AutoReleaseCountdown nextAt={gateOn && autoOn ? nextAutoReleaseAt : null} isEn={isEn} />
+                      </span>
+                    </div>
+                    {actionBreaksLoop && autoOn && (
+                      <div className="w-full flex items-start gap-1.5 text-xs text-warning">
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                        <span>
+                          {isEn
+                            ? 'Heads up: with "When Budget Ends" set to anything other than "Keep waiting", the request is already finished once the budget runs out — so auto release has nothing left to release and the request will end there. Set it to "Keep waiting" if you want the request to keep waiting indefinitely.'
+                            : '提示:「预算用完时」不是「继续等」时,预算一到请求就已经收尾了 —— 此后自动放行没有对象可放,请求就在那里结束。若希望请求一直等下去,请把它改回「继续等」。'}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
               {/* Agent Mode + Workspace Path（Steering 文件注入） */}
               <div className="col-span-3 grid grid-cols-3 gap-x-3 items-end">
                 <div className="space-y-1.5">
@@ -1583,6 +1729,24 @@ export function ProxyPanel() {
                 <span>Credits</span>
               </div>
               <div className="text-xl font-bold text-amber-500">{(stats.totalCredits || 0).toFixed(4)}</div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* 自动放行累计次数(本次「启动服务 → 停止服务」之间的周期数,与上方 stats 同生命周期,
+          停止服务即归零)。只在门闸 + 自动放行都开着时才显示 —— 关着时这个数字没有含义。 */}
+      {isRunning && config.holdWhenNoAccount === true && config.holdAutoReleaseEnabled !== false && (
+        <div className="grid grid-cols-6 gap-3">
+          <Card className="hover-lift bg-gradient-to-br from-warning/5 to-transparent">
+            <CardContent className="pt-3 pb-3">
+              <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
+                <Clock className="h-3 w-3" />
+                <span title={isEn ? 'Number of automatic release cycles since the proxy was started (resets on stop). Manual releases are not counted.' : '本次启动反代以来自动放行的周期数(停止服务归零)。手动放行不计入。'}>
+                  {isEn ? 'Auto Releases' : '自动放行次数'}
+                </span>
+              </div>
+              <div className="text-xl font-bold text-warning tabular-nums">{autoReleaseCount}</div>
             </CardContent>
           </Card>
         </div>
