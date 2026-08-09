@@ -577,6 +577,12 @@ export interface ProxyConfig {
   // effective limit = model.maxInputTokens - buffer
   // 默认 20K：覆盖 system + tools + current message + output + 估算偏差
   tokenBufferReserve?: number
+  // 出站上下文安全网总开关(默认 false)
+  //   Layer B: history 里大 tool_result 的形态感知压缩(RTK),在 token 裁剪之前跑
+  //   Layer C: 上游 SSE 静默看门狗,上游中途不吐字节时掐断并报错,不让客户端无限期挂着
+  // 开发者可用 KIRO_PROXY_LAYER_B / KIRO_PROXY_LAYER_C=false 单独关某一层。
+  // 注意:token 级裁剪本身由 enableTokenBufferReserve 管,不受本开关影响。
+  enableProxyContextSafetyNet?: boolean
   // 单账号模式下额度耗尽自动切换到下一个账号
   autoSwitchOnQuotaExhausted?: boolean
   // 多账号选择策略 (仅 enableMultiAccount=true 时生效)

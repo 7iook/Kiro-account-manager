@@ -20,7 +20,7 @@ import {
 // 说明:resolveApiKeyProfileArnIfEligible / validateApiKeyCredential / sha256Fingerprint /
 // resolveProfileArnForVerify 的消费点已随 verify-api-key / compute-token-fingerprint /
 // verify-account-credentials 剥离到 accountService/verify.ts(W2),本文件不再直接引用。
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setTokenRefreshCallbackForModelFetch, setAccountModelSyncCallback, setRateLimitRetryConfig, setAgentMode, KNOWN_SSO_OIDC_REGIONS, isKiroApiDebug, type KiroProfile } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, setEnableProxyContextSafetyNet, callKiroApi, fetchEnterpriseProfileArn, fetchEnterpriseProfiles, parseRegionFromProfileArn, setProfileArnPersistCallback, setTokenRefreshCallbackForModelFetch, setAccountModelSyncCallback, setRateLimitRetryConfig, setAgentMode, KNOWN_SSO_OIDC_REGIONS, isKiroApiDebug, type KiroProfile } from './proxy/kiroApi'
 // 账号业务函数(IPC 与将来的 web 面板 HTTP 共用同一实现;业务层不依赖 preload / IpcMainInvokeEvent)
 // 两个 deps 接口的分工见 accountService/types.ts:AccountStoreDeps 注释 ——
 // 前者模块级即可装配,后者要等 app.whenReady 后 proxyServer / mainWindow / api 就位。
@@ -580,6 +580,8 @@ function initProxyServer(): ProxyServer {
   }
   // 恢复 Token buffer reserve（开关 + 数值）
   setEnableTokenBufferReserve(config.enableTokenBufferReserve === true)
+  // 恢复出站上下文安全网总开关(Layer B RTK + Layer C 静默看门狗;默认关闭)
+  setEnableProxyContextSafetyNet(config.enableProxyContextSafetyNet === true)
   if (config.tokenBufferReserve) {
     setTokenBufferReserve(config.tokenBufferReserve)
   }
@@ -5909,6 +5911,10 @@ app.whenReady().then(async () => {
       }
       if (config.tokenBufferReserve !== undefined) {
         setTokenBufferReserve(config.tokenBufferReserve)
+      }
+      // 同步出站上下文安全网总开关(Layer B RTK + Layer C 静默看门狗)
+      if (config.enableProxyContextSafetyNet !== undefined) {
+        setEnableProxyContextSafetyNet(config.enableProxyContextSafetyNet)
       }
       // v1.7.6 同步 429 rate limit 重试策略(任何一个字段变化就更新)
       if (config.rateLimitRetryMaxAttempts !== undefined || config.rateLimitRetryBaseMs !== undefined || config.rateLimitRetryStrategy !== undefined) {

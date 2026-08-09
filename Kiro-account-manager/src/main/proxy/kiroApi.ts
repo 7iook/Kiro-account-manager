@@ -25,6 +25,10 @@ import {
   setModelContextWindow,
   getModelContextWindow
 } from './tokenCounter'
+// Layer B(出站 tool_result 语义压缩)与 Layer C(上游 SSE 静默看门狗)。
+// 两者都是叶子模块,依赖方向单向 kiroApi → layer,不会成环。
+import { compressToolResults, formatRtkLog } from './rtk'
+import { wrapStreamWithStallDetection } from './streamWatchdog'
 // 重新导出以保持向后兼容（proxyServer.ts 等模块仍 from './kiroApi' 导入）
 export { setModelContextWindow, getModelContextWindow }
 
@@ -115,6 +119,23 @@ export function setEnableTokenBufferReserve(enabled: boolean): void {
 }
 export function getEnableTokenBufferReserve(): boolean {
   return enableTokenBufferReserve
+}
+
+// ===== 出站上下文安全网总开关(Layer B RTK 压缩 + Layer C 上游静默看门狗)=====
+// 单一用户可见开关,默认 **关闭** —— 两层都会改变出站内容或掐断上游连接,先让用户
+// 自己决定何时启用。开发者可用 KIRO_PROXY_LAYER_B / KIRO_PROXY_LAYER_C=false 单独关某一层
+// (env 只能关不能开:总开关关着时 env 无意义,避免出现"两个真源打架")。
+//
+// 注意:Layer A(trimHistoryByTokens 的裁剪留痕 + 原子写回)**不受本开关管辖** ——
+// 它是既有 enableTokenBufferReserve 路径的行为修正,今天已默认生效;
+// 把它塞进一个默认关闭的新开关等于静默关掉一个本来在工作的东西。
+let enableProxyContextSafetyNet = false
+export function setEnableProxyContextSafetyNet(enabled: boolean): void {
+  enableProxyContextSafetyNet = !!enabled
+}
+// test-only: reads module-scoped flag written by setter
+export function getEnableProxyContextSafetyNet(): boolean {
+  return enableProxyContextSafetyNet
 }
 
 // Token buffer reserve（仅在 enableTokenBufferReserve=true 时生效）
@@ -1013,6 +1034,20 @@ const UNDERSTOOD_MESSAGE: KiroHistoryMessage = {
   assistantResponseMessage: { content: 'understood' }
 }
 
+// 裁剪留痕占位说明(见 trimHistoryByTokens)。
+// 静默丢弃旧历史会让模型无法区分「这事没发生过」与「这段被省略了」,于是重复索要
+// 它本来已有的信息,或从断口硬推。切口处插一条说明把「被省略」这一事实显式告知。
+export const TRUNCATION_PLACEHOLDER =
+  '[Earlier conversation history was truncated to fit the model input limit. Older messages and tool activity have been omitted.]'
+
+const TRUNCATION_PLACEHOLDER_MESSAGE: KiroHistoryMessage = {
+  userInputMessage: { content: TRUNCATION_PLACEHOLDER, origin: 'AI_EDITOR' }
+}
+
+function isTruncationPlaceholder(message: KiroHistoryMessage | undefined): boolean {
+  return message?.userInputMessage?.content === TRUNCATION_PLACEHOLDER
+}
+
 // 创建失败的工具结果消息
 function createFailedToolUseMessage(toolUseIds: string[]): KiroHistoryMessage {
   return {
@@ -1421,11 +1456,35 @@ function sanitizeConversation(messages: KiroHistoryMessage[]): KiroHistoryMessag
 //   history[0] = { userInputMessage: { content: <systemPrompt> } }
 //   history[1] = { assistantResponseMessage: { content: 'I will follow these instructions.' } }
 // 若检测到此 marker,startIdx=2,裁剪只发生在其后,保证 system 指令不丢。
-function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed: number; finalTokens: number; iterations: number } {
-  let history = payload.conversationState.history
-  if (!history || history.length === 0) {
+//
+// 2026-08-09 Layer A 两处增量:
+//  1) 留痕:真丢弃 ≥1 条时在切口插 TRUNCATION_PLACEHOLDER(user) + UNDERSTOOD_MESSAGE(assistant)。
+//     静默丢弃会让模型无法区分「这事没发生过」与「这段被省略了」→ 重复索要已有信息 / 从断口硬推。
+//     ack 不是装饰:上游要求严格 user/assistant 交替,占位(user)直接接一个同样以 user 起头的
+//     尾段会形成 user+user → 400 REQUEST_BODY_INVALID。
+//     交替不靠手工维持 —— 完整 sanitize 链(含 ensureAlternatingMessages)在 :1545 于**裁剪之前**
+//     跑完,裁剪后只剩 ensureStartsWithUserMessage,插入动作会扰动交替不变量,故这里显式复用
+//     ensureAlternatingMessages 收口(同一个 SSOT,不另造一份交替逻辑)。
+//  2) 原子性:候选 history 在本地累积,末尾一次性换入 payload。此前逐轮赋值,循环中途抛异常
+//     (JSON.stringify 遇到脏对象)会留下半裁 payload,而该 payload 随后仍被发出/重试。
+//     末次 token 估算也必须在写回**之前**算完 —— 写回是本函数最后一个动作。
+//  3) 预算判定跑在**最终形态**上:循环里估算的候选已含占位对 + 规范化补齐(finalizeCandidate),
+//     一直裁到最终形态装得下。此前先把纯历史收敛到 <= maxTokens 才插占位,占位对的固定开销
+//     从未计入 → 恰好收敛到预算线的请求被推回超限,而函数报告成功(安全网自己交出超限 payload)。
+//     裁到保护下限仍装不下时诚实上报 finalTokens > maxTokens,不丢占位对去凑数。
+export function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed: number; finalTokens: number; iterations: number } {
+  const originalHistory = payload.conversationState.history
+  if (!originalHistory || originalHistory.length === 0) {
     return { trimmed: 0, finalTokens: estimatePayloadTokens(payload), iterations: 0 }
   }
+  let history = originalHistory
+
+  // 不写回 payload 的试算视图:浅展开,history 换成候选数组,其余字段按引用共享
+  const estimateWith = (candidate: KiroHistoryMessage[]): number =>
+    estimatePayloadTokens({
+      ...payload,
+      conversationState: { ...payload.conversationState, history: candidate }
+    })
 
   // 检测 system prompt Human/AI 注入对(translator.ts openaiToKiro/claudeToKiro 都注入的固定 marker)
   // 保护:裁剪时永远跳过前 2 条,不裁 system 指令 pair
@@ -1437,9 +1496,42 @@ function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed
     history[1].assistantResponseMessage?.content === SYSTEM_MARKER
   const startIdx = hasSystemPair ? 2 : 0
 
+  // 把「已裁剪的纯历史」变成**真正会被发出的最终形态**:去重旧占位 → 插占位对 → 收口交替/起头。
+  // 纯函数(不改入参、不写回),因此可以在循环里反复试算。
+  // 预算判定必须跑在它的输出上:占位对与 ensureAlternatingMessages 补齐的 filler 都是真实
+  // token 开销,只测中间形态会让恰好收敛到预算线的请求被占位对推回超限而仍报成功。
+  const finalizeCandidate = (candidate: KiroHistoryMessage[]): KiroHistoryMessage[] => {
+    // 去掉尾段里可能残留的旧占位对(上一轮裁剪留下的),保证全程只有一对
+    const deduped: KiroHistoryMessage[] = []
+    for (let i = 0; i < candidate.length; i++) {
+      if (isTruncationPlaceholder(candidate[i])) {
+        // 占位(user) 与其后紧跟的 ack(assistant) 一起丢
+        if (isAssistantResponseMessage(candidate[i + 1])) i++
+        continue
+      }
+      deduped.push(candidate[i])
+    }
+
+    // 切口处插入留痕:占位(user) + ack(assistant),位置在 system pair 之后、保留尾段之前
+    let rebuilt = [
+      ...deduped.slice(0, startIdx),
+      TRUNCATION_PLACEHOLDER_MESSAGE,
+      UNDERSTOOD_MESSAGE,
+      ...deduped.slice(startIdx)
+    ]
+    // 插入扰动了交替不变量 → 复用既有 helper 显式收口(裁剪后 sanitize 链不会再跑)
+    rebuilt = ensureAlternatingMessages(rebuilt)
+    rebuilt = ensureStartsWithUserMessage(rebuilt)
+    return rebuilt
+  }
+
   let totalTrimmed = 0
   let iterations = 0
+  // 入口判定用**原样 payload**(还没裁 → 按契约不该有占位对):
+  // 决定「要不要动手」的门槛必须是当前真实出站形态,否则未超限请求会被误判。
   let currentTokens = estimatePayloadTokens(payload)
+  // 最终形态候选:仅在真裁过后才存在,末尾一次性换入 payload
+  let finalized: KiroHistoryMessage[] | null = null
   const MAX_ITERATIONS = 100 // 防止极端情况死循环
 
   while (currentTokens > maxTokens && (history.length - startIdx) >= 4 && iterations < MAX_ITERATIONS) {
@@ -1465,9 +1557,23 @@ function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed
 
     // 裁剪后 history 可能以 assistant 起头(仅 startIdx=0 场景) → 补 HELLO 重新规范
     history = ensureStartsWithUserMessage(history)
-    payload.conversationState.history = history
-    currentTokens = estimatePayloadTokens(payload)
+    // 每轮 cutAt >= 1 ⇒ history 严格变短 ⇒ 循环必然收敛到「装得下」或「触保护下限」,不会空转
+    finalized = finalizeCandidate(history)
+    currentTokens = estimateWith(finalized)
   }
+
+  if (totalTrimmed === 0 || finalized === null) {
+    // 一条都没裁 → 不插占位、不写回。裁剪只在超限时发生,平时不改内容,
+    // prompt cache 的 prefix 逐字节匹配不受影响(参 727be0b)。
+    return { trimmed: 0, finalTokens: currentTokens, iterations }
+  }
+
+  // 触到保护下限(system pair + 末轮对话)仍装不下时,这里的 currentTokens 会 > maxTokens。
+  // 选择**诚实上报**而不是丢占位对去凑数:占位只值几十 token,丢掉却退回静默丢弃语义,
+  // 而调用方(响应式恢复)靠 trimmed/finalTokens 判断「还能不能再裁」,谎报达标会让它误判。
+  // 全程只有这一次写回,且是本函数**最后一个动作**:
+  // 任何一步(含末次 token 估算)抛异常都必须让 payload 保持原样,半裁 payload 随后仍会被发出/重试。
+  payload.conversationState.history = finalized
 
   return { trimmed: totalTrimmed, finalTokens: currentTokens, iterations }
 }
@@ -1603,6 +1709,32 @@ export function buildKiroPayload(
   // additionalModelRequestFields（thinking 等模型级参数）
   if (additionalModelRequestFields && Object.keys(additionalModelRequestFields).length > 0) {
     payload.additionalModelRequestFields = additionalModelRequestFields
+  }
+
+
+  // ====== 第零阶段：RTK 形态感知压缩(Layer B)======
+  // 顺序刻意钉死在 token 裁剪**之前**:先语义压缩,可能压完就不必丢历史;真要丢也丢的是
+  // 更小的东西。放在裁剪之后等于去压那些已经被丢掉的内容,白做。
+  // 只压 history 里的大 tool_result,绝不碰 currentMessage(用户当前消息逐字节原样出站)。
+  if (enableProxyContextSafetyNet) {
+    const rtkResult = compressToolResults(payload)
+    if (rtkResult.applied) {
+      const line = formatRtkLog(rtkResult.stats)
+      if (line) {
+        console.log(`[KiroPayload] ${line}`)
+        proxyLogger.info('KiroPayload', line, {
+          bytesBefore: rtkResult.stats.bytesBefore,
+          bytesAfter: rtkResult.stats.bytesAfter,
+          hits: rtkResult.stats.hits.length
+        })
+      }
+    } else if (rtkResult.reason === 'error') {
+      // 压缩失败**不是**需要上抛的故障:模块保证 payload 一个字节都没被改,原样出站即可。
+      // 这里只留痕,不改控制流 —— 少一道压缩 < 弄坏一个本来能跑通的请求。
+      const msg = `RTK compression skipped (payload untouched): ${rtkResult.error ?? 'unknown'}`
+      console.warn(`[KiroPayload] ${msg}`)
+      proxyLogger.warn('KiroPayload', msg)
+    }
   }
 
   // ====== 第一阶段：按 token 估算成对裁剪旧 history ======
@@ -1868,6 +2000,43 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw getAbortError(signal)
 }
 
+/**
+ * 每次 fetch 尝试专属的「联动 AbortController」。
+ *
+ * 为什么必须新建而不是复用 callKiroApiStream 的 `signal`:那个 signal 是**调用方注入的
+ * 客户端取消通道**,对它 abort 等于伪造「客户端主动取消」—— parseEventStream 正是从同一个
+ * signal 推导 abort 语义(getAbortError(signal)),污染它会让统计与错误分类全错。
+ *
+ * 语义:外部 signal 单向转发进来(外部取消 → 联动取消);看门狗只能 abort 联动的那个,
+ * 外部 signal 的 aborted 保持 false。
+ *
+ * dispose() 必须在每次尝试结束后调用:转发监听器挂在外部 signal 上,而外部 signal 的寿命
+ * 是整个请求 —— 端点回退 / 429 / 溢出恢复 / 内容过滤 / thinking 重试每轮都新建一个,
+ * 不摘监听器就会随重试轮数线性堆积在同一个 signal 上。
+ */
+function createLinkedAbort(signal?: AbortSignal): {
+  signal: AbortSignal
+  abort: (reason?: unknown) => void
+  dispose: () => void
+} {
+  const controller = new AbortController()
+  if (!signal) {
+    return { signal: controller.signal, abort: (r) => controller.abort(r), dispose: () => undefined }
+  }
+  // 外部已经取消 → 立刻同步过来,别发一个注定被丢弃的请求
+  if (signal.aborted) {
+    controller.abort(signal.reason)
+    return { signal: controller.signal, abort: (r) => controller.abort(r), dispose: () => undefined }
+  }
+  const forward = (): void => controller.abort(signal.reason)
+  signal.addEventListener('abort', forward, { once: true })
+  return {
+    signal: controller.signal,
+    abort: (reason?: unknown) => controller.abort(reason),
+    dispose: () => signal.removeEventListener('abort', forward)
+  }
+}
+
 // 调用 Kiro API（流式）
 /**
  * 判断一个出站失败是否属于「值得整体重试」的瞬时故障。
@@ -1889,6 +2058,19 @@ export function isTransientNetworkError(err: unknown): boolean {
   if (!err) return false
   const e = err as { message?: string; code?: string; cause?: { code?: string; message?: string } }
   const msg = String(e.message ?? '')
+
+  // Layer C 上游静默 → **绝不**走整链重试。看门狗已经掐了上游、也已经把 error 交给下游,
+  // 属于「有专属处置分支」那一类(同 CONTENT_LENGTH_EXCEEDS_THRESHOLD /
+  // THINKING_SIGNATURE_INVALID)。而且静默发生时客户端可能已经收到部分输出,重发会产生
+  // 重复内容;用户还刚白等完一整个静默超时,再重走整条链等于再等好几分钟。
+  //
+  // 这个早退不是装饰:下面的传输层 regex 命中 `fetch failed` / `terminated` /
+  // UND_ERR_* —— 被掐断的 fetch 恰好会以这些形态出现(本轮实测:
+  // {message:'fetch failed', cause:{code:'UND_ERR_ABORTED'}} → true)。
+  // StallError 今天的 message 是 'upstream_stream_stall: ... upstream aborted',实测不命中;
+  // 但只要哪天 message 改词或被 undici 的 cause 包一层,就会静默掉进重试链。按稳定的 code
+  // 判定而不是靠 message 侥幸不匹配。
+  if ((e.code ?? '') === 'upstream_stream_stall') return false
 
   // 带 HTTP 状态码 = 连接是通的,只有 5xx 值得再试
   const httpStatus = msg.match(/\b(?:API|Auth) error (\d{3})\b/)
@@ -1977,6 +2159,15 @@ export async function callKiroApiStream(
   const CONTENT_FILTER_RETRY_BACKOFF_MS = [400, 1200]
   let contentFilterRetryAttempt = 0
 
+  type AttemptAbort = {
+    signal: AbortSignal | undefined
+    abort: (reason?: unknown) => void
+    dispose: () => void
+  }
+  const createAttemptAbort = (): AttemptAbort => enableProxyContextSafetyNet
+    ? createLinkedAbort(signal)
+    : { signal, abort: () => undefined, dispose: () => undefined }
+
   for (let endpointIdx = 0; endpointIdx < endpoints.length; endpointIdx++) {
     const endpoint = endpoints[endpointIdx]
     // [DIAG] 记录本端点实际出站的 modelId,供 catch 分支写入 UI 日志。
@@ -1985,6 +2176,9 @@ export async function callKiroApiStream(
     // vs「映射对了但账户/region 无该模型权限」。诊断可见性是一等公民。
     let outboundModelId: string | undefined
     let clientRequestedModelId: string | undefined
+    // 安全网 ON 时使用尝试专属联动通道;OFF 时原样透传 caller signal。
+    // 429 / thinking 重试会在轮内重建它,故用 let;finally 里统一 dispose 摘监听器。
+    let linked = createAttemptAbort()
     try {
       throwIfAborted(signal)
       const requestPayload = clonePayload(payload)
@@ -2041,8 +2235,8 @@ export async function callKiroApiStream(
       // 之前只有端到端 responseTime,无法分辨「网络+服务端慢」vs「反代自身慢」
       const tFetchStart = Date.now()
       let response = agent
-        ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
-        : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
+        ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal: linked.signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+        : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal: linked.signal })
       const ttfb = Date.now() - tFetchStart
       const usingProxy = agent ? 'proxy' : 'direct'
       console.log(`[Perf] ep=${endpoint.name} region=${dataPlaneRegion || '?'} TTFB=${ttfb}ms status=${response.status} pay=${payloadStr.length}B via=${usingProxy} acc=${account.email || account.id?.slice(0, 8) || '?'}`)
@@ -2077,9 +2271,13 @@ export async function callKiroApiStream(
           console.log(`[KiroAPI] ${endpoint.name} 429 rate-limited, backoff ${waitMs}ms retry ${retried + 1}/${maxRetries} (strategy=${strategy})`)
           await new Promise(r => setTimeout(r, waitMs))
           throwIfAborted(signal)
+          // 每次重发都换一个全新 linked controller:上一个可能已被看门狗掐过(aborted 不可复位),
+          // 复用会让新请求出生即死。旧的先 dispose 摘掉转发监听器,避免按重试次数堆积。
+          linked.dispose()
+          linked = createAttemptAbort()
           response = agent
-            ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
-            : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
+            ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal: linked.signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+            : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal: linked.signal })
           retried++
         }
         if (response.status === 429) {
@@ -2130,7 +2328,7 @@ export async function callKiroApiStream(
         }
         onComplete(u)
       }
-      await parseEventStream(response.body!, onChunk, completeGuard, onError, inputChars, signal, requestedModelId, payloadStr)
+      await parseEventStream(response.body!, onChunk, completeGuard, onError, () => linked.abort(new Error('upstream stream stall — aborted by watchdog')), inputChars, signal, requestedModelId, payloadStr)
       if (retryFilteredEmpty) {
         const waitMs = CONTENT_FILTER_RETRY_BACKOFF_MS[contentFilterRetryAttempt]
         contentFilterRetryAttempt++
@@ -2194,7 +2392,7 @@ export async function callKiroApiStream(
           // trimHistoryByTokens 内含三重保护:跳过 system prompt pair、toolUse/toolResult
           // 成对裁剪(防 orphan → 上游 400)、ensureStartsWithUserMessage。
           const trimResult = trimHistoryByTokens(payload, Math.floor(beforeTokens * ratio))
-          if (trimResult.trimmed > 0) {
+          if (trimResult.trimmed > 0 && trimResult.finalTokens < beforeTokens) {
             const msg = `Context overflow recovery ${overflowRecoveryAttempt}/${CONTEXT_OVERFLOW_RECOVERY_RATIOS.length}: dropped ${trimResult.trimmed} oldest history messages (${beforeMessages}→${payload.conversationState.history?.length ?? 0}, ≈${beforeTokens.toLocaleString()}→${trimResult.finalTokens.toLocaleString()} est. tokens, target ratio ${ratio}), retrying ${endpoint.name}`
             console.warn(`[KiroAPI] ${msg}`)
             proxyLogger.warn('KiroAPI', msg, {
@@ -2208,8 +2406,11 @@ export async function callKiroApiStream(
             endpointIdx--  // 重试同一端点(裁剪后的 payload),不消耗端点 fallback 机会
             continue
           }
-          // 裁不动了(history 已到保护下限)→ 落到下面直接返回
-          console.warn(`[KiroAPI] Context overflow recovery ${overflowRecoveryAttempt} could not trim further (history=${beforeMessages}), giving up`)
+          // 没有真实缩小 payload 时重发同一已知超限请求没有恢复价值。
+          const noProgress = trimResult.trimmed > 0
+            ? `dropped ${trimResult.trimmed} history messages but tokens did not decrease (${beforeTokens.toLocaleString()}→${trimResult.finalTokens.toLocaleString()})`
+            : `could not trim further (history=${beforeMessages})`
+          console.warn(`[KiroAPI] Context overflow recovery ${overflowRecoveryAttempt} ${noProgress}, giving up`)
         }
         const giveUp = `Context window exceeded [model=${outboundModelId ?? 'unset'}] — recovery exhausted after ${overflowRecoveryAttempt} attempt(s); skipping remaining endpoints (same backend limit)`
         console.warn(`[KiroAPI] ${giveUp}`)
@@ -2252,11 +2453,15 @@ export async function callKiroApiStream(
           const retryStr = JSON.stringify(retryPayload)
           const retryHeaders = getAuthHeaders(account, endpoint)
           const retryAgent = getNetworkAgent(account)
+          // 本次重试也要有自己的联动通道:主 fetch 那个可能已被掐过(aborted 不可复位)。
+          // 这条路径尤其不能漏静默保护 —— 用户已经白等过一次失败了。
+          linked.dispose()
+          linked = createAttemptAbort()
           const retryResponse = retryAgent
-            ? await undiciFetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal, dispatcher: retryAgent } as UndiciRequestInit) as unknown as Response
-            : await fetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal })
+            ? await undiciFetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal: linked.signal, dispatcher: retryAgent } as UndiciRequestInit) as unknown as Response
+            : await fetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal: linked.signal })
           if (retryResponse.ok) {
-            await parseEventStream(retryResponse.body!, onChunk, onComplete, onError, retryStr.length, signal, getPayloadModelId(retryPayload), retryStr)
+            await parseEventStream(retryResponse.body!, onChunk, onComplete, onError, () => linked.abort(new Error('upstream stream stall — aborted by watchdog')), retryStr.length, signal, getPayloadModelId(retryPayload), retryStr)
             return
           }
           const retryBody = await retryResponse.text()
@@ -2300,6 +2505,11 @@ export async function callKiroApiStream(
         endpointIdx = -1  // 下轮 ++ 回到 0,重走整条端点链
         continue
       }
+    } finally {
+      // 摘掉挂在外部 signal 上的转发监听器。外部 signal 活整个请求的寿命,而端点回退 /
+      // 429 / 溢出恢复 / 内容过滤 / thinking 重试每轮都新建一个 linked —— 不摘就按重试
+      // 轮数线性堆积。放 finally 覆盖全部出口(return / continue / throw)。
+      linked.dispose()
     }
   }
 
@@ -2487,17 +2697,31 @@ export function sampleTailShape(text: string): {
 }
 
 // 解析 AWS Event Stream 二进制格式
+//
+// Layer C 接线点在**函数内部**,不在调用处。理由:静默保护属于「每一次解析上游流都必须有」
+// 的不变量,放在调用处就变成每个新调用点的自觉义务(今天两处:主路径 + THINKING_SIGNATURE
+// 重试;将来第三处极容易漏)。onStallAbort 刻意做成**必填参数**而不是可选 —— 少传直接编译
+// 不过,漏接线成为类型错误而不是运行时静默缺失。
 async function parseEventStream(
   body: ReadableStream<Uint8Array>,
   onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void | Promise<void>,
   onComplete: (usage: KiroUsage) => void,
   onError: (error: Error) => void,
+  // 判定上游静默后掐断本次 fetch 的动作(必须是 linked controller 的 abort,不是调用方 signal)
+  onStallAbort: () => void,
   inputChars: number = 0,  // 输入字符长度（兜底估算用）
   signal?: AbortSignal,
   modelId?: string,        // 模型 ID，用于 contextUsagePercentage 反推 inputTokens
   payloadStr?: string      // 请求 payload JSON 字符串，用于 tiktoken 精确计算
 ): Promise<void> {
-  const reader = body.getReader()
+  // Layer C:先给上游原始字节流套静默看门狗,再取 reader。
+  // 总开关关闭 / KIRO_PROXY_LAYER_C=false / 看门狗自身构建失败 → 原样返回上游流(纯透传)。
+  // 计时按**原始上游 chunk**,不按 SSE 输出 —— 推理模型会长时间零 SSE 输出但分片一直在到,
+  // 按输出计时会误掐正常的慢思考请求(见 streamWatchdog.ts 顶部)。
+  const guardedBody = enableProxyContextSafetyNet
+    ? wrapStreamWithStallDetection(body, onStallAbort)
+    : body
+  const reader = guardedBody.getReader()
   const abort = () => {
     reader.cancel(getAbortError(signal)).catch(() => undefined)
   }

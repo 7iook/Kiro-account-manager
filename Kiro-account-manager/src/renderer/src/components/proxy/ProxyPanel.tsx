@@ -84,6 +84,8 @@ interface ProxyConfig {
   payloadSizeLimitKB?: number
   enableTokenBufferReserve?: boolean
   tokenBufferReserve?: number
+  // 出站上下文安全网总开关(Layer B RTK 压缩 + Layer C 上游静默看门狗;默认关闭)
+  enableProxyContextSafetyNet?: boolean
   autoSwitchOnQuotaExhausted?: boolean
   accountSelectionStrategy?: 'round-robin' | 'sticky' | 'weighted'
   // v1.7.6 模型能力路由(§3.3)
@@ -1305,6 +1307,22 @@ export function ProxyPanel() {
                     disabled={isRunning || !config.enableTokenBufferReserve}
                     placeholder={isEn ? 'Reserve tokens (default 20000)' : '预留 token 数（默认 20000）'}
                     className="h-9 flex-1"
+                  />
+                </div>
+              </div>
+              {/* Layer B/C 出站上下文安全网总开关(默认关闭) */}
+              <div className="col-span-3 space-y-1.5">
+                <Label htmlFor="enableProxyContextSafetyNet" className="text-xs" title={isEn ? 'Two upstream safety layers. (1) Compresses large tool results in history before any history gets dropped, so long sessions survive longer. (2) Watches the upstream stream: if it goes silent mid-response, the request is aborted with a clear error instead of leaving your client hanging indefinitely. Off by default.' : '两道出站保护。(1) 在丢弃历史之前,先压缩 history 里的大工具结果,让长会话活得更久。(2) 盯住上游流:响应中途静默时主动掐断并明确报错,而不是让客户端无限期挂着等。默认关闭。'}>{isEn ? 'Context Safety Net (compress + stall watchdog)' : '上下文安全网(压缩 + 静默看门狗)'}</Label>
+                <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent w-[260px]">
+                  <span className="text-xs text-muted-foreground">{isEn ? 'Enable' : '启用'}</span>
+                  <Switch
+                    id="enableProxyContextSafetyNet"
+                    checked={config.enableProxyContextSafetyNet || false}
+                    onCheckedChange={(checked) => {
+                      setConfig(prev => ({ ...prev, enableProxyContextSafetyNet: checked }))
+                      window.api.proxyUpdateConfig({ enableProxyContextSafetyNet: checked })
+                    }}
+                    className="scale-90"
                   />
                 </div>
               </div>
