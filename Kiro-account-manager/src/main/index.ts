@@ -764,7 +764,11 @@ function initProxyServer(): ProxyServer {
           console.log(`[ProxyServer] Lazy-synced ${proxyAccounts.length} accounts from store (${boundCount} with bound proxy)`)
         }
       }
-    }
+    },
+    // 自签证书落盘目录（K-2）：由装配层注入，共享内核不再自己 require('electron')。
+    // 传目录本身而非 config 字段 —— config 会被 store 持久化并跨 IPC，
+    // 机器绝对路径混进去会在换机/恢复备份后被当成证书目录用（见 ProxyServer 构造注释）。
+    app.getPath('userData')
   )
 
   // P1-6 注入 webhook 触发器：让反代关键事件（封号 / 全员配额耗尽 / 限流）能推送通知
@@ -1949,9 +1953,15 @@ const verifyApiDeps: VerifyApiDeps = {
  * （`setStoreRef` 在 initStore 末尾才跑）。装配成常量会在模块求值时就绑定，
  * 与 `accountDeps.getStore` 用惰性 getter 同一理由。
  *
- * `newMachineId` 用主进程的 `generateRandomMachineId` —— renderer 侧那份
- * （`store/accounts.ts:33`）用的是 Web Crypto，两者产出同为 64 位 hex，
- * 但共享层跑在主进程，必须用 Node 侧实现。
+ * `newMachineId` 注入 kproxy 的 `generateDeviceId`（`kproxy/index.ts:275`，32 字节 →
+ * 64 位 hex）—— 与 `proxy/types.ts:436` 的账号绑定设备 ID 契约一致，也与 renderer
+ * 侧三处写入（`store/accounts.ts:1053/1604/2424`）同形态。
+ *
+ * 不要改回 `machineId.ts:83` 的 `generateRandomMachineId`：那属于**系统机器码**
+ * 命名空间（产出 UUID，写 Windows 注册表 MachineGuid），与账号绑定域不可互换。
+ * `fce8c89` 曾误注入它，写出的 UUID 形态 machineId 拼进 UA 后匹配不上
+ * `kproxy/mitmProxy.ts:17 KIRO_UA_REGEX`（只认 64 hex），K-Proxy 设备 ID 改写
+ * 对 ksk_ 账号静默失效。闸门见 `test/main/accountService/accountMachineIdFormat.test.ts`。
  */
 function buildApiKeyImportDeps(): ApiKeyImportDeps {
   return {
@@ -1959,7 +1969,7 @@ function buildApiKeyImportDeps(): ApiKeyImportDeps {
     applyMutation: (mutate, opts) => applyAccountDataMutation(mutate, opts),
     now: () => Date.now(),
     newId: () => crypto.randomUUID(),
-    newMachineId: () => machineIdModule.generateRandomMachineId()
+    newMachineId: () => generateDeviceId()
   }
 }
 

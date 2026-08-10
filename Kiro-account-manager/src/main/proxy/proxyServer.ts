@@ -2,6 +2,7 @@
 import http from 'http'
 import https from 'https'
 import fs from 'fs'
+import * as path from 'path'
 import { v4 as uuidv4 } from 'uuid'
 import { safeStringEq, isBindingExternal, isIPAllowed } from '../utils/netGuard'
 import type { Socket } from 'net'
@@ -40,6 +41,7 @@ import { promptCacheTracker } from './promptCacheTracker'
 import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
 import { HoldGate, realClock, type HoldGateRuntimeConfig, type HeldRequestHooks, type HoldReason, type HoldEpisode } from './holdGate'
 import { normalizeHoldConfig } from './holdConfig'
+import { ensureProxySelfSignedCert, type ProxySelfSignedCert } from './selfSignedCert'
 
 
 /**
@@ -409,7 +411,60 @@ export class ProxyServer {
     return undefined
   }
 
-  constructor(config: Partial<ProxyConfig> = {}, events: ProxyServerEvents = {}) {
+  /**
+   * 自签证书落盘根目录（`<userDataPath>/proxy-tls/`）。由**装配层注入**，构造后只读。
+   *
+   * ## 为什么是构造参数，而不是塞进 `config`
+   *
+   * `src/main/index.ts` 有 6 处 `store.set('proxyConfig', server.getConfig())`，
+   * 启动时又把它读回来喂构造函数。若把机器绝对路径混进 `config`，它就会被持久化并
+   * 跨 IPC 发给渲染层；换机 / 换安装位置 / 恢复备份之后，一个**陈旧的外部路径**会被
+   * 当成证书目录用 —— 且不报错。路径是**装配期事实**，不是用户可配置项，
+   * 与 `config` 的生命周期根本不同。
+   *
+   * ## 为什么不是 `logger.ts` 那种模块级 setter
+   *
+   * `setLogTruncationEnabled()` 注入的是一个进程级布尔（全进程共用一个日志器，语义正确）。
+   * 证书目录是 **per-instance** 的：本仓测试里有 39 处 `new ProxyServer(...)`，
+   * 模块级单值会让它们互相覆盖同一份证书；服务端将来多实例同理。故取 `kproxy/index.ts`
+   * 的构造参数形态。
+   *
+   * ## 为什么可选，而不是像 KProxyService 那样缺失即抛
+   *
+   * `KProxyService` 的 `dataPath` 是**每次运行都要用**的（CA 必落盘），缺失即抛是对的。
+   * 而自签证书只在 `tls.enabled` 且未显式提供 cert/key 时才需要 —— 反代默认 HTTP，
+   * 39 处既有测试构造点里没有一处走证书路径。若改成必填，等于为一条可选功能
+   * 让 39 个无关调用点全部改签名（且 `tsconfig.node.json` 不含 `test/**`，
+   * 类型检查根本挡不住漏改，只会在运行时炸）。
+   *
+   * 代价是「装配层漏接线」这一形态：此时三条证书路径**显式失败**（抛 / 返回 null +
+   * 告警），绝不静默退化到 `process.cwd()`。静默兜底会让用户信赖的证书每次换位置
+   * 且无任何报错，现场只剩「证书莫名失效」—— 比启动失败贵得多。
+   */
+  private readonly userDataPath: string | null
+
+  /**
+   * @param userDataPath 用户数据目录**绝对路径**。桌面端传 `app.getPath('userData')`，
+   *   服务端传其配置目录。只用于自签证书落盘（见 `userDataPath` 字段注释）。
+   *   省略则自签证书功能不可用，其余功能不受影响。
+   */
+  constructor(config: Partial<ProxyConfig> = {}, events: ProxyServerEvents = {}, userDataPath?: string) {
+    if (userDataPath !== undefined) {
+      if (typeof userDataPath !== 'string' || userDataPath.trim() === '') {
+        throw new Error(
+          '[ProxyServer] userDataPath 传了却是空值：要么不传（自签证书功能关闭），' +
+            '要么传用户数据目录绝对路径。空串会让证书落到进程 cwd。'
+        )
+      }
+      if (!path.isAbsolute(userDataPath)) {
+        throw new Error(
+          `[ProxyServer] userDataPath 必须是绝对路径，收到相对路径：${userDataPath}。` +
+            '相对路径会随进程 cwd 漂移，等价于把证书写到随机位置。'
+        )
+      }
+    }
+    this.userDataPath = userDataPath ?? null
+
     this.config = {
       enabled: false,
       port: 5580,
@@ -728,10 +783,14 @@ export class ProxyServer {
     } else {
       // 自动生成自签证书（位于 userData/proxy-tls/）
       try {
-        const { app } = require('electron')
-        const { ensureProxySelfSignedCert } = require('./selfSignedCert')
+        if (!this.userDataPath) {
+          // 显式失败而非退化到 cwd：见构造函数 userDataPath 字段注释
+          throw new Error(
+            'userDataPath 未注入（装配层需在构造 ProxyServer 时传入用户数据目录绝对路径）'
+          )
+        }
         const hostnames = [this.config.host || '127.0.0.1']
-        const result = ensureProxySelfSignedCert(app.getPath('userData'), hostnames)
+        const result = ensureProxySelfSignedCert(this.userDataPath, hostnames)
         proxyLogger.info('ProxyServer', `Using self-signed TLS cert (SAN=${result.altNames.join(',')}, fingerprint=${result.fingerprint.slice(0, 19)}...)`)
         cert = result.cert
         key = result.key
@@ -745,12 +804,19 @@ export class ProxyServer {
 
   /**
    * 获取（或生成）反代自签证书信息（供 UI 显示/导出 PEM）
+   *
+   * 未注入 `userDataPath` 时返回 null（并告警），不静默写到 cwd。
    */
-  getSelfSignedCertInfo(): import('./selfSignedCert').ProxySelfSignedCert | null {
+  getSelfSignedCertInfo(): ProxySelfSignedCert | null {
     try {
-      const { app } = require('electron')
-      const { ensureProxySelfSignedCert } = require('./selfSignedCert')
-      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'])
+      if (!this.userDataPath) {
+        proxyLogger.warn(
+          'ProxyServer',
+          'getSelfSignedCertInfo skipped: userDataPath 未注入（装配层未传用户数据目录）'
+        )
+        return null
+      }
+      return ensureProxySelfSignedCert(this.userDataPath, [this.config.host || '127.0.0.1'])
     } catch (err) {
       proxyLogger.warn('ProxyServer', `getSelfSignedCertInfo failed: ${(err as Error).message}`)
       return null
@@ -758,12 +824,17 @@ export class ProxyServer {
   }
 
   /** 强制重新生成自签证书（用户在 UI 上点"重新生成"） */
-  regenerateSelfSignedCert(): import('./selfSignedCert').ProxySelfSignedCert | null {
+  regenerateSelfSignedCert(): ProxySelfSignedCert | null {
     try {
-      const { app } = require('electron')
-      const { ensureProxySelfSignedCert } = require('./selfSignedCert')
+      if (!this.userDataPath) {
+        proxyLogger.warn(
+          'ProxyServer',
+          'regenerateSelfSignedCert skipped: userDataPath 未注入（装配层未传用户数据目录）'
+        )
+        return null
+      }
       this.appendAuditLog('regenerate_self_signed_cert', { host: this.config.host })
-      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'], true)
+      return ensureProxySelfSignedCert(this.userDataPath, [this.config.host || '127.0.0.1'], true)
     } catch (err) {
       proxyLogger.warn('ProxyServer', `regenerateSelfSignedCert failed: ${(err as Error).message}`)
       return null

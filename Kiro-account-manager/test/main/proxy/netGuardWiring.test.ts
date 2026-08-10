@@ -17,7 +17,10 @@ function makeServer(overrides: Partial<ProxyConfig> = {}): any {
     host: '127.0.0.1',
     ...overrides
   } as ProxyConfig
-  return new ProxyServer(config, { getAccounts: () => [] } as any, {} as any)
+  // 第三个实参原为 `{} as any`（两参时代的冗余传参，被静默忽略）。K-2 给构造函数加了
+  // userDataPath 形参后它会真的被收下，故这里改为省略 —— 本文件测的是 IP 护栏，
+  // 不碰自签证书路径。
+  return new ProxyServer(config, { getAccounts: () => [] } as any)
 }
 
 describe('ProxyServer 护栏 wrapper 行为保真（抽取后经类调用）', () => {

@@ -46,12 +46,21 @@ const REPO_ROOT = resolve(__dirname, '../../..')
  *
  * `accountService/verify.ts` 是 ADR-0002 Decision 2 点名的那条穿透链的头，
  * 必须在列：闸门要覆盖的正是它拉进来的整棵子树。
+ *
+ * `proxy/proxyServer.ts` 是 K-2 补进来的。实测(2026-08-10)：K-1 的四个入口算出的闭包
+ * 是 30 个文件，**不含** proxyServer.ts —— 它的两个 value 消费者（`proxy/index.ts` 与
+ * `src/main/index.ts`）都在闭包外，`ipc/panelProxyDeps.ts` 只 `import type`。
+ * 于是它当时藏着三处**函数体内**的 `require('electron')`（喂自签证书目录），
+ * 闸门却照绿：不是判定器漏了形态，而是它够不到这个文件。加为入口后闭包变 40 个文件，
+ * 违规恰好 1 条 —— 就是它自己，修完转绿。反代服务器本身就是服务端形态要跑的东西，
+ * 它必须是入口，不能靠「将来某个文件 import 它」间接进闭包。
  */
 const KERNEL_ENTRY_POINTS = [
   'src/main/kproxy/index.ts',
   'src/main/secureBackup.ts',
   'src/main/secureBackupCipher.aesGcm.ts',
-  'src/main/accountService/verify.ts'
+  'src/main/accountService/verify.ts',
+  'src/main/proxy/proxyServer.ts'
 ]
 
 /** ESM / CJS / 动态 import 三形态 */
