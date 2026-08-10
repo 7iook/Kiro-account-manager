@@ -1,7 +1,23 @@
 // 代理服务器日志模块
+//
+// ## 为什么这里没有 `import { app } from 'electron'`
+//
+// 本模块是**共享内核**的一部分（`accountService/verify.ts` → `proxy/kiroApi.ts` →
+// 本文件），既要在 Electron 桌面端跑，也要在 Linux 服务器的裸 node 下跑。
+// 而 `electron` 在本仓是 **devDependency**：服务器 `npm install --omit=dev`
+// 之后该模块根本不存在，任何静态 import 都会让整条链死在模块解析期。
+//
+// 处理姿态与 `utils/webPanelAssetRoot.ts` 一致：**把平台差异推到装配层，
+// 并从共享代码里删掉分支**。所以这里既不做 DI 容器，也不写
+// `await import('electron')` —— 后者只是把依赖藏得更晚、还躲过静态检查，
+// 等于没解耦。取而代之：唯一一个平台相关的事实（是否为生产构建）由装配层
+// （`src/main/index.ts`）在启动早期显式注入，见 `setLogTruncationEnabled`。
+//
+// 同一动作里删掉了 `ProxyLogger.configure()` 的「默认日志目录」分支：它依赖
+// `app.getPath('userData')`，且是**死代码** —— 全仓无 configure() 调用点，
+// 且 `DEFAULT_CONFIG.enabled === false`。详见 `configure()` 上方注释。
 import * as fs from 'fs'
 import * as path from 'path'
-import { app } from 'electron'
 import { normalizeAndRedactLogEntry } from '../utils/redact'
 
 export interface LogEntry {
@@ -27,6 +43,38 @@ const DEFAULT_CONFIG: LoggerConfig = {
   logToConsole: true
 }
 
+/**
+ * INFO 级 data 是否强制截断为 200B preview（原 `app.isPackaged` 闸门）。
+ *
+ * ## 默认为 true（= 截断开启）的理由
+ *
+ * 这个默认值的唯一职责，是回答「没人注入时，谁来承担代价」。两侧代价不对称：
+ *   - 默认 true 而实际在开发机 → 日志 data 被截断，调试信息变少，**可恢复**
+ *     （装配层注入 false，或临时改一行）。
+ *   - 默认 false 而实际在生产 → 每条 INFO 日志 stringify 整个对象，
+ *     CPU 峰值把事件循环拖死（2026-07-23 frontend-freeze RCA 假设 B 的原始病灶），
+ *     **在线上表现为卡死，且没人会注意到日志系统悄悄换了行为**。
+ *
+ * 服务器场景恰好落在「没人注入」这一格：裸 node 下没有 `app.isPackaged` 这个概念，
+ * 且服务器天然是生产环境。若默认 false，服务器就会**静默退化成 dev 行为** ——
+ * 一个只在压力上来之后才暴露的性能地雷。所以默认取安全侧。
+ *
+ * 桌面端由 `src/main/index.ts` 在 `interceptConsole()` 之前注入 `app.isPackaged`，
+ * 从而恢复「dev 不截断」的原有开发体验。
+ */
+let logTruncationEnabled = true
+
+/**
+ * 由装配层注入「当前是否为生产构建」。
+ *
+ * 桌面端传 `app.isPackaged`；服务器端不调用即可（默认已是安全侧）。
+ * 必须在任何日志产生之前、且在 `interceptConsole()` 之前调用 —— 晚一步
+ * 就会有早期日志按错误的档位处理。
+ */
+export function setLogTruncationEnabled(enabled: boolean): void {
+  logTruncationEnabled = enabled
+}
+
 class ProxyLogger {
   private config: LoggerConfig
   private logStream: fs.WriteStream | null = null
@@ -37,12 +85,32 @@ class ProxyLogger {
     this.config = { ...DEFAULT_CONFIG }
   }
 
+  /**
+   * 开启/配置文件日志。
+   *
+   * ## `logDir` 现在是「开启文件日志」的必要输入，不再有默认值
+   *
+   * 原实现在 `enabled && !logDir` 时回落到
+   * `path.join(app.getPath('userData'), 'logs', 'proxy')`。该分支被删除，
+   * 而不是换个方式保留，理由是它**从来无法执行**：
+   *   - 全仓没有任何 `configure()` 调用点（`index.ts:165` 的注释亦如此记载）；
+   *   - 且 `DEFAULT_CONFIG.enabled === false`，即使被调用也要显式传 enabled。
+   * 也就是说文件日志在生产从未启用过。把一条走不到的路径改写成「服务器上也能
+   * 算出目录」，只是凭空造第二个可疑事实源；真要启用文件日志时，调用方本就
+   * 该明确说出写到哪 —— 桌面端有 userData，服务器端没有，这正是装配层的决定。
+   *
+   * 所以：想开文件日志 → 必须同时给 `logDir`。缺失时不静默降级、也不猜路径，
+   * 而是保持 enabled=false 并告警 —— 静默猜一个目录会让日志落到没人找的地方。
+   */
   configure(config: Partial<LoggerConfig>): void {
     this.config = { ...this.config, ...config }
-    
+
     if (this.config.enabled && !this.config.logDir) {
-      // 默认日志目录
-      this.config.logDir = path.join(app.getPath('userData'), 'logs', 'proxy')
+      console.warn(
+        '[ProxyLogger] configure({ enabled: true }) 缺少 logDir —— ' +
+        '文件日志保持关闭（不猜测目录）。调用方须显式提供写入目录。'
+      )
+      this.config.enabled = false
     }
 
     if (this.config.enabled) {
@@ -458,7 +526,7 @@ export function interceptConsole(): void {
     // 生产 gate:INFO 级别 data 强制走 200B preview,消除 stringify 全对象的 CPU 峰值
     // 详见 2026-07-23 frontend-freeze RCA 假设 B
     let finalData = norm.data
-    if (app.isPackaged && level === 'INFO' && finalData != null) {
+    if (logTruncationEnabled && level === 'INFO' && finalData != null) {
       try {
         const s = typeof finalData === 'string' ? finalData : JSON.stringify(finalData)
         if (s.length > 200) {

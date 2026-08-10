@@ -1,5 +1,8 @@
 // K-Proxy 模块入口
-import { app } from 'electron'
+//
+// 本模块属于**共享内核**：零 electron 依赖，能在纯 node（Linux 服务器）下加载。
+// 用户数据目录由装配层注入（桌面端传 `app.getPath('userData')`，服务端传配置目录），
+// 与 `proxy/logger.ts:ProxyLogStore.initialize(userDataPath)` 同一姿态。
 import * as path from 'path'
 import { CertManager, createCertManager } from './certManager'
 import { MitmProxy } from './mitmProxy'
@@ -18,6 +21,14 @@ export { CertManager } from './certManager'
 export { MitmProxy } from './mitmProxy'
 
 /**
+ * K-Proxy 数据目录的**唯一**拼法（SSOT）。CA 证书、私钥、证书缓存都落在这里。
+ * 两端共用同一算法，避免桌面与服务端各拼一次、日后漂移成两个目录。
+ */
+export function resolveKProxyDataPath(userDataPath: string): string {
+  return path.join(userDataPath, 'kproxy')
+}
+
+/**
  * K-Proxy 服务管理器
  */
 export class KProxyService {
@@ -26,14 +37,40 @@ export class KProxyService {
   private config: KProxyConfig
   private events: KProxyEvents
   private deviceIdMappings: Map<string, DeviceIdMapping> = new Map()
-  private dataPath: string
+  /** CA 证书与缓存的落盘根目录。构造时定型，之后只读 —— 见构造函数注释 */
+  readonly dataPath: string
   private initialized: boolean = false
   private cachedCaInfo: CACertInfo | null = null
 
-  constructor(config: Partial<KProxyConfig> = {}, events: KProxyEvents = {}) {
+  /**
+   * @param userDataPath 用户数据目录**绝对路径**。桌面端传 `app.getPath('userData')`，
+   *   服务端传其配置目录。
+   *
+   *   为什么是构造参数而不是 setter：`dataPath` 在这里算完就交给
+   *   `createCertManager(this.dataPath)`（见 `initialize()`），CA 证书与私钥都落在它下面。
+   *   若改成「先构造、后注入」，窗口期内 `dataPath` 是空串 —— 此时若有人触发
+   *   `initialize()`，CA 会被写到进程 cwd 而**不会报错**：用户下次启动拿到一张全新 CA，
+   *   已装的信任全部失效，现场只能看到「证书莫名失效」。
+   *
+   *   同理这里对缺失/相对路径**直接抛**而不兜底：静默用 cwd 兜底会让 CA 每次换位置，
+   *   且没有任何报错 —— 启动失败远比这种静默漂移便宜。
+   */
+  constructor(config: Partial<KProxyConfig> = {}, events: KProxyEvents = {}, userDataPath: string) {
     this.config = { ...DEFAULT_KPROXY_CONFIG, ...config }
     this.events = events
-    this.dataPath = path.join(app.getPath('userData'), 'kproxy')
+    if (typeof userDataPath !== 'string' || userDataPath.trim() === '') {
+      throw new Error(
+        '[KProxyService] userDataPath 缺失：必须由装配层注入用户数据目录绝对路径' +
+          '（桌面端为 Electron 的 userData 目录，服务端为其配置目录）。'
+      )
+    }
+    if (!path.isAbsolute(userDataPath)) {
+      throw new Error(
+        `[KProxyService] userDataPath 必须是绝对路径，收到相对路径：${userDataPath}。` +
+          '相对路径会随进程 cwd 漂移，等价于把 CA 写到随机位置。'
+      )
+    }
+    this.dataPath = resolveKProxyDataPath(userDataPath)
   }
 
   /**
@@ -218,13 +255,16 @@ export function getKProxyService(): KProxyService | null {
 
 /**
  * 初始化 K-Proxy 服务
+ *
+ * @param userDataPath 用户数据目录绝对路径，透传给构造函数（见其注释：必须构造时可用）
  */
 export function initKProxyService(
   config: Partial<KProxyConfig> = {},
-  events: KProxyEvents = {}
+  events: KProxyEvents = {},
+  userDataPath: string
 ): KProxyService {
   if (!kproxyService) {
-    kproxyService = new KProxyService(config, events)
+    kproxyService = new KProxyService(config, events, userDataPath)
   }
   return kproxyService
 }
