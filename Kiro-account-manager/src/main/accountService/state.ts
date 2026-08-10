@@ -12,12 +12,19 @@
  *   - 写入成功后广播 `accounts-data-changed { revision, changedIds, originId }`（payload 白名单）。
  */
 
-/** electron-store 实例的最小接口签名（与 index.ts:1762 声明一致） */
-type StoreRef = {
-  get: (key: string, defaultValue?: unknown) => unknown
-  set: (key: string, value: unknown) => void
-  path: string
-}
+/**
+ * store 实例的最小接口签名。
+ *
+ * K-3 起改为引用 `persistence/accountStorePort` 的 `AccountStorePort` —— 此前这里、
+ * `types.ts:AccountStoreRef`、`ipc/webPanelWiring.ts:WebPanelStoreRef` 三处各手抄了
+ * 一份同形状声明，每份注释都写着「与 index.ts 的声明一致」。靠注释同步的副本正是
+ * §4.3 要消灭的形态：改一处另两处不会报错，直到某天形状真的分叉。
+ *
+ * 保留 `StoreRef` 这个本地名字是为了不动本文件其余引用点（纯别名，零行为变化）。
+ */
+import type { AccountStorePort } from '../persistence/accountStorePort'
+
+type StoreRef = AccountStorePort
 
 /**
  * accountData 落盘 blob 顶层结构。

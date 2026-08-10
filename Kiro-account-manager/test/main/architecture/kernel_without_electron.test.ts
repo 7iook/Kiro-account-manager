@@ -54,13 +54,30 @@ const REPO_ROOT = resolve(__dirname, '../../..')
  * 闸门却照绿：不是判定器漏了形态，而是它够不到这个文件。加为入口后闭包变 40 个文件，
  * 违规恰好 1 条 —— 就是它自己，修完转绿。反代服务器本身就是服务端形态要跑的东西，
  * 它必须是入口，不能靠「将来某个文件 import 它」间接进闭包。
+ * `src/main/accountService/state.ts` 与 `persistence/accountStorePort.ts` 是 K-3 补的。
+ * 实测(2026-08-10)：K-2 的五个入口算出的闭包是 40 个文件，**不含** `state.ts`、
+ * 也不含 `accounts.ts` —— 它们是 accountData 写入的收口(`applyAccountDataMutation`)与
+ * load/save 路径，服务端形态必然要加载，但从那五个入口一个都到不了
+ * （真实依赖方向是 `accountService/index.ts` → `state.ts`，而 index.ts 本身在闭包外；
+ * `verify.ts` 不 import 它们）。同一个「够不到所以照绿」的形态在 K-1 → K-2 已重现过一次，
+ * 这是第三次：**闭包能覆盖多少，取决于入口列全没列全，而入口是手列的**。
+ *
+ * `persistence/accountStorePort.ts` 加为入口而非依赖 `state.ts` 间接带入：
+ * `state.ts` 只 `import type` 它，而类型导入会被 esbuild 擦除 —— 若只靠这条边，
+ * 端口文件在运行时其实不在模块图里，靠它「间接进闭包」是把闸门建在一条会消失的边上。
+ * 服务端实现 `accountStore.conf.ts` 由端口文件的 value 消费者带入？不 —— 它没有被
+ * 端口 import（方向相反）。故也显式列为入口。
  */
 const KERNEL_ENTRY_POINTS = [
   'src/main/kproxy/index.ts',
   'src/main/secureBackup.ts',
   'src/main/secureBackupCipher.aesGcm.ts',
   'src/main/accountService/verify.ts',
-  'src/main/proxy/proxyServer.ts'
+  'src/main/proxy/proxyServer.ts',
+  'src/main/accountService/state.ts',
+  'src/main/accountService/accounts.ts',
+  'src/main/persistence/accountStorePort.ts',
+  'src/main/persistence/accountStore.conf.ts'
 ]
 
 /** ESM / CJS / 动态 import 三形态 */
@@ -302,5 +319,25 @@ describe('architecture: 共享内核零 electron 依赖（模块图闸门）', (
       'utf-8'
     )
     expect(desktop).toMatch(/safeStorage/)
+  })
+
+  it('持久化端口不依赖 electron-store（它内部 import electron，见其 index.js:3）', () => {
+    // electron-store 自己 `import electron from 'electron'`（v11.0.2 的第 3 行），
+    // 而它从 `app.getPath('userData')` 推导 cwd —— 服务端既加载不了也用不上。
+    // 内核只能依赖它的基类 `conf`（已核实 conf@15.0.2 零 electron 依赖）。
+    for (const f of [
+      'src/main/persistence/accountStorePort.ts',
+      'src/main/persistence/accountStore.conf.ts'
+    ]) {
+      const code = stripComments(readFileSync(resolve(REPO_ROOT, f), 'utf-8'))
+      expect(code, `${f} 不应依赖 electron-store`).not.toMatch(/['"]electron-store['"]/)
+    }
+  })
+
+  it('accountData 写入收口在闭包内（服务端形态必须能加载它）', () => {
+    // 这条自检的对象是**闸门自己的覆盖面**，不是被测代码：state.ts 是所有
+    // accountData 写入的唯一收口，它若在闭包外，「内核零 electron」就没覆盖写路径。
+    expect(graph.files).toContain('src/main/accountService/state.ts')
+    expect(graph.files).toContain('src/main/persistence/accountStorePort.ts')
   })
 })

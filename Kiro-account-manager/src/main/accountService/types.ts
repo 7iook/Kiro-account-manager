@@ -11,6 +11,7 @@
  * 可变状态一律走 getter/setter 而非传值:index.ts 里的 IDE token watcher 与
  * ProactiveRenewal 定时器**也读**这些变量,传值会产生两个副本(recon §3 要点 2)。
  */
+import type { AccountStorePort } from '../persistence/accountStorePort'
 
 /** 反代账号池中账号的最小形状(只用到绑定代理) */
 export interface PoolAccountRef {
@@ -247,12 +248,14 @@ export interface BatchSummary {
 
 // ============ store 读写依赖（W2 剥离引入，与上面 AccountRuntimeDeps 合并为一份并集）============
 
-/** electron-store 实例的最小读接口（与 index.ts 的 `store` 声明一致） */
-export type AccountStoreRef = {
-  get: (key: string, defaultValue?: unknown) => unknown
-  set: (key: string, value: unknown) => void
-  path: string
-}
+/**
+ * store 实例的最小读写接口。
+ *
+ * K-3 起是 `persistence/accountStorePort:AccountStorePort` 的别名 —— 原先这里、
+ * `state.ts:StoreRef`、`ipc/webPanelWiring.ts:WebPanelStoreRef` 各持一份手抄声明。
+ * 保留这个导出名是因为 `index.ts:103` 与 `accounts.test.ts:19` 都在按名引用它。
+ */
+export type AccountStoreRef = AccountStorePort
 
 // ============ Kiro 用量 API 的响应形状 ============
 // 说明：index.ts 里同一份 API 响应被 4 个 handler 各自用局部 interface 声明了一遍

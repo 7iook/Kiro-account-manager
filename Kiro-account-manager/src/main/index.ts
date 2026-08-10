@@ -107,6 +107,15 @@ import {
   type ApiKeyImportDeps,
   type ApiKeyImportInput
 } from './accountService'
+// 持久化端口（K-3）：数据文件名 / 混淆密钥 / 四态前置校验的单一真源。
+// 桌面仍用 electron-store 构造实例（它额外提供 renderer 侧 IPC 桥，且正在正常工作），
+// 但**判据**与服务端共用同一份 —— 否则两端会各自漂移出不同的失败行为。
+import {
+  ACCOUNT_STORE_ENCRYPTION_KEY,
+  ACCOUNT_STORE_NAME,
+  adaptRawStoreToPort,
+  preflightAccountStore
+} from './persistence/accountStorePort'
 import {
   createTray,
   destroyTray,
@@ -1977,13 +1986,58 @@ async function initStore(): Promise<void> {
   if (store) return
   const Store = (await import('electron-store')).default
   const path = await import('path')
-  
+
+  // ============ K-3 数据故障前置校验（桌面走三态，不含写权限） ============
+  //
+  // 决策卡 `decision-card.md:103-106` 的四态位于该卡的**服务器迁移**章节
+  // （周围不变量 I1a/I1b/I1c 通篇在讲把数据文件拷到服务器），本是服务端启动语义。
+  // 逐条判断哪些也该管桌面 ——
+  // 实测(2026-08-10 本机 node v22 · conf 15.0.2，用 conf + 显式 cwd 等价复刻本构造)桌面现状：
+  //   ① 文件不存在        → 构造成功、空库启动、写入成功    ← 与决策卡一致，无需改
+  //   ② 存在但解不开      → `new Store()` 抛 `SyntaxError: Unexpected token`
+  //                          （conf 把解密失败退化成「把密文当明文 JSON.parse」）
+  //                          结果**已经**是拒绝启动，但错误信息完全不指向真实原因：
+  //                          运维/用户看到 JSON 语法错误，不会想到是加密密钥不符
+  //   ③ 版本比预期新      → 构造成功、正常启动 ← 与决策卡 ③ 冲突（但见下：该字段今天不存在）
+  //   ④ 数据目录/文件只读 → **桌面不查**。它是服务器才真实存在的处境（挂载权限 /
+  //                          容器卷 / 服务用户不拥有拷进来的文件）；桌面上是「装了应用、
+  //                          它写自己的 %APPDATA%」，那个处境几乎不存在。在这儿加闸门等于
+  //                          用「多一条桌面拒绝启动的路」换「守一件桌面不会发生的事」。
+  //                          闸门本体仍在端口里（`assertAccountStoreWritable`），
+  //                          由服务端的 `preflightAccountStoreForServer` 调用。
+  //
+  // 故这里调的是**不含写权限**的 `preflightAccountStore`。**对桌面端的可见行为变化**：
+  //   - ②：仍然拒绝启动（行为不变），但错误信息从 JSON 语法错误变成明确说明
+  //   - ①③④：无变化（③ 的版本字段是 K-3 新引入的，现存数据一律无此字段 = 判为兼容）
+  // 即本轮**没有给桌面新增任何一条拒绝启动的路**。
+  const dataDir = app.getPath('userData')
+  preflightAccountStore(dataDir)
+
   const storeInstance = new Store({
-    name: 'kiro-accounts',
-    encryptionKey: 'kiro-account-manager-secret-key'
+    name: ACCOUNT_STORE_NAME,
+    // 混淆密钥收口到 persistence 端口的常量 —— 桌面与服务端**必须**用同一个值，
+    // 否则一端写的文件另一端读不开。ADR-0002 已裁决它是混淆非安全，且**禁止改动**：
+    // 改了等于让所有既有用户的 kiro-accounts.json 再也读不开。
+    encryptionKey: ACCOUNT_STORE_ENCRYPTION_KEY
   })
   
-  store = storeInstance as unknown as typeof store
+  // 桌面 store 引用经端口适配器包一层，而不是直接把 electron-store 实例赋过去。
+  //
+  // 唯一目的：把 `set(key, undefined)` 翻译成 `delete(key)`。实测(2026-08-10 · conf 15.0.2)
+  // `conf` 对 `set(key, undefined)` 抛 `TypeError: Use \`delete()\` to clear values`，
+  // **且旧值留在盘上**。本文件的 orphan session 清理有三处这种写法（:458 / :477 / :486），
+  // 都裹在只 console.warn 的 catch 里 —— 于是快照永远清不掉，每次启动被重新归档一次，
+  // 历史里出现字节完全相同的重复条目（本机实测已产生 7 条重复）。
+  //
+  // 修在装配层而不是那三个调用点：调用点的语义本来就是「清掉这个键」，
+  // 让每处各自记得改写成 delete 是三次机会各错一次；收在这里则新增调用点自动受益，
+  // 且与服务端实现（`accountStore.conf.ts`）共用同一份翻译逻辑。
+  store = adaptRawStoreToPort({
+    get: (key: string, defaultValue?: unknown) => storeInstance.get(key, defaultValue),
+    set: (key: string, value: unknown) => storeInstance.set(key, value),
+    delete: (key: string) => storeInstance.delete(key),
+    path: storeInstance.path
+  })
   
   // 尝试从备份恢复数据（如果主数据损坏）。备份优先读加密 .enc，兼容旧明文 .json
   try {

@@ -23,12 +23,20 @@ import {
   type RawInterfaceAddress
 } from '../webPanel/addressClassify'
 import type { PanelRouteDeps, PanelAccountIdentity } from '../webPanel/routes'
+import type { AccountStorePort } from '../persistence/accountStorePort'
 
-/** electron-store 的最小接口（与 accountService/state.ts:StoreRef 同一风格） */
-export interface WebPanelStoreRef {
-  get: (key: string, defaultValue?: unknown) => unknown
-  set: (key: string, value: unknown) => void
-}
+/**
+ * store 的最小接口。
+ *
+ * K-3 起收敛到 `persistence/accountStorePort:AccountStorePort`（原先这里、
+ * `accountService/state.ts`、`accountService/types.ts` 各持一份手抄声明）。
+ *
+ * ⚠️ 一处**刻意的收窄**：本文件只需要 `get`/`set`，原声明没有 `path`。
+ * 这里用 `Pick` 而不是直接等于端口 —— 面板装配确实不该看见数据文件路径
+ * （它没有备份职责），把 `path` 一并暴露只会让将来有人在面板层拼路径。
+ * 而 `Pick` 仍然由端口驱动：端口改了 `get`/`set` 的签名，这里会立刻报错。
+ */
+export type WebPanelStoreRef = Pick<AccountStorePort, 'get' | 'set'>
 
 /** store 里的配置键 —— 与 `proxyConfig` / `kproxyConfig` 同级同风格 */
 const CONFIG_KEY = 'webPanelConfig'
