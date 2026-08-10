@@ -225,6 +225,32 @@ export async function setOverage(id: string, enabled: boolean): Promise<void> {
  * 是否存在），不是「客户端发过启动请求所以应该在跑」。UI 必须以它为准，
  * 绝不能在发出启动请求后乐观地把开关拨到「运行中」。
  */
+/**
+ * One release action inside a hold round.
+ *
+ * `outcome` is the field that matters most when reading this on a phone:
+ * `resumed-and-served` means the release actually got an account and forwarded the
+ * request, so the client received real content; `re-held` means it found no account
+ * and the request went straight back to being held, so the client only saw heartbeats.
+ * A run of `re-held` rows tells you the release count is not keeping the request alive.
+ */
+export interface PanelHoldRelease {
+  at: number
+  trigger: 'auto' | 'manual' | 'pool-available' | 'poll'
+  outcome: 'pending' | 'resumed-and-served' | 're-held' | 'ended'
+  outcomeAt: number | null
+}
+
+/** One round of holding: from "nothing held" to "nothing held" again. */
+export interface PanelHoldEpisode {
+  id: number
+  reason: 'account-blocked' | 'account-auth-failure' | 'pool-empty'
+  detail: string[]
+  startedAt: number
+  endedAt: number | null
+  releases: PanelHoldRelease[]
+}
+
 export interface ProxyStatus {
   success?: boolean
   running: boolean
@@ -269,6 +295,14 @@ export interface ProxyStatus {
   nextAutoReleaseAt: number | null
   /** 本次反代启动以来自动放行的**周期次数**（不是条目数）；手动放行不计入 */
   autoReleaseCount: number
+  /**
+   * Hold timeline: the round in progress plus recently finished rounds.
+   * Required for the same reason as the three fields above -- the server sends them
+   * on every branch, so a missing field means the contract drifted, and that must
+   * fail at compile time instead of rendering as a calm "nothing held".
+   */
+  currentEpisode: PanelHoldEpisode | null
+  recentEpisodes: PanelHoldEpisode[]
 }
 
 export async function fetchProxyStatus(): Promise<ProxyStatus> {

@@ -60,6 +60,7 @@ describe('整池重建(clear→add)必须迁移运行期状态', () => {
       stop: async () => undefined,
       getStats: () => ({ totalRequests: 0, successRequests: 0, failedRequests: 0 }),
       getHoldAutoReleaseState: () => ({ autoReleaseEnabled: false, nextAutoReleaseAt: null, autoReleaseCount: 0 }),
+      getHeldRequestsInfo: () => ({ count: 0, autoReleaseEnabled: false, nextAutoReleaseAt: null, autoReleaseCount: 0, currentEpisode: null, recentEpisodes: [] }),
       releaseHeldRequests: () => 0
     }
     const deps = buildPanelProxyDeps({
@@ -97,6 +98,7 @@ describe('整池重建(clear→add)必须迁移运行期状态', () => {
       stop: async () => undefined,
       getStats: () => ({ totalRequests: 0, successRequests: 0, failedRequests: 0 }),
       getHoldAutoReleaseState: () => ({ autoReleaseEnabled: false, nextAutoReleaseAt: null, autoReleaseCount: 0 }),
+      getHeldRequestsInfo: () => ({ count: 0, autoReleaseEnabled: false, nextAutoReleaseAt: null, autoReleaseCount: 0, currentEpisode: null, recentEpisodes: [] }),
       releaseHeldRequests: () => 0
     } as ProxyServerRef
     const deps = buildPanelProxyDeps({

@@ -13,6 +13,7 @@
 import { describe, it, expect } from 'vitest'
 import { buildPanelProxyDeps, type ProxyServerRef, type PanelProxyStatus } from '../../../src/main/ipc/panelProxyDeps'
 import type { ProxyConfig } from '../../../src/main/proxy/types'
+import type { HoldEpisode } from '../../../src/main/proxy/holdGate'
 
 interface StubOpts {
   running?: boolean
@@ -20,6 +21,8 @@ interface StubOpts {
   nextAutoReleaseAt?: number | null
   autoReleaseCount?: number
   heldCount?: number
+  currentEpisode?: HoldEpisode | null
+  recentEpisodes?: HoldEpisode[]
 }
 
 function makeServerRef(opts: StubOpts = {}): ProxyServerRef & { releaseCalls: number } {
@@ -40,6 +43,17 @@ function makeServerRef(opts: StubOpts = {}): ProxyServerRef & { releaseCalls: nu
       autoReleaseEnabled: opts.autoReleaseEnabled ?? false,
       nextAutoReleaseAt: opts.nextAutoReleaseAt ?? null,
       autoReleaseCount: opts.autoReleaseCount ?? 0
+    }),
+    // Single construction point on the proxy side: count + the three auto-release
+    // fields + the two timeline fields. Derived from getHoldAutoReleaseState() so the
+    // stub never carries a second copy of those field names.
+    getHeldRequestsInfo: () => ({
+      count: held,
+      autoReleaseEnabled: opts.autoReleaseEnabled ?? false,
+      nextAutoReleaseAt: opts.nextAutoReleaseAt ?? null,
+      autoReleaseCount: opts.autoReleaseCount ?? 0,
+      currentEpisode: opts.currentEpisode ?? null,
+      recentEpisodes: opts.recentEpisodes ?? []
     }),
     releaseHeldRequests: () => {
       ref.releaseCalls++

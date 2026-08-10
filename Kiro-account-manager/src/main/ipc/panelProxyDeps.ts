@@ -26,7 +26,8 @@ import {
 } from '../proxy/activation'
 import type { AccountPool } from '../proxy/accountPool'
 import type { ProxyConfig } from '../proxy/types'
-import type { HoldAutoReleaseState } from '../proxy/proxyServer'
+import type { HoldAutoReleaseState, HeldRequestsInfo } from '../proxy/proxyServer'
+import type { HoldEpisode } from '../proxy/holdGate'
 
 /** 反代服务器的最小接口（避免把整个 ProxyServer 类型拖进来） */
 export interface ProxyServerRef {
@@ -50,6 +51,12 @@ export interface ProxyServerRef {
    * 巨大负倒计时，而那看起来像渲染 bug 而非「没有下一次」。
    */
   getHoldAutoReleaseState: () => HoldAutoReleaseState
+  /**
+   * Single construction point on the proxy side (count + auto-release state + timeline).
+   * The desktop pull, the desktop push event and this panel all read the same shape,
+   * so the field sets cannot drift apart.
+   */
+  getHeldRequestsInfo: () => HeldRequestsInfo
   /** 手动放行全部挂起请求。@returns 实际放行数（幂等，无挂起时 0） */
   releaseHeldRequests: () => number
 }
@@ -128,6 +135,14 @@ export interface PanelProxyStatus {
   nextAutoReleaseAt: number | null
   /** 本次反代启动以来自动放行的**周期次数**（不是条目数）。手动放行不计入 */
   autoReleaseCount: number
+  /**
+   * Current in-progress hold round: trigger reason, when it started, and every
+   * release with its outcome. null = nothing is held right now.
+   * The phone panel is read-only here (routes.ts deliberately takes no config params).
+   */
+  currentEpisode: HoldEpisode | null
+  /** Most recent finished hold rounds, newest first (at most 20). */
+  recentEpisodes: HoldEpisode[]
 }
 
 function bindingContext(data: ReturnType<PanelProxyDepsImpl['loadAccountData']>): ProxyBindingContext {
@@ -217,7 +232,10 @@ export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): {
         // 没有门闸实例 → 关闭态 + 无下一次。`null` 而不是 0（0 是合法 epoch）
         autoReleaseEnabled: false,
         nextAutoReleaseAt: null,
-        autoReleaseCount: 0
+        autoReleaseCount: 0,
+        // No hold gate instance yet, so there is no timeline to read.
+        currentEpisode: null,
+        recentEpisodes: []
       }
     }
     const config = server.getConfig()
@@ -227,7 +245,7 @@ export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): {
     // 「配置开着」与「调度器真的在跑」是两件事，按配置推算就会显示
     // 「自动放行已开启」而实际不执行（决策卡 §1 Must NOT #5）。
     // 字段名与 `HoldAutoReleaseState` 逐字一致，故整体展开而不逐字段搬运。
-    const auto = server.getHoldAutoReleaseState()
+    const { count: _heldCount, ...auto } = server.getHeldRequestsInfo()
     const selectedId = config.enableMultiAccount === false ? config.selectedAccountIds?.[0] : undefined
     const out: PanelProxyStatus = {
       success: true,

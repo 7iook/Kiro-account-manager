@@ -8,7 +8,7 @@ import { homedir as nodeHomedir } from 'node:os'
 import { encode, decode } from 'cbor-x'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import icon from '../../resources/icon.png?asset'
-import { ProxyServer, configureProxyClients, type ProxyAccount, type ProxyConfig, type ProxyClientTarget, type ProxyClientModel } from './proxy'
+import { ProxyServer, configureProxyClients, type ProxyAccount, type ProxyConfig, type ProxyClientTarget, type ProxyClientModel, type HeldRequestsInfo } from './proxy'
 import { 
   initKProxyService, 
   getKProxyService, 
@@ -50,7 +50,7 @@ import {
 import { refreshOidcTokenAcrossRegions } from './oidcRefresh'
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
-import { proxyLogStore, interceptConsole } from './proxy/logger'
+import { proxyLogStore, interceptConsole, setLogTruncationEnabled } from './proxy/logger'
 import { installIpcSizeGuard } from './utils/emitToRenderer'
 import { installStdioGuard } from './utils/stdioGuard'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
@@ -1982,7 +1982,13 @@ async function initStore(): Promise<void> {
     if (!mainData) {
       try {
         const { readSecureBackup } = await import('./secureBackup')
-        const backupData = await readSecureBackup(path.dirname(storeInstance.path)) as { accounts?: unknown } | null
+        // 加解密能力由装配层注入：桌面用 safeStorage（OS keyring）。
+        // 内核 secureBackup 不认识 electron，服务端注入 AES-GCM 实现。
+        const { createSafeStorageBackupCipher } = await import('./secureBackupCipher.safeStorage')
+        const backupData = await readSecureBackup(
+          path.dirname(storeInstance.path),
+          createSafeStorageBackupCipher()
+        ) as { accounts?: unknown } | null
         if (backupData && backupData.accounts) {
           console.log('[Store] Restoring data from backup...')
           // initStore bootstrap 阶段:store 引用尚未注入 accountService/state,
@@ -1991,8 +1997,18 @@ async function initStore(): Promise<void> {
           storeInstance.set('accountData', { ...(backupData as Record<string, unknown>), revision: 0 })
           console.log('[Store] Data restored from backup successfully')
         }
-      } catch {
-        // 备份也不存在，忽略
+      } catch (e) {
+        // readSecureBackup 现在把「没有备份」和「备份解不开」区分开了：
+        // 前者返回 null（走不到这里），所以进到这个 catch 说明**有**一份备份却读不开
+        // （keyring 变更 / 文件损坏）。不能再当「备份也不存在，忽略」静默吞掉 ——
+        // 那正是把一次可修复的故障变成静默数据丢失的地方。
+        // 这里只记不抛：主数据缺失叠加备份损坏时，仍要让应用能起来（用户可手动导入），
+        // 崩在启动路径上会让用户连界面都进不去，反而更难自救。
+        console.error(
+          '[Store] 备份存在但无法恢复（不覆盖任何现有数据）。若刚更换过系统密钥环或迁移过机器，' +
+            '旧备份可能已无法解密：',
+          e
+        )
       }
     }
   } catch (error) {
@@ -2403,8 +2419,11 @@ async function writeBackupNow(): Promise<void> {
   try {
     const path = await import('path')
     const { writeSecureBackup, isSecureBackupAvailable } = await import('./secureBackup')
-    await writeSecureBackup(path.dirname(store.path), data)
-    console.log(`[Backup] Data backup created (${isSecureBackupAvailable() ? 'encrypted' : 'plaintext-fallback'})`)
+    // 加解密能力由装配层注入（同 initStore 处注释）
+    const { createSafeStorageBackupCipher } = await import('./secureBackupCipher.safeStorage')
+    const cipher = createSafeStorageBackupCipher()
+    await writeSecureBackup(path.dirname(store.path), data, cipher)
+    console.log(`[Backup] Data backup created (${isSecureBackupAvailable(cipher) ? 'encrypted' : 'plaintext-fallback'})`)
   } catch (error) {
     console.error('[Backup] Failed to create backup:', error)
   }
@@ -2945,6 +2964,7 @@ function createWindow(): void {
         const savedKProxyConfig = store?.get('kproxyConfig') as KProxyConfig | undefined
         if (savedKProxyConfig?.autoStart) {
           console.log('[KProxy] Auto-starting K-Proxy MITM...')
+          // 用户数据目录由装配层注入（内核零 electron 依赖，见 kproxy/index.ts 头部）
           const service = initKProxyService(savedKProxyConfig, {
             onRequest: (info) => {
               mainWindow?.webContents.send('kproxy-request', info)
@@ -2962,7 +2982,7 @@ function createWindow(): void {
             onMitmIntercept: (host, modified) => {
               mainWindow?.webContents.send('kproxy-mitm', { host, modified })
             }
-          })
+          }, app.getPath('userData'))
           await service.initialize()
           await service.start()
           console.log('[KProxy] Auto-started successfully')
@@ -3098,6 +3118,12 @@ function handleProtocolUrl(url: string): void {
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
   // 初始化日志系统（尽早拦截，确保所有 console 输出都进入日志存储）
+  //
+  // 平台差异注入点：logger 是共享内核，不再自己 import electron（见其文件头）。
+  // 它对「是否生产构建」的默认判断取安全侧(截断开启)，桌面端在这里把真实的
+  // app.isPackaged 交给它，从而恢复「dev 不截断、便于调试」的开发体验。
+  // 必须在 interceptConsole() 之前 —— 晚一步就有早期日志按错误档位处理。
+  setLogTruncationEnabled(app.isPackaged)
   proxyLogStore.initialize(app.getPath('userData'))
   interceptConsole()
 
@@ -6443,17 +6469,22 @@ app.whenReady().then(async () => {
 
   // IPC: 查询当前挂起中的请求数(前端徽标 + 放行按钮启用条件)
   ipcMain.handle('proxy-get-held-requests', () => {
+    // 反代未运行 / 异常时的空读数。**单一字面量**:此前两条兜底路径各手抄一份字段列表,
+    // 每次给 HeldRequestsInfo 加字段都得同步改两处,漏一处就是「前端字段时有时无」(E-060 形态)。
+    const emptyInfo = (): HeldRequestsInfo => ({
+      count: 0,
+      autoReleaseEnabled: false,
+      nextAutoReleaseAt: null,
+      autoReleaseCount: 0,
+      currentEpisode: null,
+      recentEpisodes: []
+    })
     try {
-      if (!proxyServer) {
-        return { count: 0, autoReleaseEnabled: false, nextAutoReleaseAt: null, autoReleaseCount: 0 }
-      }
-      return {
-        count: proxyServer.getHeldRequestsCount(),
-        ...proxyServer.getHoldAutoReleaseState()
-      }
+      if (!proxyServer) return emptyInfo()
+      return proxyServer.getHeldRequestsInfo()
     } catch (error) {
       console.error('[ProxyServer] Get held requests failed:', error)
-      return { count: 0, autoReleaseEnabled: false, nextAutoReleaseAt: null, autoReleaseCount: 0 }
+      return emptyInfo()
     }
   })
 
@@ -6463,6 +6494,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('kproxy-init', async () => {
     try {
       const savedConfig = store?.get('kproxyConfig') as Partial<KProxyConfig> | undefined
+      // 用户数据目录由装配层注入（内核零 electron 依赖，见 kproxy/index.ts 头部）
       const service = initKProxyService(savedConfig || {}, {
         onRequest: (info) => {
           mainWindow?.webContents.send('kproxy-request', info)
@@ -6480,7 +6512,7 @@ app.whenReady().then(async () => {
         onMitmIntercept: (host, modified) => {
           mainWindow?.webContents.send('kproxy-mitm', { host, modified })
         }
-      })
+      }, app.getPath('userData'))
       const caInfo = await service.initialize()
       return { 
         success: true, 

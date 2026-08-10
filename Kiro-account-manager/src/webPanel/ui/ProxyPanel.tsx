@@ -26,7 +26,9 @@ import {
   stopProxy,
   syncProxyPool,
   type AccountListItem,
-  type ProxyStatus
+  type ProxyStatus,
+  type PanelHoldEpisode,
+  type PanelHoldRelease
 } from '../api/panel'
 import { PanelApiError } from '../api/client'
 import { formatCountdown, formatPercent } from './format'
@@ -392,6 +394,9 @@ export function ProxyPanel({
             放行需要反代处于运行状态
           </p>
         )}
+        {/* Hold timeline: why it started, when, and what each release led to.
+            A run of "又挂回" means those releases did not deliver content to the client. */}
+        <HoldTimelineBlock current={status?.currentEpisode ?? null} recent={status?.recentEpisodes ?? []} now={now} />
       </div>
 
       <button
@@ -507,6 +512,170 @@ function AccountPicker({ accounts, selectedId, onClose, onPick }: AccountPickerP
           </ul>
         )}
       </div>
+    </div>
+  )
+}
+
+/** epoch ms -> HH:MM:SS(本地时区)。时间线看的是本轮会话内的钟点,不显示日期。 */
+function holdClockTime(ms: number): string {
+  const d = new Date(ms)
+  const p = (n: number): string => n.toString().padStart(2, '0')
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+/** 时长 ms -> 「X 分 Y 秒」/「Y 秒」。 */
+function holdDuration(ms: number): string {
+  const sec = Math.max(0, Math.round(ms / 1000))
+  if (sec < 60) return `${sec} 秒`
+  return `${Math.floor(sec / 60)} 分 ${sec % 60} 秒`
+}
+
+const HOLD_REASON_TEXT: Record<PanelHoldEpisode['reason'], string> = {
+  'account-blocked': '账号封禁或额度上限',
+  'account-auth-failure': '账号授权失效',
+  'pool-empty': '池内无号可试'
+}
+
+const HOLD_TRIGGER_TEXT: Record<PanelHoldRelease['trigger'], string> = {
+  auto: '定时',
+  manual: '手动',
+  'pool-available': '池恢复',
+  poll: '轮询'
+}
+
+/**
+ * 放行结局的显示样式。
+ *
+ * 这一列是整个时间线里最要紧的信息：它区分两种结果相反的情况。
+ * - `resumed-and-served`：放行真的拿到号并转发成功 → 客户端收到真实内容 → 它的空闲看守重新计时
+ * - `re-held`：放行没找到号，请求立刻又挂回去 → 客户端只看到心跳 → 看守**没有**重新计时
+ *
+ * 所以连续几行「又挂回」意味着「已放行 N 次」这个数字并不代表请求能一直活着。
+ */
+const HOLD_OUTCOME_STYLE: Record<
+  PanelHoldRelease['outcome'],
+  { text: string; cls: string }
+> = {
+  'resumed-and-served': { text: '已续接', cls: 'text-emerald-700 dark:text-emerald-400' },
+  're-held': { text: '又挂回', cls: 'text-amber-700 dark:text-amber-400' },
+  ended: { text: '已结束', cls: 'text-rose-700 dark:text-rose-400' },
+  pending: { text: '进行中', cls: 'text-slate-400' }
+}
+
+/** 一轮挂起里的放行明细（最新在前 —— 长时间挂起时用户最关心刚刚那几次）。 */
+function HoldReleaseList({ ep }: { ep: PanelHoldEpisode }): React.JSX.Element {
+  if (ep.releases.length === 0) {
+    return <p className="mt-0.5 pl-3 text-xs text-slate-400">尚未放行过</p>
+  }
+  return (
+    <div className="mt-0.5 space-y-0.5 pl-3">
+      {[...ep.releases].reverse().map((r, i) => {
+        const style = HOLD_OUTCOME_STYLE[r.outcome]
+        return (
+          <p
+            key={`${ep.id}-${r.at}-${i}`}
+            className="flex items-baseline gap-1.5 text-xs tabular-nums text-slate-600 dark:text-slate-300"
+          >
+            <span className="text-slate-400">#{ep.releases.length - i}</span>
+            <span>{holdClockTime(r.at)}</span>
+            <span className="text-slate-400">{HOLD_TRIGGER_TEXT[r.trigger]}</span>
+            <span className="text-slate-400">→</span>
+            <span className={style.cls}>{style.text}</span>
+            {r.outcomeAt !== null && r.outcomeAt > r.at && (
+              <span className="text-slate-400">（{holdDuration(r.outcomeAt - r.at)}）</span>
+            )}
+          </p>
+        )
+      })}
+    </div>
+  )
+}
+
+/**
+ * 手机端挂起时间线 —— 只读，无任何操作入口。
+ *
+ * 「只看不改」是既有的面板边界（`routes.ts` 刻意不接受配置参数：手机误触代价大于收益），
+ * 本区块沿用它 —— 放行按钮已在上方，这里不再重复提供动作。
+ *
+ * `now` 由父组件的秒级心跳传入，不自建定时器：父组件已有一个用于倒计时的 1s tick，
+ * 再开一个只会让手机多一次重渲染。无挂起记录时整块不渲染，不占屏。
+ */
+function HoldTimelineBlock({
+  current,
+  recent,
+  now
+}: {
+  current: PanelHoldEpisode | null
+  recent: PanelHoldEpisode[]
+  now: number
+}): React.JSX.Element | null {
+  const [expanded, setExpanded] = useState(false)
+  if (!current && recent.length === 0) return null
+
+  return (
+    <div className="mt-3 border-t border-slate-100 pt-3 dark:border-slate-800">
+      <p className="text-xs text-slate-500 dark:text-slate-400">挂起时间线（本轮会话）</p>
+
+      {current && (
+        <div className="mt-1">
+          <p className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-sm text-slate-800 dark:text-slate-200">
+            <span className="rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-500/15 dark:text-amber-400">
+              挂起中
+            </span>
+            <span>{HOLD_REASON_TEXT[current.reason]}</span>
+            <span className="text-xs text-slate-500 dark:text-slate-400">
+              始于 {holdClockTime(current.startedAt)}
+            </span>
+            <span className="text-xs text-slate-500 dark:text-slate-400">
+              （{holdDuration(now - current.startedAt)}）
+            </span>
+            <span className="text-xs text-slate-500 dark:text-slate-400">
+              已放行 {current.releases.length} 次
+            </span>
+          </p>
+          {current.detail.length > 0 && (
+            <p className="mt-0.5 break-all pl-3 text-xs text-slate-500 dark:text-slate-400">
+              {current.detail.join(' · ')}
+            </p>
+          )}
+          <HoldReleaseList ep={current} />
+        </div>
+      )}
+
+      {recent.length > 0 && (
+        <div className="mt-1.5">
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="h-11 text-xs text-slate-500 underline-offset-2 active:underline dark:text-slate-400"
+          >
+            {expanded ? '收起' : `更早的挂起轮次（${recent.length}）`}
+          </button>
+          {expanded && (
+            <div className="space-y-1.5">
+              {recent.map((ep) => (
+                <div key={ep.id}>
+                  <p className="flex flex-wrap items-baseline gap-x-2 text-xs tabular-nums text-slate-600 dark:text-slate-300">
+                    <span className="text-slate-400">{HOLD_REASON_TEXT[ep.reason]}</span>
+                    <span>{holdClockTime(ep.startedAt)}</span>
+                    {ep.endedAt !== null && (
+                      <>
+                        <span className="text-slate-400">→</span>
+                        <span>{holdClockTime(ep.endedAt)}</span>
+                        <span className="text-slate-400">
+                          （{holdDuration(ep.endedAt - ep.startedAt)}）
+                        </span>
+                      </>
+                    )}
+                    <span className="text-slate-400">{ep.releases.length} 次</span>
+                  </p>
+                  <HoldReleaseList ep={ep} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }

@@ -215,6 +215,222 @@ function AutoReleaseCountdown({ nextAt, isEn }: { nextAt: number | null; isEn: b
   return <span className="tabular-nums">{`${mm}:${ss.toString().padStart(2, '0')}`}</span>
 }
 
+/** 时间线读数形状(与主进程 HeldRequestsInfo 逐字同名;此处只声明消费所需字段)。 */
+type HoldReleaseView = {
+  at: number
+  trigger: 'auto' | 'manual' | 'pool-available' | 'poll'
+  outcome: 'pending' | 'resumed-and-served' | 're-held' | 'ended'
+  outcomeAt: number | null
+}
+type HoldEpisodeView = {
+  id: number
+  reason: 'account-blocked' | 'account-auth-failure' | 'pool-empty'
+  detail: string[]
+  startedAt: number
+  endedAt: number | null
+  releases: HoldReleaseView[]
+}
+
+/** epoch ms → HH:MM:SS(本地时区)。时间线全部显示钟点,不显示日期 —— 观测的是本轮会话。 */
+function clockTime(ms: number): string {
+  const d = new Date(ms)
+  return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`
+}
+
+/** 时长(ms)→ 人读的 “Xm Ys” / “Ys”。 */
+function humanDuration(ms: number, isEn: boolean): string {
+  const sec = Math.max(0, Math.round(ms / 1000))
+  if (sec < 60) return isEn ? `${sec}s` : `${sec} 秒`
+  const m = Math.floor(sec / 60)
+  const s = sec % 60
+  return isEn ? `${m}m ${s}s` : `${m} 分 ${s} 秒`
+}
+
+/**
+ * 挂起时间线面板 —— 回答用户的三个问题:这次为什么挂、几点开始、每次放行放完之后怎么了。
+ *
+ * 「放完之后怎么了」(outcome)是这里最要紧的一列,它区分两种结果相反的情况:
+ * - `resumed-and-served` 放行后真的拿到号并转发成功 → 客户端收到语义正文 → 其空闲看守计时**被重置**
+ * - `re-held` 放行后仍无号,请求又挂回去了 → 客户端只收到心跳 → 看守计时**没被重置**
+ * 后者连续出现时,「放行了 N 次」这个数字并不代表请求能一直活着 —— 这一列就是用来看穿它的。
+ */
+function HoldTimeline({
+  current,
+  recent,
+  isEn
+}: {
+  current: HoldEpisodeView | null
+  recent: HoldEpisodeView[]
+  isEn: boolean
+}): React.JSX.Element | null {
+  // 每秒 tick 一次,让「已挂起 X 分 Y 秒」这个连续量走起来(仅本组件重渲染)。
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    if (!current) return
+    const timer = setInterval(() => setTick((n) => n + 1), 1000)
+    return () => clearInterval(timer)
+  }, [current])
+
+  if (!current && recent.length === 0) return null
+
+  const reasonText = (r: HoldEpisodeView['reason']): string =>
+    r === 'account-blocked'
+      ? isEn ? 'account blocked / quota exhausted' : '账号封禁或额度上限'
+      : r === 'account-auth-failure'
+        ? isEn ? 'account authorization failed' : '账号授权失效'
+        : isEn ? 'no account in pool' : '池内无号可试'
+
+  const outcomeBadge = (o: HoldReleaseView['outcome']): React.JSX.Element => {
+    const map = {
+      'resumed-and-served': {
+        cls: 'text-success',
+        zh: '已续接',
+        en: 'served',
+        tip: isEn
+          ? 'The release actually got an account and forwarded the request, so the client received real content and its idle watchdog restarted.'
+          : '这次放行真的拿到了号并转发成功,客户端收到了真实内容,它的空闲看守随之重新计时。'
+      },
+      're-held': {
+        cls: 'text-warning',
+        zh: '又挂回',
+        en: 're-held',
+        tip: isEn
+          ? 'The release found no usable account, so the request went straight back to being held. The client only saw heartbeats, so its idle watchdog did NOT restart.'
+          : '这次放行没找到可用号,请求立刻又挂了回去。客户端只看到心跳,它的空闲看守**没有**重新计时。'
+      },
+      ended: {
+        cls: 'text-destructive',
+        zh: '已结束',
+        en: 'ended',
+        tip: isEn ? 'The request ended here (budget ran out or the client went away).' : '请求在这里结束了(预算用完或客户端已断开)。'
+      },
+      pending: {
+        cls: 'text-muted-foreground',
+        zh: '进行中',
+        en: 'pending',
+        tip: isEn ? 'Waiting to see what this release leads to.' : '这次放行的结果还没落定。'
+      }
+    }[o]
+    return (
+      <span className={map.cls} title={map.tip}>
+        {isEn ? map.en : map.zh}
+      </span>
+    )
+  }
+
+  const triggerText = (t: HoldReleaseView['trigger']): string =>
+    t === 'auto'
+      ? isEn ? 'auto' : '定时'
+      : t === 'manual'
+        ? isEn ? 'manual' : '手动'
+        : t === 'pool-available'
+          ? isEn ? 'pool ready' : '池恢复'
+          : isEn ? 'poll' : '轮询'
+
+  const renderReleases = (ep: HoldEpisodeView): React.JSX.Element => {
+    if (ep.releases.length === 0) {
+      return (
+        <div className="text-xs text-muted-foreground pl-4">
+          {isEn ? 'no release yet' : '尚未放行过'}
+        </div>
+      )
+    }
+    // 最新在前:长时间挂起时用户最关心刚刚那几次。
+    return (
+      <div className="pl-4 space-y-0.5">
+        {[...ep.releases].reverse().map((r, i) => (
+          <div key={`${ep.id}-${r.at}-${i}`} className="text-xs flex items-center gap-2 tabular-nums">
+            <span className="text-muted-foreground">#{ep.releases.length - i}</span>
+            <span>{clockTime(r.at)}</span>
+            <span className="text-muted-foreground">{triggerText(r.trigger)}</span>
+            <span>→</span>
+            {outcomeBadge(r.outcome)}
+            {r.outcomeAt !== null && r.outcomeAt > r.at && (
+              <span className="text-muted-foreground">({humanDuration(r.outcomeAt - r.at, isEn)})</span>
+            )}
+          </div>
+        ))}
+      </div>
+    )
+  }
+
+  return (
+    <div className="col-span-3 space-y-2 p-2 rounded-md bg-muted/30 border border-border/60">
+      <div className="text-xs font-medium flex items-center gap-1.5">
+        <Clock className="h-3.5 w-3.5" />
+        {isEn ? 'Hold Timeline' : '挂起时间线'}
+        <span
+          className="text-muted-foreground font-normal"
+          title={
+            isEn
+              ? 'Records each round of holding: why it started, when, and what each release led to. In-memory only, cleared when the proxy stops.'
+              : '记录每一轮挂起:为什么挂、几点开始、每次放行之后发生了什么。仅存内存,停止服务即清空。'
+          }
+        >
+          {isEn ? '(this session)' : '(本轮会话)'}
+        </span>
+      </div>
+
+      {current && (
+        <div className="space-y-1">
+          <div className="text-xs flex items-center gap-2 flex-wrap">
+            <span className="px-1.5 py-0.5 rounded bg-warning/15 text-warning font-medium">
+              {isEn ? 'HOLDING' : '挂起中'}
+            </span>
+            <span className="text-muted-foreground">{isEn ? 'reason' : '原因'}</span>
+            <span className="font-medium">{reasonText(current.reason)}</span>
+            <span className="text-muted-foreground">{isEn ? 'since' : '始于'}</span>
+            <span className="tabular-nums">{clockTime(current.startedAt)}</span>
+            <span className="text-muted-foreground">
+              ({humanDuration(Date.now() - current.startedAt, isEn)})
+            </span>
+            <span className="text-muted-foreground">
+              {isEn ? `· released ${current.releases.length}x` : `· 已放行 ${current.releases.length} 次`}
+            </span>
+          </div>
+          {current.detail.length > 0 && (
+            <div className="text-xs text-muted-foreground pl-4 break-all">
+              {current.detail.join(' · ')}
+            </div>
+          )}
+          {renderReleases(current)}
+        </div>
+      )}
+
+      {recent.length > 0 && (
+        <details className="text-xs">
+          <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+            {isEn ? `Earlier rounds (${recent.length})` : `更早的挂起轮次 (${recent.length})`}
+          </summary>
+          <div className="mt-1.5 space-y-2">
+            {recent.map((ep) => (
+              <div key={ep.id} className="space-y-0.5">
+                <div className="flex items-center gap-2 flex-wrap tabular-nums">
+                  <span className="text-muted-foreground">{reasonText(ep.reason)}</span>
+                  <span>{clockTime(ep.startedAt)}</span>
+                  {ep.endedAt !== null && (
+                    <>
+                      <span>→</span>
+                      <span>{clockTime(ep.endedAt)}</span>
+                      <span className="text-muted-foreground">
+                        ({humanDuration(ep.endedAt - ep.startedAt, isEn)})
+                      </span>
+                    </>
+                  )}
+                  <span className="text-muted-foreground">
+                    {isEn ? `${ep.releases.length}x` : `${ep.releases.length} 次`}
+                  </span>
+                </div>
+                {renderReleases(ep)}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
+  )
+}
+
 export function ProxyPanel() {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
@@ -227,6 +443,9 @@ export function ProxyPanel() {
   const [nextAutoReleaseAt, setNextAutoReleaseAt] = useState<number | null>(null)
   // 本次「启动服务 → 停止服务」之间的自动放行周期数,反代停止即归零(与 sessionStats 同生命周期)
   const [autoReleaseCount, setAutoReleaseCount] = useState(0)
+  // 挂起时间线(决策卡 hold-gate-observability):当前进行中的一轮 + 最近已结束的若干轮。
+  const [holdEpisode, setHoldEpisode] = useState<HoldEpisodeView | null>(null)
+  const [recentHoldEpisodes, setRecentHoldEpisodes] = useState<HoldEpisodeView[]>([])
   const [config, setConfig] = useState<ProxyConfig>({
     enabled: false,
     port: 5580,
@@ -505,17 +724,22 @@ export function ProxyPanel() {
     })
 
     // 挂起门闸:订阅挂起数变化 + 初次拉取当前值
-    // 形状按决策卡 §3 读数契约:`count` 之外还带三个自动放行字段。主进程侧(W2)扩形状前它们是
-    // undefined,故这里用可选字段读取 —— 扩之前后都编译得过,不需要断言,也不会因为一端先落地而报错。
+    // 形状按决策卡 §3 读数契约:`count` 之外还带三个自动放行字段 + 两个时间线字段。
+    // 全部用可选读取 —— 主进程任一端先落地都编译得过,不需要断言。
+    // **拉取与推送共用这一个函数**:两条路径不可能各自漏读某个字段。
     const applyHeldInfo = (info: {
       count: number
       nextAutoReleaseAt?: number | null
       autoReleaseCount?: number
+      currentEpisode?: HoldEpisodeView | null
+      recentEpisodes?: HoldEpisodeView[]
     }): void => {
       setHeldCount(info.count)
       // `?? null`:把「主进程还没扩这个字段」(undefined)与「明确没有下一次」(null)归一成同一显示态「—」
       setNextAutoReleaseAt(info.nextAutoReleaseAt ?? null)
       setAutoReleaseCount(info.autoReleaseCount ?? 0)
+      setHoldEpisode(info.currentEpisode ?? null)
+      setRecentHoldEpisodes(info.recentEpisodes ?? [])
     }
     const unsubHeld = window.api.onProxyHeldRequestsChanged((info) => {
       applyHeldInfo(info)
@@ -1526,6 +1750,21 @@ export function ProxyPanel() {
                         <AutoReleaseCountdown nextAt={gateOn && autoOn ? nextAutoReleaseAt : null} isEn={isEn} />
                       </span>
                     </div>
+                    <div className="flex items-center gap-1.5">
+                      <Label
+                        className="text-xs text-muted-foreground"
+                        title={
+                          isEn
+                            ? 'How many auto-release CYCLES have fired since the proxy started (not how many requests were released — one cycle releases everything held at that moment). Resets when you stop the service. This can be larger than the number of rows in the timeline below, because a cycle that fired while nothing was held still counts here.'
+                            : '本次启动服务以来自动放行触发了多少**个周期**(不是放行了多少个请求 —— 一个周期会把当时挂起的全部放掉)。停止服务即归零。它可能比下方时间线里的条数多,因为「触发了但当时没有可放的请求」那种空周期也计在这里。'
+                        }
+                      >
+                        {isEn ? 'Released' : '累计放行'}
+                      </Label>
+                      <span className="text-xs font-bold tabular-nums">
+                        {isEn ? `${autoReleaseCount}x` : `${autoReleaseCount} 次`}
+                      </span>
+                    </div>
                     {actionBreaksLoop && autoOn && (
                       <div className="w-full flex items-start gap-1.5 text-xs text-warning">
                         <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
@@ -1539,6 +1778,9 @@ export function ProxyPanel() {
                   </div>
                 )
               })()}
+              {/* 挂起时间线(决策卡 hold-gate-observability):触发原因 / 起始时刻 / 每次放行及其结局。
+                  无任何挂起记录时组件自身返回 null,不占位。 */}
+              <HoldTimeline current={holdEpisode} recent={recentHoldEpisodes} isEn={isEn} />
               {/* Agent Mode + Workspace Path（Steering 文件注入） */}
               <div className="col-span-3 grid grid-cols-3 gap-x-3 items-end">
                 <div className="space-y-1.5">

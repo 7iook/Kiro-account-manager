@@ -38,7 +38,7 @@ import {
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
 import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
-import { HoldGate, realClock, type HoldGateRuntimeConfig, type HeldRequestHooks } from './holdGate'
+import { HoldGate, realClock, type HoldGateRuntimeConfig, type HeldRequestHooks, type HoldReason, type HoldEpisode } from './holdGate'
 import { normalizeHoldConfig } from './holdConfig'
 
 
@@ -103,6 +103,13 @@ export interface HoldAutoReleaseState {
 export interface HeldRequestsInfo extends HoldAutoReleaseState {
   /** 当前挂起中的请求数。 */
   count: number
+  /**
+   * 当前进行中的那一轮挂起(含触发原因 / 起始时刻 / 已放行明细);`null` = 当前无挂起。
+   * 决策卡 hold-gate-observability。
+   */
+  currentEpisode: HoldEpisode | null
+  /** 最近已结束的挂起轮次,最新在前(≤ 20)。 */
+  recentEpisodes: HoldEpisode[]
 }
 
 type ModelModality = 'text' | 'audio' | 'image' | 'video' | 'pdf'
@@ -510,10 +517,21 @@ export class ProxyServer {
    * 前端字段时有时无」。收口成一个方法后,该失败形态在结构上不可能出现。
    */
   private buildHeldRequestsInfo(): HeldRequestsInfo {
+    const timeline = this.holdGate.getTimeline()
     return {
       count: this.holdGate.getHeldCount(),
-      ...this.getHoldAutoReleaseState()
+      ...this.getHoldAutoReleaseState(),
+      currentEpisode: timeline.current,
+      recentEpisodes: timeline.recent
     }
+  }
+
+  /**
+   * 挂起读数的**公开出口**(IPC 拉取用)。与推送事件共用同一 {@link buildHeldRequestsInfo},
+   * 故拉取与推送的形状在结构上不可能分叉。
+   */
+  getHeldRequestsInfo(): HeldRequestsInfo {
+    return this.buildHeldRequestsInfo()
   }
 
   /** 触发挂起数变化事件(task#3 在 enterHold/abort 后调,驱动前端徽标)。 */
@@ -3858,7 +3876,8 @@ export class ProxyServer {
     }
 
     // 挂起等待:进入 HELD,直到 resume(手动/自动)/ 超时 / abort 认领。返回 true=被 resume(应重试),false=终态。
-    const waitInHold = (): Promise<boolean> => {
+    // reason/detail 仅用于可观测性时间线(决策卡 hold-gate-observability),不参与任何控制流判断。
+    const waitInHold = (reason: HoldReason, detail: string[]): Promise<boolean> => {
       return new Promise<boolean>((resolveHold) => {
         let holdId = 0
         const settleHold = (retry: boolean): void => { this.emitHeldRequestsChanged(); resolveHold(retry) }
@@ -3868,7 +3887,7 @@ export class ProxyServer {
           sendError: () => { onTimeoutError(); this.recordRequestFailed(); settleHold(false) },
           sendGracefulStop: () => { onTimeoutGracefulStop(); this.recordRequestFailed(); settleHold(false) }
         }
-        holdId = this.holdGate.enterHold({ receivedAt: startTime, hooks })
+        holdId = this.holdGate.enterHold({ receivedAt: startTime, hooks, reason, detail })
         this.emitHeldRequestsChanged()
         // 客户端中途断开 → abort 该挂起条目(停心跳、清 timer、认领作废),视为终态。
         const onAbort = (): void => { this.holdGate.abort(holdId); this.emitHeldRequestsChanged(); settleHold(false) }
@@ -3918,16 +3937,35 @@ export class ProxyServer {
           this.recordRequestFailed()
           return
         }
-        const shouldRetry = await waitInHold()
+        // 时间线观测(决策卡 hold-gate-observability):把已经算好的决策事实映射成 HoldReason。
+        // 分类口径复用上面同一组变量(poolBlocked / errKind),不新建第二套判据。
+        const holdReason: HoldReason = poolBlocked
+          ? 'account-blocked'
+          : errKind === 'account-level-auth-failure'
+            ? 'account-auth-failure'
+            : 'pool-empty'
+        const holdDetail = decision === 'hold' ? this.accountPool.describeBlockedAccounts() : []
+        const shouldRetry = await waitInHold(holdReason, holdDetail)
         if (!shouldRetry) return // 超时/abort 终态
         acc = await pickFresh()
         if (!acc) { triedIds.clear(); acc = await pickFresh() } // resume 后仍未拿到(去抖竞争),清 tried 再试一次
+        if (!acc) {
+          // 本轮放行后仍无号 → 即将重新挂起。这是「乙世界」:客户端本轮拿不到任何语义正文字节,
+          // 其 idle watchdog 计时**未被重置**。记下它,界面上才能区分「放行有效」与「放行空转」。
+          this.holdGate.settleLastRelease('re-held')
+        }
         continue
       }
       triedIds.add(acc.id)
       if (holdDebugEnabled) console.log(`[HoldGate][DEBUG] attempt start · account=${acc.email || acc.id} · triedCount=${triedIds.size}`)
       const outcome = await attempt(acc, recordError)
-      if (outcome === 'done') return // 终态(成功 / 已吐正文失败 / abort)
+      if (outcome === 'done') {
+        // 拿到号并跑完一次完整转发 → 客户端真的收到了语义正文(甲世界)。
+        // 若本次是被放行唤醒后才跑成的,这一笔就是「放行真的续上了命」的直接证据。
+        // 无 pending 放行记录时该调用是 no-op(从未挂起过的正常请求)。
+        this.holdGate.settleLastRelease('resumed-and-served')
+        return // 终态(成功 / 已吐正文失败 / abort)
+      }
       // 首字节前失败:先即时切下一个未试过的号,拿不到再挂起。
       if (holdDebugEnabled) console.log(`[HoldGate][DEBUG] attempt returned pre_body_failed · trying next account`)
       acc = await pickFresh()

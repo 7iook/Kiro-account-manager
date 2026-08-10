@@ -72,7 +72,75 @@ export interface HoldGateDeps {
 export interface EnterHoldParams {
   receivedAt: number
   hooks: HeldRequestHooks
+  /**
+   * 本次挂起的触发原因(可观测性 · 决策卡 hold-gate-observability)。
+   *
+   * **由 `ProxyServer` 传入,门闸不自行推断** —— 门闸不认识账号池,分类逻辑的权威源是
+   * `proxyServer.decideHoldAction` / `shouldHoldForNoAccount` / `isAccountLevelAuthFailure`。
+   * (同「autoReleaseEnabled 生效值」那次的教训:门闸不知 holdWhenNoAccount,故计算层归 ProxyServer。)
+   * 缺省回落 `'pool-empty'` —— 界面不显示"未知",那等于没观测。
+   */
+  reason?: HoldReason
+  /** 原因细节,直接来自 `accountPool.describeBlockedAccounts()`;可空数组。 */
+  detail?: string[]
 }
+
+/**
+ * 挂起触发原因。枚举照 `proxyServer` 现有决策分类,不自造第二套口径。
+ */
+export type HoldReason =
+  /** 池内有号被封禁 / 额度耗尽(shouldHoldForNoAccount) */
+  | 'account-blocked'
+  /** 最近的 pre-body 错误是账号级授权失效(isAccountLevelAuthFailure) */
+  | 'account-auth-failure'
+  /** 无 pre-body 错误:池空 / UI 指定号不在池 / 池未同步 */
+  | 'pool-empty'
+
+/**
+ * 一次放行之后**究竟发生了什么** —— 本轮可观测性的承重字段。
+ *
+ * 为什么必须有它:`autoReleaseCount`(放行了几次)单独存在时,无法区分两个结果完全相反的世界:
+ *   - `resumed-and-served`:放行拿到号 → 真吐语义正文 → 客户端 idle watchdog 计时**被重置** → 功能有效
+ *   - `re-held`:放行仍无号 → 重新 enterHold → 全程只有 ping → 计时**未重置** → 「放行 N 次还是断了」
+ * 2026-08-06 RCA §2.1 已 🟢 证实 watchdog 只认语义正文字节、ping 不重置它;而
+ * hold-gate-auto-release 决策卡 §1 自标「放行为何能重置客户端计时未逐字节取证」。
+ * 这个字段就是那个未取证假设的判据 —— 用户在真实使用中看一眼就能分辨,不必专门复现。
+ */
+export type ReleaseOutcome = 'pending' | 'resumed-and-served' | 're-held' | 'ended'
+
+/** 一次放行动作的记录。口径 = **周期动作**,一次 releaseAll 放 N 条也只记一条。 */
+export interface HoldRelease {
+  /** 放行时刻(注入时钟,与 nextAutoReleaseAt 同源)。 */
+  at: number
+  /** 谁放的:定时自动 / 手动点按钮 / 池恢复事件 / 兜底轮询。 */
+  trigger: 'auto' | 'manual' | 'pool-available' | 'poll'
+  outcome: ReleaseOutcome
+  /** 结局落定时刻;null = 主循环尚未回填。 */
+  outcomeAt: number | null
+}
+
+/**
+ * 一轮挂起(episode)= 从「集合由空变非空」到「集合再次变空」。
+ *
+ * 注意它是**一轮**而非**一个请求**:并发多个请求同时挂起时共享一个 episode,
+ * 起始时刻与原因取第一个触发者。理由 = 2026-08-06 RCA §1.6 的教训:
+ * 挂起/放行日志无请求 ID 且 releaseAll 是批量的,按请求配对时长必然算错(那次算出 4172s 假读数)。
+ * 以「轮」为单位统计则不需要配对,天然免疫该仪器错误。
+ */
+export interface HoldEpisode {
+  /** 单调递增,全实例不复用。 */
+  id: number
+  reason: HoldReason
+  detail: string[]
+  startedAt: number
+  /** null = 仍在挂起中。 */
+  endedAt: number | null
+  releases: HoldRelease[]
+}
+
+/** 时间线读数上限(Must NOT #2:不得无限增长)。 */
+const MAX_EPISODES = 20
+const MAX_RELEASES_PER_EPISODE = 50
 
 /** 被挂起请求的内部条目(含一次性认领位)。 */
 interface HeldEntry {
@@ -116,11 +184,129 @@ export class HoldGate {
   // resetSessionState() 归零。**注意本实例不随 stop/start 重建**(门闸在 ProxyServer 构造函数里
   // 建一次),故归零必须显式做 —— 早期注释误写作"反代 stop/start 即新实例",那正是本缺陷的来源。
   private autoReleaseCount = 0
+  // ===== 可观测性时间线(决策卡 hold-gate-observability)=====
+  // I1 旁路:所有写入点都包 try-catch,时间线坏了不得影响放行本身。
+  /** 当前进行中的一轮挂起;null = 集合为空。 */
+  private currentEpisode: HoldEpisode | null = null
+  /** 已结束的 episode,最新在前,上限 MAX_EPISODES。 */
+  private recentEpisodes: HoldEpisode[] = []
+  private episodeSeq = 0
 
   constructor(deps: HoldGateDeps) {
     this.clock = deps.clock
     this.isPoolAvailable = deps.isPoolAvailable
     this.config = deps.config
+  }
+
+  /**
+   * 时间线读数(桌面/手机面板消费)。返回**深拷贝**:调用方(IPC 序列化 / 前端)拿到的是快照,
+   * 不能反手改到门闸内部状态上。
+   */
+  getTimeline(): { current: HoldEpisode | null; recent: HoldEpisode[] } {
+    const clone = (ep: HoldEpisode): HoldEpisode => ({
+      ...ep,
+      detail: [...ep.detail],
+      releases: ep.releases.map((r) => ({ ...r }))
+    })
+    return {
+      current: this.currentEpisode ? clone(this.currentEpisode) : null,
+      recent: this.recentEpisodes.map(clone)
+    }
+  }
+
+  /**
+   * 回填最近一条放行的结局(由 `ProxyServer` 主循环在拿号成功/失败/终态三处调用)。
+   *
+   * 这是「放行到底有没有让客户端看到字节」的唯一记录点 —— 见 {@link ReleaseOutcome} 的说明。
+   * 无进行中 episode / 无 pending 记录时是 no-op(不抛错:回填点在主循环里,不能因观测而崩)。
+   */
+  settleLastRelease(outcome: Exclude<ReleaseOutcome, 'pending'>): void {
+    try {
+      const ep = this.currentEpisode
+      if (!ep) return
+      const last = ep.releases[ep.releases.length - 1]
+      if (last && last.outcome === 'pending') {
+        last.outcome = outcome
+        last.outcomeAt = this.clock.now()
+      }
+      // 结局已定 → 这一轮真的结束了(拿到号服务完 / 终态)则归档;
+      // 're-held' 是同一轮的延续,不归档。
+      if (outcome !== 're-held') this.finalizeEpisode()
+    } catch {
+      /* I1:观测失败不影响主流程 */
+    }
+  }
+
+  /**
+   * 开一轮 episode。已有进行中的则并入,不覆盖起始时刻与原因。
+   *
+   * 注意本方法在 `held.set` **之前**被调,故此时 `held.size` 对「上一轮是否已结束」
+   * 没有区分力(re-held 延续与全新一轮都是 0)。故归档完全交由
+   * {@link settleLastRelease} / {@link onTimeout} / {@link abort} 按**显式结局**驱动,
+   * 这里不做任何推断 —— 靠集合大小猜意图正是上一版把 re-held 切碎的原因。
+   */
+  private openEpisodeIfNeeded(params: EnterHoldParams): void {
+    try {
+      if (this.currentEpisode) return
+      this.currentEpisode = {
+        id: ++this.episodeSeq,
+        reason: params.reason ?? 'pool-empty',
+        detail: params.detail ? [...params.detail] : [],
+        startedAt: this.clock.now(),
+        endedAt: null,
+        releases: []
+      }
+    } catch {
+      /* I1 */
+    }
+  }
+
+  /**
+   * 关闭当前 episode 并归档(集合变空时)。
+   *
+   * ⚠️ **不在 `claim()` 里立刻调** —— 那会把「一轮挂起」切碎。放行的正常形态是:
+   * `releaseAll` 清空集合 → 主循环拿号 → **拿不到又立刻 enterHold**。若在 claim 时就归档,
+   * 这一轮会被切成 N 个只有一条放行记录的 episode,而用户问的是「这次挂起从几点开始、放了几次」,
+   * 切碎后这个问题就无法回答了(每个碎片都显示"放了 1 次")。
+   *
+   * 故归档改由 {@link finalizeEpisodeIfSettled} 在**结局确定**时做:
+   *   - `resumed-and-served` / `ended` → 这一轮真的结束了 → 归档
+   *   - `re-held` → 请求又挂回去了 → 同一轮延续 → 不归档
+   * 无人回填时(abort / 手动放行后调用方不关心结局)由 `enterHold` 的下一轮开始或
+   * `resetSessionState` 收尾,不会永久悬挂。
+   */
+  private finalizeEpisode(): void {
+    try {
+      const ep = this.currentEpisode
+      if (!ep || this.held.size > 0) return
+      ep.endedAt = this.clock.now()
+      this.recentEpisodes.unshift(ep)
+      if (this.recentEpisodes.length > MAX_EPISODES) {
+        this.recentEpisodes.length = MAX_EPISODES
+      }
+      this.currentEpisode = null
+    } catch {
+      /* I1 */
+    }
+  }
+
+  /**
+   * 记一次放行动作。**口径 = 周期动作**:一次 releaseAll 放 N 条也只记一条,
+   * 与 `autoReleaseCount` 口径一致(否则界面次数会随并发请求数虚高)。
+   * 放行了 0 条时不记 —— 「什么都没放」不构成一次放行事件。
+   */
+  private recordRelease(trigger: HoldRelease['trigger'], released: number): void {
+    try {
+      if (released <= 0) return
+      const ep = this.currentEpisode
+      if (!ep) return
+      ep.releases.push({ at: this.clock.now(), trigger, outcome: 'pending', outcomeAt: null })
+      if (ep.releases.length > MAX_RELEASES_PER_EPISODE) {
+        ep.releases.splice(0, ep.releases.length - MAX_RELEASES_PER_EPISODE)
+      }
+    } catch {
+      /* I1 */
+    }
   }
 
   /** 有挂起请求且轮询未启动时,启动低频兜底轮询(周期 = maxWaitMs)。 */
@@ -131,8 +317,7 @@ export class HoldGate {
     const periodMs = Math.max(1000, this.config.maxWaitMs)
     this.pollHandle = this.clock.setInterval(() => {
       // 周期性复查池:配额到点恢复等"无事件"恢复场景由此兜底放行。
-      this.tryResume()
-      // 放行后若已无挂起请求,停止轮询(省资源)。
+      this.tryResume('poll')
       this.stopPollingIfIdle()
     }, periodMs)
   }
@@ -164,7 +349,7 @@ export class HoldGate {
       // 若这里加了池可用性判断,恰好在"账号一直受限"这个目标场景下永不触发 = 功能等于没做。
       this.autoReleaseCount++
       // 已认领条目(超时/abort/已放行)在 releaseAll 内部走 claim() 的一次性 CAS,自然 no-op(Invariant 2)。
-      this.releaseAll()
+      this.releaseAll('auto')
       if (this.held.size === 0) {
         // 集合已空 → 停表,不留空转 interval(Must NOT #3)。
         this.stopAutoRelease()
@@ -243,6 +428,9 @@ export class HoldGate {
     this.stopPollingIfIdle()
     this.stopAutoRelease()
     this.autoReleaseCount = 0
+    // 时间线与计数同生命周期(决策卡 I2):会话复位则整体归零,不留上一会话的 episode。
+    this.currentEpisode = null
+    this.recentEpisodes = []
   }
 
   /** 下次自动放行的绝对 epoch ms;null = 没有下一次(关闭 / 无挂起条目)。前端本地自减渲染倒计时。 */
@@ -284,6 +472,8 @@ export class HoldGate {
       this.onTimeout(entry)
     }, delay)
 
+    // 时间线:集合由空变非空 → 开一轮 episode;已有进行中的则并入,不覆盖起始时刻与原因。
+    this.openEpisodeIfNeeded(params)
     this.held.set(id, entry)
     // 有挂起请求 → 确保兜底轮询在跑(覆盖配额时间衰减等无事件恢复,方案 §5 A4)。
     this.startPollingIfNeeded()
@@ -305,6 +495,8 @@ export class HoldGate {
     this.stopPollingIfIdle()
     // 同上:最后一个条目被认领(放行/超时/abort)后自动放行调度器停表。
     this.stopAutoReleaseIfIdle()
+    // 时间线:此处**不归档** —— 放行后主循环很可能立即重新 enterHold(池仍无号),
+    // 那仍是同一轮挂起。归档时机见 finalizeEpisode 的说明。
     return true
   }
 
@@ -324,10 +516,19 @@ export class HoldGate {
     if (entry.claimed) return
     switch (this.config.timeoutAction) {
       case 'error':
-        if (this.claim(entry)) entry.hooks.sendError()
+        if (this.claim(entry)) {
+          entry.hooks.sendError()
+          // 终态:这一轮挂起到此结束(若有 pending 放行记录则一并标 ended)。
+          this.settleLastRelease('ended')
+          this.finalizeEpisode()
+        }
         return
       case 'graceful_stop':
-        if (this.claim(entry)) entry.hooks.sendGracefulStop()
+        if (this.claim(entry)) {
+          entry.hooks.sendGracefulStop()
+          this.settleLastRelease('ended')
+          this.finalizeEpisode()
+        }
         return
       case 'keep_blocking':
       default:
@@ -340,18 +541,8 @@ export class HoldGate {
    * 池可用性变化时尝试自动放行:仅当池确有可用号时,认领并 resume 所有未认领的 HELD 请求。
    * 幂等:已认领请求是 no-op,绝不重复 resume(测试 3)。
    */
-  tryResume(): void {
+  tryResume(trigger: 'pool-available' | 'poll' = 'pool-available'): void {
     if (!this.isPoolAvailable()) return
-    for (const entry of [...this.held.values()]) {
-      if (this.claim(entry)) entry.hooks.resume()
-    }
-  }
-
-  /**
-   * 手动放行:认领并 resume 所有当前未认领的 HELD 请求(前端"放行"按钮 → IPC)。
-   * @returns 实际被放行(认领成功)的请求数;无挂起请求时返回 0(幂等)。
-   */
-  releaseAll(): number {
     let released = 0
     for (const entry of [...this.held.values()]) {
       if (this.claim(entry)) {
@@ -359,6 +550,27 @@ export class HoldGate {
         released++
       }
     }
+    this.recordRelease(trigger, released)
+    // 池恢复/轮询放行后主循环会拿到号(这正是 tryResume 的前提)→ 由它回填
+    // 'resumed-and-served' 并归档;万一又没拿到 → 回填 're-held' 继续同一轮。此处不预判。
+  }
+
+  /**
+   * 手动放行:认领并 resume 所有当前未认领的 HELD 请求(前端"放行"按钮 → IPC)。
+   * @returns 实际被放行(认领成功)的请求数;无挂起请求时返回 0(幂等)。
+   */
+  releaseAll(trigger: HoldRelease['trigger'] = 'manual'): number {
+    let released = 0
+    for (const entry of [...this.held.values()]) {
+      if (this.claim(entry)) {
+        entry.hooks.resume()
+        released++
+      }
+    }
+    this.recordRelease(trigger, released)
+    // 手动放行是一个**终结动作**:调用方(IPC / 面板按钮)不会回填结局,故就地归档,
+    // 否则 episode 永远挂在 current 上。自动/轮询/池恢复三种由主循环回填,不在此归档。
+    if (trigger === 'manual') this.finalizeEpisode()
     return released
   }
 
@@ -371,6 +583,8 @@ export class HoldGate {
     if (!entry) return
     // 直接认领作废(不调用任何 hooks),后续入口皆 no-op。
     this.claim(entry)
+    // 客户端走了 → 这一轮挂起结束(集合空时),归档供事后查看。
+    this.finalizeEpisode()
   }
 
   /** 当前挂起中的请求数(UI 展示 + 放行按钮启用条件)。 */
