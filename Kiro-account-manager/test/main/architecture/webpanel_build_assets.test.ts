@@ -92,9 +92,17 @@ describe('webPanel 构建产物（L1/L2 · 需已 build）', () => {
     // 换来的是「改完没 build 当场被拓住」，而后者的代价是用户报障 + 一轮误导排查。
     const SRC_ROOT = resolve(REPO_ROOT, 'src', 'webPanel')
 
+    // 递归时跳过 dot 目录 —— 它们是工具缓存(`.ace-tool` 语义检索索引 / `.vite` 依赖缓存),
+    // 不是面板源码。`src/webPanel/.gitignore` 已把 `.ace-tool/` 排除出版本控制,但本判据
+    // 用的是 `readdirSync` 裸递归、不读 gitignore,于是任何人在本仓跑一次语义检索都会让
+    // 这条门禁变红,且失败信息指向「跑 build:webpanel」—— 跑完仍红(缓存 mtime 还是最新)。
+    // 判据要盯的是「人改了面板源码」这个事实,工具写缓存不是那个事实。
+    const isToolCache = (name: string): boolean => name.startsWith('.')
+
     const newestMtime = (dir: string): { ms: number; file: string } => {
       let best = { ms: 0, file: '' }
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (isToolCache(entry.name)) continue
         const full = join(dir, entry.name)
         if (entry.isDirectory()) {
           const sub = newestMtime(full)
