@@ -17,9 +17,10 @@
  * `ipc/panelProxyDeps.ts`）。这里一个动作对应一次请求，不做客户端编排 ——
  * 客户端若自己排序，就成了第二个顺序真源，两处早晚分叉。
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   fetchProxyStatus,
+  releaseHeldRequests,
   setProxyActiveAccount,
   startProxy,
   stopProxy,
@@ -28,7 +29,7 @@ import {
   type ProxyStatus
 } from '../api/panel'
 import { PanelApiError } from '../api/client'
-import { formatPercent } from './format'
+import { formatCountdown, formatPercent } from './format'
 
 interface ProxyPanelProps {
   /** 账号列表（已由 App 加载）—— 选号弹窗的候选来源 */
@@ -45,6 +46,25 @@ interface ProxyPanelProps {
    */
   onError: (msg: string) => void
 }
+
+/**
+ * 越过放行时刻后，等这么久再去重新取数。
+ *
+ * 不是 0：`nextAutoReleaseAt` 由服务端定时器产出，而倒计时用的是**手机自己的时钟**。
+ * 两者有偏差时（手机快几百毫秒、或推进 `nextAt` 的那一拍还在事件循环里排队），
+ * 到点即问会拿回同一个旧时刻。这点余量让绝大多数情况一次就取到新周期。
+ */
+const RECONCILE_GRACE_MS = 1500
+
+/**
+ * 取回来仍是同一个（已过期的）时刻时的重试间隔。
+ *
+ * 说明服务端这一拍确实还没走完（时钟偏差比余量大，或反代正忙）。此时**降频**重试而不是
+ * 每秒追问：倒计时已经显示「即将放行」，用户看到的信息是对的，缺的只是新周期的数字。
+ * 一旦服务端推进了 `nextAutoReleaseAt`，本效应会因依赖变化而重建，重试随之停止 ——
+ * 所以这个循环是自终止的，不会变成常驻轮询。
+ */
+const RECONCILE_RETRY_MS = 15_000
 
 /**
  * 错误文案取 `PanelApiError.message`。
@@ -67,6 +87,14 @@ export function ProxyPanel({
   const [status, setStatus] = useState<ProxyStatus | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [picking, setPicking] = useState(false)
+  /**
+   * 本地时钟，仅用于渲染倒计时。
+   *
+   * 服务端只给 `nextAutoReleaseAt`（绝对 epoch ms），倒计时在这里本地自减 ——
+   * **绝不轮询服务端拿倒计时数值**：倒计时是连续量，轮询它会让请求频率被刷新率
+   * 绑架（手机上还意味着持续耗电与流量）。
+   */
+  const [now, setNow] = useState(() => Date.now())
 
   /** 拉真实状态。所有写操作之后都要调它 —— 这是运行态的唯一判据 */
   const refresh = useCallback(async (): Promise<void> => {
@@ -84,6 +112,86 @@ export function ProxyPanel({
   useEffect(() => {
     void refresh()
   }, [refresh])
+
+  /**
+   * 最新的 `refresh`，供下面两个「按时机重新对齐」的效应调用。
+   *
+   * 为什么用 ref 而不是把 `refresh` 写进依赖：那两个效应的重建时机应当只由
+   * **服务端读数**（`nextAutoReleaseAt`）决定。若依赖里带上 `refresh`，父组件换一个
+   * `onError` 回调身份就会重建定时器、把已经走过的等待清零 —— 表现为「界面偶尔就是不更新」，
+   * 且与放行周期毫无关系，极难定位。
+   */
+  const refreshRef = useRef(refresh)
+  useEffect(() => {
+    refreshRef.current = refresh
+  }, [refresh])
+
+  /**
+   * 倒计时的本地心跳。
+   *
+   * 只在**真有下一次放行**时起表 —— 没有 `nextAutoReleaseAt` 时空转会让手机在后台
+   * 每秒重渲染一次，白耗电。依赖里带上 `nextAutoReleaseAt`，它变化时重建计时器。
+   */
+  const nextAt = status?.nextAutoReleaseAt
+  useEffect(() => {
+    if (nextAt === null || nextAt === undefined) return
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [nextAt])
+
+  /**
+   * 跨放行周期后与服务端重新对齐。
+   *
+   * ## 为什么必须有这一段
+   *
+   * 桌面端消费推送事件（`onProxyHeldRequestsChanged`），周期一过自然拿到新读数；
+   * **面板没有那条推送通道**。挂载时拉一次之后，界面对服务端的认知就永久停在那一刻：
+   * 服务端在 T1 放行并排好 T2，手机却继续拿本地时钟去减那个作废的 T1 ——
+   * 渲染成永久「即将放行」、次数永远是挂载时那个数，除非用户手动刷新或做一次写操作。
+   *
+   * ## 为什么这不违反「倒计时不轮询」
+   *
+   * 决策卡禁的是「每秒向服务端要一个递减的数值」（连续量被刷新率绑架）。这里是
+   * **事件驱动**：只在「本地时钟越过了服务端给的那个时刻」这一个离散事件上取一次数。
+   * 一个 8 分钟周期 = 一次请求，与倒计时刷新率无关。倒计时本身仍然纯本地自减
+   * （上面那个 1 秒心跳一个字节都没往外发）。
+   *
+   * ## 手机侧的取舍
+   *
+   * - 没有下一次放行（`null`）时**不挂任何表** —— 保持既有的「不空转」性质。
+   * - 时刻已过（重新取回来还是旧值 / 后台挂了一小时回来）→ 按 `RECONCILE_RETRY_MS`
+   *   降频重试，不是每秒追问。
+   * - 后台被冻结的标签页里定时器本就不跑；回到前台由下面的 `visibilitychange` 兜住，
+   *   这也是本效应在长时间后台后能立刻收敛的原因。
+   */
+  useEffect(() => {
+    if (nextAt === null || nextAt === undefined) return
+    const delay = nextAt - Date.now()
+    // 已过期 → 降频重试；未到点 → 到点后加一点余量再问。
+    const wait = delay <= 0 ? RECONCILE_RETRY_MS : delay + RECONCILE_GRACE_MS
+    const timer = setTimeout(() => {
+      void refreshRef.current()
+    }, wait)
+    return () => clearTimeout(timer)
+  }, [nextAt])
+
+  /**
+   * 回到前台时重新对齐。
+   *
+   * 手机上息屏 / 切走后浏览器会冻结定时器，回来时本地时钟可能已远远越过那个时刻
+   * （放了好几轮）。上面的定时器在冻结期间不触发，所以**必须**在可见性恢复时补一次 ——
+   * 否则用户切回来看到的是一个陈旧界面，而这正是最常见的使用姿势（锁屏、过一会儿再看）。
+   *
+   * 只在**有下一次放行**时监听：反代没跑 / 自动放行关着时，切前台不该产生任何请求。
+   */
+  useEffect(() => {
+    if (nextAt === null || nextAt === undefined) return
+    const onVisible = (): void => {
+      if (document.visibilityState === 'visible') void refreshRef.current()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [nextAt])
 
   const run = useCallback(
     async (name: string, action: () => Promise<void>): Promise<void> => {
@@ -227,6 +335,64 @@ export function ProxyPanel({
           停止会中断正在进行的请求。已服务 {status?.totalRequests ?? 0} 次。
         </p>
       )}
+
+      {/*
+        自动放行读数 + 立即放行。
+        账号不可用时反代把客户端请求挂起等待恢复，调度器周期性放行一次让客户端的
+        idle 看守不把请求掐断。这里让用户在手机上看到「还有多久放下一次 / 已放了几次」，
+        并能立刻补一次（例如刚换了新号，不想等剩余时间）。
+        刻意**没有**间隔与开关控件 —— 配置留在桌面端（手机误触代价大于收益）。
+      */}
+      <div className="mt-3 border-t border-slate-100 pt-3 dark:border-slate-800">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              自动放行
+              {status?.autoReleaseEnabled === true ? (
+                <span className="ml-1 text-emerald-700 dark:text-emerald-400">已开启</span>
+              ) : (
+                <span className="ml-1 text-slate-400">未开启</span>
+              )}
+            </p>
+            <p className="mt-0.5 flex items-baseline gap-3 text-sm text-slate-800 dark:text-slate-200">
+              <span>
+                <span className="text-xs text-slate-500 dark:text-slate-400">下次 </span>
+                {/* 绝对时间戳 → 本地倒计时。null 显示「-」而不是 0:00（0 是合法 epoch） */}
+                {formatCountdown(status?.nextAutoReleaseAt, now)}
+              </span>
+              <span>
+                <span className="text-xs text-slate-500 dark:text-slate-400">已放行 </span>
+                {status?.autoReleaseCount ?? 0}
+                <span className="text-xs text-slate-500 dark:text-slate-400"> 次</span>
+              </span>
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() =>
+              void run('release', async () => {
+                // `released` 是必填契约（`api/panel.ts`）—— 不写 `?? 0`：那会把
+                // 「服务端没给放行数」静默说成「当前没有挂起的请求」。
+                const { released } = await releaseHeldRequests()
+                // released=0 不是失败 —— 放行是幂等的，「点了没东西可放」是正常结果。
+                // 如实说出来，而不是报错让用户以为坏了。
+                onNotice(released > 0 ? `已放行 ${released} 个挂起请求` : '当前没有挂起的请求')
+              })
+            }
+            disabled={busy !== null || !running}
+            className="h-11 shrink-0 rounded-xl border border-slate-300 px-3 text-sm text-slate-700 active:bg-slate-100 disabled:opacity-60 dark:border-slate-600 dark:text-slate-200 dark:active:bg-slate-800"
+          >
+            {busy === 'release' ? '放行中…' : '立即放行'}
+          </button>
+        </div>
+        {!running && (
+          // 放行需要反代在运行（服务端会返回 PROXY_NOT_RUNNING）。原因说在前面，
+          // 而不是让用户点了才看到报错。
+          <p className="mt-1.5 text-xs text-slate-500 dark:text-slate-400">
+            放行需要反代处于运行状态
+          </p>
+        )}
+      </div>
 
       <button
         type="button"

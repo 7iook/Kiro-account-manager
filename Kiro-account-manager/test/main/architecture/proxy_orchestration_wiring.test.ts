@@ -152,3 +152,65 @@ describe('统一映射: 不得出现第四份 Account→ProxyAccount 映射', ()
     expect(src).toMatch(/activateProxyAccount\s*\(/)
   })
 })
+
+/**
+ * 池准入判据不得有第二个真源 —— 这一组是「只修了面板路径」的闸门
+ *
+ * 本轮的实际教训：`activation.ts:186` 的 `status !== 'active'` 只被面板路径
+ * (`panelProxyDeps.ts syncPool`) 消费，而用户报的「重启后账号不回池」走的是
+ * `index.ts` 里**两份手抄的同一过滤器**（autostart `syncAccountsToPool` /
+ * `onPoolEmpty` 惰性补池）。只改 activation.ts 会得到「新测试全绿、缺陷照旧」
+ * —— 正是 E-052 的形状。所以判据本身也要有装配实证。
+ */
+describe('池准入判据: 三条水合路径共用同一真源', () => {
+  it('index.ts 的两处水合都走 checkPoolAdmission，而不是自己判 status', () => {
+    const src = stripComments(read('src/main/index.ts'))
+    // 两处水合（autostart + onPoolEmpty）各一次调用
+    const hits = src.match(/checkPoolAdmission\s*\(/g) ?? []
+    expect(
+      hits.length,
+      'index.ts 的水合路径没有全部走 checkPoolAdmission —— 只改 activation.ts 等于只修了面板路径'
+    ).toBeGreaterThanOrEqual(2)
+    expect(src).toMatch(/import\s*\{[^}]*checkPoolAdmission[^}]*\}\s*from\s*'\.\/proxy\/activation'/)
+  })
+
+  it('入池过滤器里不得复活 `status === active` 判据', () => {
+    // 作用域限定在**水合入口**：`pool.addAccount` 的喂料链。
+    // index.ts:5447 也有一处 `status === 'active' && credentials` —— 那是
+    // `get-kiro-available-models` 挑一个号去拉模型列表，不进反代池，不在本闸门管辖内
+    // （它挑不到号的后果是"模型列表为空"，不是"号被永久踢出池"）。
+    for (const rel of ['src/main/proxy/activation.ts', 'src/main/ipc/panelProxyDeps.ts']) {
+      const src = stripComments(read(rel))
+      expect(
+        src,
+        `${rel} 疑似用 status 当池准入闸门 —— status 是显示字段，断网测活会把好号写成 error`
+      ).not.toMatch(/status\s*===\s*'active'|status\s*!==\s*'active'/)
+    }
+    // index.ts 的两条水合路径：过滤器紧邻处不得再出现 status 判据。
+    // 锚在 checkPoolAdmission 调用点前后 400 字符的窗口里，避免把全文件其它
+    // 无关的 status 用法误判成入池闸门。
+    const main = stripComments(read('src/main/index.ts'))
+    const re = /checkPoolAdmission\s*\(/g
+    let m: RegExpExecArray | null
+    let windows = 0
+    while ((m = re.exec(main)) !== null) {
+      windows++
+      const win = main.slice(Math.max(0, m.index - 400), m.index + 400)
+      expect(
+        win,
+        'index.ts 水合路径的过滤器旁边仍有 status 判据 —— 两个真源早晚分叉'
+      ).not.toMatch(/status\s*===\s*'active'\s*&&\s*\w+\.credentials/)
+    }
+    expect(windows, 'index.ts 没有任何 checkPoolAdmission 调用点').toBeGreaterThanOrEqual(2)
+  })
+
+  it('被挡在池外的号必须点名进日志（静默缩池是本缺陷最贵的部分）', () => {
+    // describeBlockedAccounts 只遍历池内成员，看不见「压根没入池」的号，
+    // 所以信号必须落在水合点本身。三条路径各一次。
+    const main = stripComments(read('src/main/index.ts'))
+    expect(main).toMatch(/logPoolAdmissionSkips\s*\(\s*admissionSkips\s*,\s*'autostart'\s*\)/)
+    expect(main).toMatch(/logPoolAdmissionSkips\s*\(\s*admissionSkips\s*,\s*'lazy-refill'\s*\)/)
+    const panel = stripComments(read('src/main/ipc/panelProxyDeps.ts'))
+    expect(panel).toMatch(/logPoolAdmissionSkips\s*\(/)
+  })
+})

@@ -11,7 +11,7 @@
  * 在 `fetch` 这一层拦，测的才是服务端实际会收到的东西。
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { App } from '../../../src/webPanel/App'
 
@@ -413,6 +413,15 @@ describe('手机端导入 ksk_', () => {
     await userEvent.click(button)
 
     await waitFor(() => expect(screen.getByRole('button', { name: '导入中…' })).toBeDisabled())
-    release?.()
+
+    // 放行挂住的 POST 后**必须等它结算完**：否则 resolve 引发的状态更新落在
+    // 测试结束（组件卸载）之后，React 会打 "not wrapped in act(...)" 告警。
+    // 顺带把「放行后按钮恢复可点」也断言掉 —— 卡在「导入中…」是真实失效
+    // （用户以为还在跑，实际早结束了，只能刷新页面）。
+    await act(async () => {
+      release?.()
+      await gate
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: '导入' })).toBeEnabled())
   })
 })

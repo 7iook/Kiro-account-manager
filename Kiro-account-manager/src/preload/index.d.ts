@@ -12,6 +12,7 @@ import { ElectronAPI } from '@electron-toolkit/preload'
  */
 import type { WebPanelStatus } from '../main/ipc/webPanelWiring'
 import type { WebPanelConfig } from '../main/webPanel/server'
+import type { HeldRequestsInfo } from '../main/proxy/proxyServer'
 
 export type { WebPanelStatus, WebPanelConfig }
 
@@ -795,7 +796,7 @@ interface KiroApi {
 
   // 挂起门闸:手动放行所有挂起请求 / 查询挂起数
   proxyReleaseHeldRequests: () => Promise<{ released: number }>
-  proxyGetHeldRequests: () => Promise<{ count: number }>
+  proxyGetHeldRequests: () => Promise<HeldRequestsInfo>
 
   // ============ v1.8 反代安全 / 可观测 IPC ============
   proxySelfSignedCertInfo: () => Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }>
@@ -893,7 +894,7 @@ interface KiroApi {
   onProxyAccountUpdate: (callback: (info: { id: string; accessToken?: string; refreshToken?: string; expiresAt?: number; profileArn?: string }) => void) => () => void
 
   // 监听挂起请求数变化事件(驱动挂起数徐标 + 放行按钮启用态)
-  onProxyHeldRequestsChanged: (callback: (info: { count: number }) => void) => () => void
+  onProxyHeldRequestsChanged: (callback: (info: HeldRequestsInfo) => void) => () => void
 
   // ============ Web 管理面板（局域网访问） ============
   // 契约权威源 = `src/main/ipc/webPanelWiring.ts`（7 条通道，兄弟包已合入 main）。

@@ -48,6 +48,17 @@ export interface HoldGateRuntimeConfig {
   totalBudgetMs: number
   graceMs: number
   timeoutAction: HoldTimeoutAction
+  /**
+   * 自动定时放行开关(决策卡 hold-gate-auto-release · 默认 true)。
+   *
+   * 为什么需要它:客户端(Claude Code / SUB)的 idle watchdog 在 ~10min 处掐断静默请求,
+   * ping 心跳不算语义正文挡不住它(holdConfig.ts BUDGET_MAX 注释处有实测记录)。
+   * 用户实测:账号**仍处受限状态**时,在窗口到点前手动点一次「放行」,那 10min 计时被重置。
+   * 本调度器 = 把该手动动作自动化。
+   */
+  autoReleaseEnabled: boolean
+  /** 自动放行周期 ms(默认 480000=8min · clamp 收口在 holdConfig.ts)。 */
+  autoReleaseIntervalMs: number
 }
 
 export interface HoldGateDeps {
@@ -89,6 +100,22 @@ export class HoldGate {
   // availabilityListener 的事件盲区。故有挂起请求期间跑一个低频轮询周期性 tryResume 兜底。
   // 轮询周期复用 maxWaitMs(单次挂起上限即"多久没被唤醒就主动复查一次池"的节奏)。
   private pollHandle: unknown = null
+  // 自动定时放行句柄(决策卡 hold-gate-auto-release · D3 与兜底轮询并列不合并)。
+  // 为什么是**独立的第二个 timer**、而不是在兜底轮询里加个判断:
+  //   兜底轮询走 tryResume() —— 只在**池有可用号**时才放,代价是一次必然成功的转发;
+  //   自动放行**刻意不看池状态** —— 放行本身就是目的(让客户端 idle watchdog 的 10min 计时重置),
+  //   代价是一次很可能再次失败、随后重新 enterHold 的转发。两个语义代价差一个数量级,
+  //   合并就得靠布尔参数区分,而那正是 RCA 2026-08-02 病灶原型(换号判据与挂起判据混用 →
+  //   正常请求被挂 600s,proxyServer.ts 那条注释记着这个教训)。故并列两个 timer。
+  private autoReleaseHandle: unknown = null
+  /** 下次自动放行的绝对 epoch ms。null = **没有下一次**(关闭 / 无挂起条目);禁用 0 表达"无"(0 是合法 epoch)。 */
+  private autoReleaseNextAt: number | null = null
+  // 口径:一次 timer 触发 = +1,与该次实际放行了几个条目无关(0 个也计数,代表"调度器确实在跑");
+  // 手动 releaseAll() 不计入(计数器只在 timer 回调里自增,不在 releaseAll 内部)。
+  // 生命周期 = 一次服务会话(启动服务 → 停止服务),由 ProxyServer 在两个会话边界调
+  // resetSessionState() 归零。**注意本实例不随 stop/start 重建**(门闸在 ProxyServer 构造函数里
+  // 建一次),故归零必须显式做 —— 早期注释误写作"反代 stop/start 即新实例",那正是本缺陷的来源。
+  private autoReleaseCount = 0
 
   constructor(deps: HoldGateDeps) {
     this.clock = deps.clock
@@ -116,6 +143,116 @@ export class HoldGate {
       this.clock.clearInterval(this.pollHandle)
       this.pollHandle = null
     }
+  }
+
+  /**
+   * 有挂起请求 + 开关开 + 调度器未启动时,启动自动放行 timer(周期 = autoReleaseIntervalMs)。
+   * 生命周期跟随挂起集合(非空启动 / 空则停表),与兜底轮询同形态(I3)。
+   */
+  private startAutoReleaseIfNeeded(): void {
+    if (this.autoReleaseHandle !== null) return
+    if (!this.config.autoReleaseEnabled) return
+    if (this.held.size === 0) return
+    // 周期下限保护:间隔已被 holdConfig SSOT clamp,这里再兜一道防 0/负值把 FakeClock/Node 拖进死循环。
+    const periodMs = Math.max(1000, this.config.autoReleaseIntervalMs)
+    // 先算下次时刻再挂 timer:getNextAutoReleaseAt() 在任何时刻都能读到非 null(字段语义纪律)。
+    this.autoReleaseNextAt = this.clock.now() + periodMs
+    this.autoReleaseHandle = this.clock.setInterval(() => {
+      // 关键:**不查 isPoolAvailable()**。这与 tryResume 的语义差别正是本功能存在的理由 ——
+      // 池仍无可用号时才是最需要放行的场景:放行让上游重跑,产生客户端可见的流活动,
+      // 客户端 idle watchdog 的 ~10min 计时随之重置(用户 2026-08-09 实测确立)。
+      // 若这里加了池可用性判断,恰好在"账号一直受限"这个目标场景下永不触发 = 功能等于没做。
+      this.autoReleaseCount++
+      // 已认领条目(超时/abort/已放行)在 releaseAll 内部走 claim() 的一次性 CAS,自然 no-op(Invariant 2)。
+      this.releaseAll()
+      if (this.held.size === 0) {
+        // 集合已空 → 停表,不留空转 interval(Must NOT #3)。
+        this.stopAutoRelease()
+      } else {
+        // 仍有未认领条目(如 keep_blocking 下超时留存者被 resume 后又被重新 enterHold 的场景之外,
+        // 还包括 resume 回调内同步重新入集合)→ 推进下次时刻,倒计时继续。
+        this.autoReleaseNextAt = this.clock.now() + periodMs
+      }
+    }, periodMs)
+  }
+
+  /** 停表并清空下次时刻(null = 没有下一次)。 */
+  private stopAutoRelease(): void {
+    if (this.autoReleaseHandle !== null) {
+      this.clock.clearInterval(this.autoReleaseHandle)
+      this.autoReleaseHandle = null
+    }
+    this.autoReleaseNextAt = null
+  }
+
+  /** 挂起集合空了就停表(与 stopPollingIfIdle 同调用点)。 */
+  private stopAutoReleaseIfIdle(): void {
+    if (this.autoReleaseHandle !== null && this.held.size === 0) {
+      this.stopAutoRelease()
+    }
+  }
+
+  /**
+   * 热更新自动放行配置(D1 裁决:**重建 timer**,不继承"当轮周期启动时一次算好"的语义)。
+   *
+   * 为什么必须重建:兜底轮询的周期是启动时定下的,沿用那个语义会让用户「改了间隔没反应」,
+   * 只能靠重启反代碰运气;而现有 hold 控件是刻意支持热生效的。重建代价极小。
+   *
+   * 原子性:先算新的 nextAt 再赋值 —— 重建瞬间 getNextAutoReleaseAt() 不得短暂返回 null,
+   * 否则前端倒计时会闪一下「无」。
+   */
+  applyAutoReleaseConfig(next: { enabled: boolean; intervalMs: number }): void {
+    this.config.autoReleaseEnabled = next.enabled
+    this.config.autoReleaseIntervalMs = next.intervalMs
+    // 停掉旧 timer(clearInterval 不影响读数字段),随后按新值重建;
+    // startAutoReleaseIfNeeded 内部会先算 nextAt 再挂 timer,故读数不出现中间 null。
+    if (this.autoReleaseHandle !== null) {
+      this.clock.clearInterval(this.autoReleaseHandle)
+      this.autoReleaseHandle = null
+    }
+    if (!next.enabled || this.held.size === 0) {
+      this.autoReleaseNextAt = null
+      return
+    }
+    this.startAutoReleaseIfNeeded()
+  }
+
+  /**
+   * 服务会话复位:清空挂起条目 + 停掉本门闸的**所有** timer + 自动放行计数归零。
+   *
+   * 由 `ProxyServer` 在「启动服务 / 停止服务」这两个会话边界调用(它重置 sessionStats 的同一处)。
+   * 为什么需要它:门闸实例是在 `ProxyServer` **构造函数**里建一次的,不是每次 start 建一次。
+   * 计数器若只挂在实例上,stop→start 后会继承上一会话的累计值 —— 而契约(决策卡 §3)与
+   * 用户口径都是「本次启动服务到停止服务之间累计,停止归零」,与既有 sessionStats 同生命周期。
+   *
+   * 语义(与 `abort` 同类,不与 `releaseAll` 同类):**作废,不驱动**。
+   * 不调用任何 hooks —— 不 resume(服务都停了,重试无处可去)、不发 error/graceful_stop
+   * (停服收尾由 `ProxyServer` 对 `activeRequests` 的 abort 负责,门闸不越权替它给客户端发信号)。
+   *
+   * `seq` **刻意不重置**:条目 id 全实例单调。上一会话残留的 abort 监听器若迟到触发,
+   * 拿着旧 id 打进来必须打空,绝不能命中新会话刚建的条目。
+   */
+  resetSessionState(): void {
+    for (const entry of [...this.held.values()]) {
+      // 认领位置 true:任何迟到的入口(旧 abort 监听器 / 已排队的 timer 回调)后续都是 no-op。
+      entry.claimed = true
+      this.stopTimers(entry)
+    }
+    this.held.clear()
+    // 集合已空 → 兜底轮询与自动放行调度器都必须停表,否则会留下一个对着「已停的服务」空转的 interval。
+    this.stopPollingIfIdle()
+    this.stopAutoRelease()
+    this.autoReleaseCount = 0
+  }
+
+  /** 下次自动放行的绝对 epoch ms;null = 没有下一次(关闭 / 无挂起条目)。前端本地自减渲染倒计时。 */
+  getNextAutoReleaseAt(): number | null {
+    return this.autoReleaseNextAt
+  }
+
+  /** 本实例(= 本次反代启动)以来自动放行的**周期次数**,非条目数;手动放行不计入。 */
+  getAutoReleaseCount(): number {
+    return this.autoReleaseCount
   }
 
   /**
@@ -150,6 +287,8 @@ export class HoldGate {
     this.held.set(id, entry)
     // 有挂起请求 → 确保兜底轮询在跑(覆盖配额时间衰减等无事件恢复,方案 §5 A4)。
     this.startPollingIfNeeded()
+    // 同上,自动放行调度器也在集合首次非空时起表(开关关闭时内部直接 return)。
+    this.startAutoReleaseIfNeeded()
     return id
   }
 
@@ -164,6 +303,8 @@ export class HoldGate {
     this.held.delete(entry.id)
     // 挂起集合可能已空 → 停止兜底轮询,避免空转 timer 泄漏。
     this.stopPollingIfIdle()
+    // 同上:最后一个条目被认领(放行/超时/abort)后自动放行调度器停表。
+    this.stopAutoReleaseIfIdle()
     return true
   }
 

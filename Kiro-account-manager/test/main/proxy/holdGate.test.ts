@@ -421,3 +421,321 @@ describe('HoldGate · 兜底轮询(方案 §5 A4:覆盖配额时间衰减等无�
     expect(clock.activeTimerCount()).toBe(before)
   })
 })
+
+describe('HoldGate · 自动定时放行(决策卡 hold-gate-auto-release)', () => {
+  let clock: FakeClock
+  beforeEach(() => {
+    clock = new FakeClock()
+  })
+
+  // 承重场景:池「从头到尾无可用号」时仍到点放行 —— 与 tryResume 的语义差别所在。
+  // tryResume 只在池有号时放;自动放行不看池状态,因为「放一次让客户端看守重置」是目的本身。
+  it('开启自动放行_池仍无可用号也会到点放行挂起请求', () => {
+    const gate = mkGate(clock, { autoReleaseEnabled: true, autoReleaseIntervalMs: 480000 }, () => false)
+    const hooks = makeHooks()
+    gate.enterHold({ receivedAt: clock.now(), hooks })
+
+    clock.advance(479000)
+    expect(hooks.resume).not.toHaveBeenCalled()
+
+    clock.advance(1000)
+    expect(hooks.resume).toHaveBeenCalledTimes(1)
+    expect(gate.getHeldCount()).toBe(0)
+  })
+
+  it('关闭自动放行_到点不放行', () => {
+    const gate = mkGate(clock, { autoReleaseEnabled: false, autoReleaseIntervalMs: 480000 }, () => false)
+    const hooks = makeHooks()
+    gate.enterHold({ receivedAt: clock.now(), hooks })
+
+    clock.advance(480000 * 3)
+    expect(hooks.resume).not.toHaveBeenCalled()
+    expect(gate.getHeldCount()).toBe(1)
+  })
+
+  // timer 泄漏防线:空集合不该留下空转 interval(应用退出时会挂住 Node)。
+  it('挂起集合为空时不启动自动放行timer_最后一个请求被认领后停表', () => {
+    const gate = mkGate(clock, { autoReleaseEnabled: true, autoReleaseIntervalMs: 480000 }, () => false)
+    const baseline = clock.activeTimerCount()
+    expect(baseline).toBe(0)
+
+    const hooks = makeHooks()
+    const id = gate.enterHold({ receivedAt: clock.now(), hooks })
+    expect(clock.activeTimerCount()).toBeGreaterThan(baseline)
+
+    gate.abort(id)
+    expect(gate.getHeldCount()).toBe(0)
+    expect(clock.activeTimerCount()).toBe(0)
+  })
+
+  // Invariant 2(一次性 CAS 认领):abort 后的条目不得被自动放行再次驱动。
+  it('已认领的条目不会被自动放行重复resume', () => {
+    const gate = mkGate(clock, { autoReleaseEnabled: true, autoReleaseIntervalMs: 480000 }, () => false)
+    const hooks = makeHooks()
+    const id = gate.enterHold({ receivedAt: clock.now(), hooks })
+
+    gate.abort(id)
+    clock.advance(480000 * 2)
+    expect(hooks.resume).not.toHaveBeenCalled()
+  })
+
+  // D1 裁决:改间隔必须重建 timer。继承「当轮周期已算好」的语义会表现为「改了没反应」。
+  it('间隔配置变更后_下一次放行按新间隔', () => {
+    const gate = mkGate(clock, { autoReleaseEnabled: true, autoReleaseIntervalMs: 480000 }, () => false)
+    const hooks = makeHooks()
+    gate.enterHold({ receivedAt: clock.now(), hooks })
+
+    clock.advance(60000)
+    gate.applyAutoReleaseConfig({ enabled: true, intervalMs: 180000 })
+
+    // 新间隔从改配置那一刻重新起算:再走 179s 不该放
+    clock.advance(179000)
+    expect(hooks.resume).not.toHaveBeenCalled()
+    clock.advance(1000)
+    expect(hooks.resume).toHaveBeenCalledTimes(1)
+  })
+
+  // 口径:一次 timer 触发 = +1(哪怕放了 0 个条目);手动放行不计入自动计数。
+  it('累计放行次数随每次自动放行递增_手动放行不计入自动计数', () => {
+    const gate = mkGate(clock, { autoReleaseEnabled: true, autoReleaseIntervalMs: 480000 }, () => false)
+    expect(gate.getAutoReleaseCount()).toBe(0)
+
+    gate.enterHold({ receivedAt: clock.now(), hooks: makeHooks() })
+    clock.advance(480000)
+    expect(gate.getAutoReleaseCount()).toBe(1)
+
+    // 手动放行:不改自动计数
+    gate.enterHold({ receivedAt: clock.now(), hooks: makeHooks() })
+    gate.releaseAll()
+    expect(gate.getAutoReleaseCount()).toBe(1)
+  })
+
+  // D2 展开:keep_blocking 下超时条目留在集合且未认领 → 自动放行仍能认领它。
+  // 这正是「无限挂」成立的前提。
+  it('预算耗尽的条目在keep_blocking下仍被自动放行认领', () => {
+    const gate = mkGate(
+      clock,
+      {
+        autoReleaseEnabled: true,
+        autoReleaseIntervalMs: 100000,
+        totalBudgetMs: 100000,
+        graceMs: 15000,
+        timeoutAction: 'keep_blocking'
+      },
+      () => false
+    )
+    const hooks = makeHooks()
+    gate.enterHold({ receivedAt: clock.now(), hooks })
+
+    // 越过 deadline(85s 触发点)后仍在集合里
+    clock.advance(90000)
+    expect(gate.getHeldCount()).toBe(1)
+    expect(hooks.sendError).not.toHaveBeenCalled()
+
+    // 下一个自动放行周期(120s)仍能认领它
+    clock.advance(10000)
+    expect(hooks.resume).toHaveBeenCalledTimes(1)
+  })
+
+  // D2 展开的对照面:error/graceful_stop 下 onTimeout 已 claim 并移出集合 → 自动放行认领不到。
+  it('timeoutAction为error时_预算到点后条目已被认领_自动放行认领不到', () => {
+    const gate = mkGate(
+      clock,
+      {
+        autoReleaseEnabled: true,
+        autoReleaseIntervalMs: 100000,
+        totalBudgetMs: 100000,
+        graceMs: 15000,
+        timeoutAction: 'error'
+      },
+      () => false
+    )
+    const hooks = makeHooks()
+    gate.enterHold({ receivedAt: clock.now(), hooks })
+
+    clock.advance(90000)
+    expect(hooks.sendError).toHaveBeenCalledTimes(1)
+    expect(gate.getHeldCount()).toBe(0)
+
+    clock.advance(60000)
+    expect(hooks.resume).not.toHaveBeenCalled()
+  })
+
+  // 字段语义纪律:null = 没有下一次。禁用 0 表达「无」(0 是合法 epoch)。
+  it('无挂起条目时nextAutoReleaseAt为null而非0', () => {
+    const gate = mkGate(clock, { autoReleaseEnabled: true, autoReleaseIntervalMs: 480000 }, () => false)
+    expect(gate.getNextAutoReleaseAt()).toBeNull()
+
+    const id = gate.enterHold({ receivedAt: clock.now(), hooks: makeHooks() })
+    expect(gate.getNextAutoReleaseAt()).toBe(clock.now() + 480000)
+
+    gate.abort(id)
+    expect(gate.getNextAutoReleaseAt()).toBeNull()
+  })
+
+  it('关闭自动放行时nextAutoReleaseAt为null', () => {
+    const gate = mkGate(clock, { autoReleaseEnabled: false, autoReleaseIntervalMs: 480000 }, () => false)
+    gate.enterHold({ receivedAt: clock.now(), hooks: makeHooks() })
+    expect(gate.getNextAutoReleaseAt()).toBeNull()
+  })
+
+  // 重建瞬间的原子性:先算新值再赋值,不出现中间 null(否则前端倒计时会闪一下「无」)。
+  it('间隔热改的瞬间nextAutoReleaseAt不出现中间null', () => {
+    const gate = mkGate(clock, { autoReleaseEnabled: true, autoReleaseIntervalMs: 480000 }, () => false)
+    gate.enterHold({ receivedAt: clock.now(), hooks: makeHooks() })
+
+    clock.advance(60000)
+    gate.applyAutoReleaseConfig({ enabled: true, intervalMs: 180000 })
+    const after = gate.getNextAutoReleaseAt()
+    expect(after).not.toBeNull()
+    expect(after).toBe(clock.now() + 180000)
+  })
+})
+
+describe('HoldGate · 两定时器同刻竞争(兜底轮询 vs 自动放行)', () => {
+  let clock: FakeClock
+  beforeEach(() => {
+    clock = new FakeClock()
+  })
+
+  // ── 本组的时序前提(实测取证,非推理),写在这里免得后人重新踩 ──────────────
+  // FakeClock.advance 用 `sort((a,b) => a.due - b.due)[0]` 挑下一个到期 timer。
+  // V8 的 sort 是稳定排序 → 同 due 时**数组插入顺序**决定谁先跑。
+  // 而插入顺序由生产代码 enterHold 钉死:先 startPollingIfNeeded() 再
+  // startAutoReleaseIfNeeded() → **兜底轮询恒定排在自动放行之前**。
+  // applyAutoReleaseConfig 重建 auto timer 只会把它挪到数组更后面,也换不了位。
+  // 结论:同一 tick 上「轮询先跑」可构造;「自动放行先跑」**在本 harness 里造不出来**。
+  //       后者改用「自动周期严格短于轮询周期」在不同 tick 上覆盖(见本组末两例)。
+
+  // 同刻竞争 · 池不可用:轮询先跑但放不了(tryResume 看池),随后自动放行放它。
+  // 无论谁先认领,条目都只能被 resume 一次 —— 这是统一 claim() 的 CAS 该保证的事。
+  it('两定时器同刻到期_池不可用_条目只被放行一次', () => {
+    const gate = mkGate(
+      clock,
+      { autoReleaseEnabled: true, autoReleaseIntervalMs: 100000, maxWaitMs: 100000 },
+      () => false
+    )
+    const hooks = makeHooks()
+    gate.enterHold({ receivedAt: clock.now(), hooks })
+
+    clock.advance(100000) // 轮询与自动放行同刻到期
+
+    expect(hooks.resume).toHaveBeenCalledTimes(1)
+    expect(gate.getHeldCount()).toBe(0)
+    // 放行的是自动那一支(轮询因池不可用放不了)→ 计数 +1
+    expect(gate.getAutoReleaseCount()).toBe(1)
+    expect(clock.activeTimerCount()).toBe(0) // 集合空 → 两张表都停,不留空转
+  })
+
+  // 同刻竞争 · 池可用:轮询先抢到 claim(),集合随即空 →
+  // claim() 内的 stopAutoReleaseIfIdle() 把自动 timer **在它触发之前就清掉了**。
+  // 故这一支的正确口径是 count 保持 0 —— 「没跑过的周期不算一次」。
+  //
+  // ⚠️ 这一条与派单文档的断言相反(文档预期 +1,理由是「一次 timer 触发 = +1」)。
+  // 两者其实不矛盾:文档那条口径管的是「回调真的跑了但放了 0 条」,而本场景里回调
+  // **根本没跑**。区别不是措辞 —— 它决定用户屏幕上的数字含义:count 是「调度器真跑了
+  // 几轮」,不是「本该跑几轮」。若将来有人把 stopAutoReleaseIfIdle() 挪到自增之后、
+  // 或改成「清表前补记一次」,这条会红。
+  it('两定时器同刻到期_池可用_轮询先认领_自动放行未触发故计数不涨', () => {
+    const gate = mkGate(
+      clock,
+      { autoReleaseEnabled: true, autoReleaseIntervalMs: 100000, maxWaitMs: 100000 },
+      () => true
+    )
+    const hooks = makeHooks()
+    gate.enterHold({ receivedAt: clock.now(), hooks })
+
+    clock.advance(100000)
+
+    expect(hooks.resume).toHaveBeenCalledTimes(1) // 仍然只放一次
+    expect(gate.getHeldCount()).toBe(0)
+    expect(gate.getAutoReleaseCount()).toBe(0) // 自动回调未触发 → 不计数
+    expect(gate.getNextAutoReleaseAt()).toBeNull() // 停表后 null,不是 0
+  })
+
+  // 计数口径的可达半边:一次触发 = +1,与该次放了几条无关。
+  // 防的是「改成按放行条目数累加」——那会让界面上「放行次数」在多请求场景下虚高。
+  it('一次自动放行同时放三条_计数只加一(周期数而非条目数)', () => {
+    const gate = mkGate(
+      clock,
+      { autoReleaseEnabled: true, autoReleaseIntervalMs: 100000, maxWaitMs: 600000 },
+      () => false
+    )
+    const a = makeHooks()
+    const b = makeHooks()
+    const c = makeHooks()
+    gate.enterHold({ receivedAt: clock.now(), hooks: a })
+    gate.enterHold({ receivedAt: clock.now(), hooks: b })
+    gate.enterHold({ receivedAt: clock.now(), hooks: c })
+
+    clock.advance(100000)
+
+    expect(a.resume).toHaveBeenCalledTimes(1)
+    expect(b.resume).toHaveBeenCalledTimes(1)
+    expect(c.resume).toHaveBeenCalledTimes(1)
+    expect(gate.getAutoReleaseCount()).toBe(1) // 不是 3
+  })
+
+  // 反向:自动放行先认领(周期严格短于轮询)。之后轮询到点时已无事可做 ——
+  // 不得重复 resume、不得抛错。同刻的这个方向本 harness 造不出(见组首说明),
+  // 故用「自动周期 < 轮询周期」在不同 tick 上覆盖同一风险面。
+  it('自动放行先认领_随后轮询到点无事可做_不重复放行不抛错', () => {
+    const gate = mkGate(
+      clock,
+      { autoReleaseEnabled: true, autoReleaseIntervalMs: 60000, maxWaitMs: 150000 },
+      () => true // 池可用:轮询若还能找到条目就会放,借此暴露重复放行
+    )
+    const hooks = makeHooks()
+    gate.enterHold({ receivedAt: clock.now(), hooks })
+
+    expect(() => clock.advance(600000)).not.toThrow() // 跨过多个轮询周期
+
+    expect(hooks.resume).toHaveBeenCalledTimes(1)
+    expect(gate.getHeldCount()).toBe(0)
+    expect(gate.getAutoReleaseCount()).toBe(1)
+    expect(clock.activeTimerCount()).toBe(0)
+  })
+
+  // 生产里 resume 会走 runWithHold 主循环 continue → 仍无号则**同步重新 enterHold**。
+  // 于是两张表都还活着,两支放行在后续 tick 上交替命中同一集合。
+  // 锁两件事:① 每个条目各自只被 resume 一次(CAS 跨重入仍成立);
+  //          ② 轮询那一支的放行**不计入** autoReleaseCount(口径不被另一支污染)。
+  it('放行后同步重新挂起_两支交替命中_各条目只放一次且轮询放行不计入自动计数', () => {
+    let poolUp = false
+    const gate = mkGate(
+      clock,
+      { autoReleaseEnabled: true, autoReleaseIntervalMs: 60000, maxWaitMs: 150000 },
+      () => poolUp
+    )
+
+    const seen: ReturnType<typeof makeHooks>[] = []
+    // 首个条目被放行后,模拟主循环「仍无号 → 重新入集合」(同一 receivedAt,I1 不重置 deadline)。
+    const first = makeHooks()
+    first.resume.mockImplementation(() => {
+      const next = makeHooks()
+      seen.push(next)
+      gate.enterHold({ receivedAt: 0, hooks: next })
+    })
+    seen.push(first)
+    gate.enterHold({ receivedAt: 0, hooks: first })
+
+    clock.advance(60000) // 自动放行到点 → 放 first,其 resume 同步重新挂起一个新条目
+    expect(first.resume).toHaveBeenCalledTimes(1)
+    expect(gate.getAutoReleaseCount()).toBe(1)
+    expect(gate.getHeldCount()).toBe(1) // 新条目在集合里,两张表继续跑
+
+    // 池恢复 → 轮询那一支把重入的条目放掉
+    poolUp = true
+    clock.advance(150000)
+
+    // 每个条目各自恰好一次 resume,无重复驱动
+    for (const h of seen) {
+      expect(h.resume).toHaveBeenCalledTimes(1)
+    }
+    // 期间自动放行可能也触发过,但轮询的放行绝不能计入自动计数:
+    // 计数只允许等于自动回调真实触发次数,而非总放行条目数。
+    expect(gate.getAutoReleaseCount()).toBeLessThan(seen.length + 1)
+    expect(gate.getHeldCount()).toBe(0)
+    expect(clock.activeTimerCount()).toBe(0)
+  })
+})

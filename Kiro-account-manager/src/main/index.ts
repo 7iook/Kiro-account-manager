@@ -35,6 +35,7 @@ import {
 import { parseCreditUsage, parseSubscription } from './accountService/parseUsage'
 import type { VerifyApiKeyResult } from '../shared/types/credential'
 import { buildCompleteLoginResult } from './proxy/profile-selection'
+import { checkPoolAdmission, logPoolAdmissionSkips, type PoolAdmissionSkip } from './proxy/activation'
 import {
   writeKiroAuthTokenFile,
   readKiroAuthTokenFile,
@@ -728,8 +729,14 @@ function initProxyServer(): ProxyServer {
           return p.url
         }
 
+        // 准入判据与 autostart / 面板同一真源，见 `proxy/activation.ts checkPoolAdmission`
+        const admissionSkips: PoolAdmissionSkip[] = []
         const proxyAccounts = Object.values(accountData.accounts)
-          .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
+          .filter((acc: any) => {
+            const skip = checkPoolAdmission(acc)
+            if (skip) admissionSkips.push(skip)
+            return !skip
+          })
           .map((acc: any) => ({
             id: acc.id,
             email: acc.email,
@@ -749,6 +756,7 @@ function initProxyServer(): ProxyServer {
             scopes: acc.credentials?.scopes,
             proxyUrl: buildProxyUrl(acc.id)
           }))
+        logPoolAdmissionSkips(admissionSkips, 'lazy-refill')
         if (proxyAccounts.length > 0 && proxyServer) {
           const pool = proxyServer.getAccountPool()
           proxyAccounts.forEach(acc => pool.addAccount(acc))
@@ -2850,8 +2858,17 @@ function createWindow(): void {
             return p.url
           }
 
+          // 准入判据与面板侧同一真源(`proxy/activation.ts checkPoolAdmission`):
+          // 有凭据 + 未被上游明确拒绝。**不判 `status === 'active'`** —— status 是显示字段,
+          // 断网时的后台测活会把好号写成 'error'(`persistCheckResult.ts:325`),
+          // 而没有任何路径会自动写回 'active',于是一次网络抖动就把全部账号永久踢出池。
+          const admissionSkips: PoolAdmissionSkip[] = []
           const proxyAccounts = Object.values(accountData.accounts)
-            .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
+            .filter((acc: any) => {
+              const skip = checkPoolAdmission(acc)
+              if (skip) admissionSkips.push(skip)
+              return !skip
+            })
             .map((acc: any) => {
               const provider = acc.credentials?.provider || acc.idp
               const authMethod = acc.credentials?.authMethod
@@ -2881,10 +2898,13 @@ function createWindow(): void {
                 groupId: acc.groupId
               }
             })
+          logPoolAdmissionSkips(admissionSkips, 'autostart')
           if (proxyAccounts.length > 0) {
-            const pool = server.getAccountPool()
-            pool.clear()
-            proxyAccounts.forEach(acc => pool.addAccount(acc))
+            // replaceAll 而非 clear()+addAccount():后者会在清空那一步丢掉
+            // 运行期状态(额度 / 402 耗尽标记 / 风控挂起 / 断路器)。
+            // 自启动首次同步时池本来是空的,迁移无副作用;但这里同时被
+            // retrySync 复用(下方 2s..10s 重试),那时池里可能已有喂进去的额度。
+            server.getAccountPool().replaceAll(proxyAccounts)
           }
           return proxyAccounts.length
         }
@@ -3527,10 +3547,10 @@ app.whenReady().then(async () => {
             return { success: false, error: 'INVALID_ACCOUNT_SHAPE' }
           }
         }
-        pool.clear()
-        for (const acc of replace) {
-          pool.addAccount(acc)
-        }
+        // replaceAll:按 id 迁移运行期状态(额度 / 402 耗尽标记 / 风控挂起 / 断路器)。
+        // 热替换是「换名单」不是「忘掉一切」—— 名单里仍在的号不该因为一次替换
+        // 就把已知的耗尽/封禁状态清干净(那会让坏号立刻重新进入轮询)。
+        pool.replaceAll(replace)
         console.log(`[AccountPool] Hot-replace pool: ${replace.length} accounts`)
         return { success: true, addedCount: replace.length, removedCount: 0, poolSize: pool.size }
       }
@@ -6185,10 +6205,10 @@ app.whenReady().then(async () => {
     try {
       const server = initProxyServer()
       const pool = server.getAccountPool()
-      pool.clear()
-      for (const account of accounts) {
-        pool.addAccount(account)
-      }
+      // replaceAll 而非 clear()+addAccount():renderer 传来的账号形状不带 quota /
+      // suspendedAt / errorCount,清空后重加会把运行期状态整体抹掉 ——
+      // 表现为「界面点一下同步,已耗尽的号又开始被选中」。
+      pool.replaceAll(accounts)
       return { success: true, accountCount: pool.size }
     } catch (error) {
       console.error('[ProxyServer] Sync accounts failed:', error)
@@ -6424,11 +6444,16 @@ app.whenReady().then(async () => {
   // IPC: 查询当前挂起中的请求数(前端徽标 + 放行按钮启用条件)
   ipcMain.handle('proxy-get-held-requests', () => {
     try {
-      if (!proxyServer) return { count: 0 }
-      return { count: proxyServer.getHeldRequestsCount() }
+      if (!proxyServer) {
+        return { count: 0, autoReleaseEnabled: false, nextAutoReleaseAt: null, autoReleaseCount: 0 }
+      }
+      return {
+        count: proxyServer.getHeldRequestsCount(),
+        ...proxyServer.getHoldAutoReleaseState()
+      }
     } catch (error) {
       console.error('[ProxyServer] Get held requests failed:', error)
-      return { count: 0 }
+      return { count: 0, autoReleaseEnabled: false, nextAutoReleaseAt: null, autoReleaseCount: 0 }
     }
   })
 

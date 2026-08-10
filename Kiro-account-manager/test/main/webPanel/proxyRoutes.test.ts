@@ -47,10 +47,14 @@ function accountRecords(): Record<string, unknown> {
       status: 'active',
       credentials: { accessToken: TOKEN_B, refreshToken: 'rt-b', authMethod: 'social' }
     },
+    // 被挡在池外的号：判据是 lastError 里的封禁原文，不是 status
+    // （`activation.ts checkPoolAdmission`）。只有 status:'error' 的号是
+    // 「上次测活时网没通」，那种必须照常入池。
     'acc-dead': {
       id: 'acc-dead',
       email: 'dead@example.com',
       status: 'error',
+      lastError: 'AccountSuspendedException: account is suspended',
       credentials: { accessToken: 'ZZdeadZZ' }
     }
   }
@@ -62,7 +66,7 @@ function accountRecords(): Record<string, unknown> {
  * 用真 pool 而不是 mock：这批用例要证明的是「池里到底有没有那个账号」，
  * 对 mock 断言等于什么都没证明。
  */
-function makeProxyStub(opts: { enableMultiAccount?: boolean } = {}) {
+function makeProxyStub(opts: { enableMultiAccount?: boolean; heldCount?: number } = {}) {
   const pool = new AccountPool()
   const config: Partial<ProxyConfig> = {
     port: 5580,
@@ -73,6 +77,13 @@ function makeProxyStub(opts: { enableMultiAccount?: boolean } = {}) {
   let running = false
   let affinityDrops = 0
   const records = accountRecords()
+  // 挂起门闸替身:放行 = 把当前挂起条目全部认领并清空(与 HoldGate.releaseAll 的幂等语义一致)
+  let held = opts.heldCount ?? 0
+  let releaseCalls = 0
+  // 放行闸门:装上后放行会卡住,用于制造两个请求**真正重叠**的窗口。
+  // 不装时放行是同步的 —— 那种情况下两次连点不会重叠,singleFlight 也就无从去重。
+  let releaseGate: Promise<void> | null = null
+  let openGate: (() => void) | null = null
 
   const host: ProxyActivationHost = {
     isRunning: () => running,
@@ -89,9 +100,24 @@ function makeProxyStub(opts: { enableMultiAccount?: boolean } = {}) {
     host,
     records,
     get affinityDrops() { return affinityDrops },
+    get releaseCalls() { return releaseCalls },
+    get heldCount() { return held },
     isRunning: () => running,
     start: async () => { running = true },
     stop: async () => { running = false },
+    /** 让后续放行卡住，直到 openRelease() 被调用（制造真实重叠窗口） */
+    blockRelease: () => {
+      releaseGate = new Promise<void>((resolve) => { openGate = resolve })
+    },
+    openRelease: () => { openGate?.() },
+    /** 放行:认领全部挂起条目。已空时返回 0(幂等,不报错) */
+    releaseHeld: async () => {
+      releaseCalls++
+      if (releaseGate) await releaseGate
+      const n = held
+      held = 0
+      return n
+    },
     syncFromStore: () => {
       const accounts = buildProxyAccountsFromStore(records)
       pool.clear()
@@ -104,7 +130,7 @@ function makeProxyStub(opts: { enableMultiAccount?: boolean } = {}) {
 /** 把反代替身接成 PanelRouteDeps 的 proxy 侧实现（镜像生产装配的形状） */
 function proxyDeps(stub: ReturnType<typeof makeProxyStub>): Pick<
   PanelRouteDeps,
-  'proxyGetStatus' | 'proxySyncPool' | 'proxyActivateAccount' | 'proxyStart' | 'proxyStop'
+  'proxyGetStatus' | 'proxySyncPool' | 'proxyActivateAccount' | 'proxyStart' | 'proxyStop' | 'proxyReleaseHeld'
 > {
   return {
     proxyGetStatus: async () => ({
@@ -116,7 +142,11 @@ function proxyDeps(stub: ReturnType<typeof makeProxyStub>): Pick<
       selectedAccountId: stub.config.selectedAccountIds?.[0],
       poolSize: stub.pool.size,
       availableCount: stub.pool.availableCount,
-      inFlightRequests: 0
+      inFlightRequests: 0,
+      // 自动放行读数(决策卡 §3 三字段):null = 没有下一次,绝不用 0 表达「无」
+      autoReleaseEnabled: stub.isRunning() && stub.heldCount > 0,
+      nextAutoReleaseAt: stub.isRunning() && stub.heldCount > 0 ? 1_800_000_000_000 : null,
+      autoReleaseCount: 2
     }),
     proxySyncPool: async () => ({ success: true, poolSize: stub.syncFromStore() }),
     proxyActivateAccount: async (accountId: string) => {
@@ -133,6 +163,11 @@ function proxyDeps(stub: ReturnType<typeof makeProxyStub>): Pick<
     proxyStop: async () => {
       await stub.stop()
       return { success: true, running: stub.isRunning() }
+    },
+    proxyReleaseHeld: async () => {
+      // 反代没跑就没有挂起集合。不隐式启动 —— 与其它写端点一致的 409 语义
+      if (!stub.isRunning()) return { success: false, error: 'PROXY_NOT_RUNNING' }
+      return { success: true, released: await stub.releaseHeld() }
     }
   }
 }
@@ -199,7 +234,8 @@ describe('面板反代端点 · 鉴权闸门（启停是高影响操作）', () 
       ['GET', '/api/proxy/status'],
       ['POST', '/api/proxy/start'],
       ['POST', '/api/proxy/stop'],
-      ['POST', '/api/proxy/active-account']
+      ['POST', '/api/proxy/active-account'],
+      ['POST', '/api/proxy/release-held']
     ] as const) {
       const res = await fetch(`${base(server)}${path}`, {
         method,
@@ -305,7 +341,7 @@ describe('面板反代端点 · 启停（真实状态，非乐观更新）', () 
 
     const res = await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
     expect(res.status).toBe(200)
-    // 只收 status=active 的两个，acc-dead 被过滤
+    // 只收有凭据且未被后端拒绝的两个，acc-dead（封禁）被过滤
     expect(stub.pool.size).toBe(2)
     expect(stub.isRunning()).toBe(true)
   })
@@ -369,6 +405,138 @@ describe('面板反代端点 · 启停（真实状态，非乐观更新）', () 
     expect(r2.status).toBe(200)
     expect(stub.pool.size).toBe(2)
     expect(stub.isRunning()).toBe(true)
+  })
+})
+
+describe('面板反代端点 · 手动放行挂起请求（决策卡 §3 手机端契约）', () => {
+  it('放行返回实际放行数，且挂起集合被清空', async () => {
+    const stub = makeProxyStub({ heldCount: 3 })
+    const server = makeServer(stub)
+    await server.start()
+    const cookie = await login(server)
+    await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
+
+    const res = await fetch(`${base(server)}/api/proxy/release-held`, {
+      method: 'POST',
+      headers: authed(cookie)
+    })
+    expect(res.status).toBe(200)
+    expect((await res.json()).released).toBe(3)
+    // 判据不是「接口成功」而是真实副作用:集合真的空了
+    expect(stub.heldCount).toBe(0)
+  })
+
+  it('无挂起条目时放行 → 200 released=0，不是错误（放行本身幂等）', async () => {
+    const stub = makeProxyStub({ heldCount: 0 })
+    const server = makeServer(stub)
+    await server.start()
+    const cookie = await login(server)
+    await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
+
+    const res = await fetch(`${base(server)}/api/proxy/release-held`, {
+      method: 'POST',
+      headers: authed(cookie)
+    })
+    expect(res.status).toBe(200)
+    expect((await res.json()).released).toBe(0)
+  })
+
+  it('反代未运行时放行 → 409 PROXY_NOT_RUNNING，不静默成功', async () => {
+    const stub = makeProxyStub({ heldCount: 2 })
+    const server = makeServer(stub)
+    await server.start()
+    const cookie = await login(server)
+
+    const res = await fetch(`${base(server)}/api/proxy/release-held`, {
+      method: 'POST',
+      headers: authed(cookie)
+    })
+    expect(res.status).toBe(409)
+    expect((await res.json()).code).toBe('PROXY_NOT_RUNNING')
+    // 没跑就不该产生副作用
+    expect(stub.releaseCalls).toBe(0)
+  })
+
+  it('手机连点放行 → 单飞去重，只真执行一次', async () => {
+    const stub = makeProxyStub({ heldCount: 5 })
+    const server = makeServer(stub)
+    await server.start()
+    const cookie = await login(server)
+    await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
+
+    // 制造真实重叠窗口：放行卡住不返回，第二次连点必然落在第一次执行期间。
+    // 不卡住就无法测出 singleFlight —— 同步放行下第一次早已 finally 清掉去重键，
+    // 第二次是全新执行，`releaseCalls` 必然是 2。这个测试要证明的是
+    // 「重叠时共享一次执行」，所以重叠必须真实存在（详见交付报告的评审发现）。
+    stub.blockRelease()
+    const p1 = fetch(`${base(server)}/api/proxy/release-held`, { method: 'POST', headers: authed(cookie) })
+    const p2 = fetch(`${base(server)}/api/proxy/release-held`, { method: 'POST', headers: authed(cookie) })
+    // 让两个请求都到达路由层并进入 singleFlight，再放开闸门
+    await new Promise((r) => setTimeout(r, 30))
+    stub.openRelease()
+    const [r1, r2] = await Promise.all([p1, p2])
+
+    expect(r1.status).toBe(200)
+    expect(r2.status).toBe(200)
+    // 承重判据:两个请求共享同一次执行。若各自执行,底层会被调两次,
+    // 且第二次拿到的是已被清空的集合 → released=0。
+    expect(stub.releaseCalls).toBe(1)
+    expect((await r1.json()).released).toBe(5)
+    expect((await r2.json()).released).toBe(5)
+  })
+
+  it('写操作缺 CSRF 头 → 401，且没有产生放行副作用', async () => {
+    const stub = makeProxyStub({ heldCount: 4 })
+    const server = makeServer(stub)
+    await server.start()
+    const cookie = await login(server)
+    await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
+
+    const res = await fetch(`${base(server)}/api/proxy/release-held`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' }
+    })
+    expect(res.status).toBe(401)
+    expect(stub.heldCount).toBe(4)
+  })
+
+  it('GET 该路径不被当作放行处理（写操作只认 POST）', async () => {
+    const stub = makeProxyStub({ heldCount: 4 })
+    const server = makeServer(stub)
+    await server.start()
+    const cookie = await login(server)
+    await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
+
+    const res = await fetch(`${base(server)}/api/proxy/release-held`, { headers: authed(cookie) })
+    expect(res.status).toBeGreaterThanOrEqual(400)
+    expect(stub.releaseCalls).toBe(0)
+  })
+})
+
+describe('面板反代端点 · 自动放行读数（倒计时靠绝对时间戳，不靠轮询数值）', () => {
+  it('status 带三字段：enabled / 绝对时间戳 / 累计次数', async () => {
+    const stub = makeProxyStub({ heldCount: 1 })
+    const server = makeServer(stub)
+    await server.start()
+    const cookie = await login(server)
+    await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
+
+    const status = await (await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })).json()
+    expect(status.autoReleaseEnabled).toBe(true)
+    // 绝对 epoch ms —— 前端本地自减渲染倒计时,主进程不推倒计时数值
+    expect(status.nextAutoReleaseAt).toBe(1_800_000_000_000)
+    expect(status.autoReleaseCount).toBe(2)
+  })
+
+  it('无下一次放行时 nextAutoReleaseAt 是 null 而不是 0（0 是合法 epoch）', async () => {
+    const stub = makeProxyStub({ heldCount: 0 })
+    const server = makeServer(stub)
+    await server.start()
+    const cookie = await login(server)
+
+    const status = await (await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })).json()
+    expect(status.nextAutoReleaseAt).toBeNull()
+    expect(status.nextAutoReleaseAt).not.toBe(0)
   })
 })
 

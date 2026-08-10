@@ -101,3 +101,25 @@ export function usageBarClass(percentUsed: number | undefined): string {
 export function displayName(item: AccountListItem): string {
   return item.nickname || item.email || item.userId || item.id
 }
+
+/**
+ * 倒计时文案：从绝对时间戳到现在的剩余时长（`mm:ss`）。
+ *
+ * 入参是**绝对** epoch ms（服务端只给时间戳，倒计时在本地渲染）。
+ *
+ * - `null` / `undefined` / 非有限值 → `-`（表示「没有下一次」）。
+ *   注意判空必须区分 `null` 与 `0`：`0` 是合法 epoch，若把它当「无」，
+ *   真实的 1970 时间戳就会被静默吞掉。这里的判据是 `Number.isFinite`，
+ *   `0` 会照常走下面的计算（结果是负数 → 「即将放行」）。
+ * - 已到点或时钟回拨导致为负 → `即将放行`（不显示负号 —— 负倒计时看起来像 bug，
+ *   而它的真实含义是「这一刻正在放或马上放」）。
+ */
+export function formatCountdown(target: number | null | undefined, now: number = Date.now()): string {
+  if (target === null || target === undefined || !Number.isFinite(target)) return '-'
+  const diff = target - now
+  if (diff <= 0) return '即将放行'
+  const totalSec = Math.ceil(diff / 1000)
+  const min = Math.floor(totalSec / 60)
+  const sec = totalSec % 60
+  return `${min}:${String(sec).padStart(2, '0')}`
+}

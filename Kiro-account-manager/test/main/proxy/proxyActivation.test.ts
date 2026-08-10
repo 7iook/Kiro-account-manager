@@ -215,11 +215,20 @@ describe('activateProxyAccount · 三步顺序（下沉蓝本 accounts.ts:4306�
 })
 
 describe('buildProxyAccountsFromStore · 同步池的候选筛选', () => {
-  it('只收 status=active 且有 accessToken 的账号（对齐既有两处内联映射的过滤）', () => {
+  // 判据是「有凭据 且 未被后端拒绝」，不是 `status === 'active'`：status 是显示字段，
+  // 断网时的后台测活会把好号写成 'error'（`persistCheckResult.ts:325`），
+  // 用它当闸门等于让一次网络抖动把好号永久钉在池外。所以这里的 `inactive`
+  // 必须带**封禁形状**的 lastError 才该被挡 —— 光有 status:'error' 不算。
+  it('只收有凭据且未被后端拒绝的账号', () => {
     const records = {
       ok: { id: 'ok', status: 'active', credentials: { accessToken: 't' } },
       noToken: { id: 'noToken', status: 'active', credentials: {} },
-      inactive: { id: 'inactive', status: 'error', credentials: { accessToken: 't' } }
+      inactive: {
+        id: 'inactive',
+        status: 'error',
+        lastError: 'AccountSuspendedException',
+        credentials: { accessToken: 't' }
+      }
     }
     const out = buildProxyAccountsFromStore(records)
     expect(out.map((a) => a.id)).toEqual(['ok'])
