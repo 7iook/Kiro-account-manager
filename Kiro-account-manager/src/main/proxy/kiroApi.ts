@@ -97,6 +97,26 @@ export function getRateLimitRetryConfig(): Readonly<RateLimitRetryConfig> {
   return { ...rateLimitRetryConfig }
 }
 
+// ============ 上游尝试计数(纯观测 · 不改变任何重试行为)============
+// RCA 2026-08-11 429-latency-throughput §3:此前无法回答「一次客户端请求内部
+// 到底撞了几次 429 / 发了几次上游请求」——请求日志只有端到端 responseTime,
+// 而长尾(实测 200-361s)恰恰来自重试链累积。日志里虽有逐条 [Perf] 行,但
+// 事后靠 payload 相邻性拼链不可靠(实测会把连续重试误当同一请求)。
+//
+// 用「按请求实例传入的计数器」而非模块级全局:并发请求各自计数,互不污染。
+export interface UpstreamAttemptCounter {
+  /** 发往上游的尝试总次数(含端点回退 / 429 重试 / 溢出恢复重试) */
+  attempts: number
+  /** 其中收到 429 的次数 */
+  rateLimited: number
+  /** 被拒后重传的累计字节数 —— 量化「无效上传」成本(实测 1.23MB/请求) */
+  wastedUploadBytes: number
+}
+
+export function createUpstreamAttemptCounter(): UpstreamAttemptCounter {
+  return { attempts: 0, rateLimited: 0, wastedUploadBytes: 0 }
+}
+
 // Payload 大小限制（KB），用户可在高级设置中调整
 // 默认 4608KB = 4.5MB：上游请求体硬限实测约 5MiB（参 F:\kiro-rs），留安全余量。
 // 注意：这是 **byte 维度** 的兼底；token 超 context window 由 enableTokenBufferReserve 处理。
@@ -2094,7 +2114,9 @@ export async function callKiroApiStream(
   onComplete: (usage: KiroUsage) => void,
   onError: (error: Error) => void,
   signal?: AbortSignal,
-  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
+  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli',
+  /** 纯观测计数器(可选)。传入则累计上游尝试 / 429 / 无效上传字节;不传时零行为变化。 */
+  attemptCounter?: UpstreamAttemptCounter
 ): Promise<void> {
   const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
 
@@ -2234,6 +2256,7 @@ export async function callKiroApiStream(
       // TTFB = TCP/TLS 连接 + 网络 RTT + Kiro 后端模型 first-byte(启动/thinking)
       // 之前只有端到端 responseTime,无法分辨「网络+服务端慢」vs「反代自身慢」
       const tFetchStart = Date.now()
+      if (attemptCounter) attemptCounter.attempts++
       let response = agent
         ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal: linked.signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
         : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal: linked.signal })
@@ -2242,6 +2265,11 @@ export async function callKiroApiStream(
       console.log(`[Perf] ep=${endpoint.name} region=${dataPlaneRegion || '?'} TTFB=${ttfb}ms status=${response.status} pay=${payloadStr.length}B via=${usingProxy} acc=${account.email || account.id?.slice(0, 8) || '?'}`)
 
       if (response.status === 429) {
+        // 纯观测:首次 429(重试循环内的后续 429 在循环末尾累计)。
+        if (attemptCounter) {
+          attemptCounter.rateLimited++
+          attemptCounter.wastedUploadBytes += payloadStr.length
+        }
         // 429 = Kiro 后端概率式限流(不是真 QPS 上限,窗口随机开关)。
         // 策略:短 backoff + 高重试次数 + jitter,让请求密集打向服务端有更大概率命中开窗。
         // 之前策略 3 次 · 2s→5s→10s(exponential)对概率窗口过慢,大部分错过窗口 → 端点全打完 → 500。
@@ -2275,10 +2303,16 @@ export async function callKiroApiStream(
           // 复用会让新请求出生即死。旧的先 dispose 摘掉转发监听器,避免按重试次数堆积。
           linked.dispose()
           linked = createAttemptAbort()
+          if (attemptCounter) attemptCounter.attempts++
           response = agent
             ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal: linked.signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
             : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal: linked.signal })
           retried++
+          // 纯观测:重发后仍 429 → 又一次无效上传。
+          if (response.status === 429 && attemptCounter) {
+            attemptCounter.rateLimited++
+            attemptCounter.wastedUploadBytes += payloadStr.length
+          }
         }
         if (response.status === 429) {
           console.log(`[KiroAPI] ${endpoint.name} still rate-limited after ${maxRetries} retries, trying next endpoint...`)

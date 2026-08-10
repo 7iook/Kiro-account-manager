@@ -15,6 +15,14 @@ interface LogEntry {
   credits?: number
   responseTime?: number
   error?: string
+  // 诊断字段(RCA 2026-08-11 429-latency-throughput §3)。均为可选:旧日志无这些字段时显示 '-'。
+  /** 首 token 延迟 ms —— 与 responseTime(端到端)分离,用于定位「首响慢」在哪一段 */
+  ttft?: number
+  /** 本次请求内部遭遇的上游 429 次数 */
+  upstream429?: number
+  /** 本次请求实际发出的上游尝试总数(含端点回退/账号切换)。实测基线 7.3 */
+  upstreamAttempts?: number
+  accountId?: string
 }
 
 interface ProxyLogsDialogProps {
@@ -127,7 +135,10 @@ export function ProxyLogsDialog({
                     <th className="text-center p-2 font-medium">{isEn ? 'Out' : '输出'}</th>
                     <th className="text-center p-2 font-medium">Cache</th>
                     <th className="text-right p-2 font-medium">Credits</th>
+                    <th className="text-right p-2 font-medium" title={isEn ? 'time to first token' : '首 token 延迟'}>{isEn ? 'TTFT' : '首响'}</th>
                     <th className="text-right p-2 font-medium">{isEn ? 'Time' : '耗时'}</th>
+                    <th className="text-center p-2 font-medium" title={isEn ? 'upstream 429 hits in this request' : '本次请求撞上游 429 的次数'}>429</th>
+                    <th className="text-center p-2 font-medium" title={isEn ? 'upstream attempts in this request' : '本次请求的上游尝试次数'}>{isEn ? 'Try' : '尝试'}</th>
                   </tr>
                 </thead>
                 <tbody className="font-mono">
@@ -169,7 +180,18 @@ export function ProxyLogsDialog({
                       <td className="p-2 text-center text-muted-foreground">{log.outputTokens ? log.outputTokens.toLocaleString() : '-'}</td>
                       <td className="p-2 text-center text-success">{log.cacheReadTokens ? log.cacheReadTokens.toLocaleString() : '-'}</td>
                       <td className="p-2 text-right text-muted-foreground">{log.credits ? log.credits.toFixed(6) : '-'}</td>
+                      <td className="p-2 text-right text-muted-foreground">{log.ttft ? `${(log.ttft / 1000).toFixed(1)}s` : '-'}</td>
                       <td className="p-2 text-right text-muted-foreground">{log.responseTime ? `${(log.responseTime / 1000).toFixed(1)}s` : '-'}</td>
+                      <td className="p-2 text-center">
+                        {log.upstream429 ? (
+                          <span className="text-destructive" title={isEn ? 'upstream 429 hits' : '上游 429 次数'}>{log.upstream429}</span>
+                        ) : (
+                          <span className="text-muted-foreground">-</span>
+                        )}
+                      </td>
+                      <td className="p-2 text-center text-muted-foreground" title={isEn ? 'upstream attempts for this request' : '本次请求的上游尝试次数'}>
+                        {log.upstreamAttempts ?? '-'}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

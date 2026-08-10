@@ -21,7 +21,7 @@ import type {
 } from './types'
 import { AccountPool, ErrorType, classifyError, extractHttpStatusCode } from './accountPool'
 import { SmoothWeightedRoundRobin } from '../utils/smoothWeightedRoundRobin'
-import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
+import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, createUpstreamAttemptCounter, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -62,7 +62,17 @@ export function isUpstreamTerminalFailure(message: string): boolean {
 
 export interface ProxyServerEvents {
   onRequest?: (info: { path: string; method: string; accountId?: string }) => void
-  onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }) => void
+  /**
+   * 可选诊断字段(RCA 2026-08-11 429-latency-throughput §3 观测缺口):
+   * - `ttft`: 首 token 延迟 ms —— 与 responseTime(端到端)分离,用于区分
+   *   「上游/排队慢」vs「流式输出慢」。此前全仓零 TTFT 打点,首响慢无法归因。
+   * - `upstream429`: 本次客户端请求内部累计遭遇的上游 429 次数。
+   * - `upstreamAttempts`: 本次请求实际发出的上游尝试总数(含端点回退与账号切换)。
+   *   实测基线 7.3 次/请求;它与 responseTime 一起才能解释长尾。
+   * - `accountId`: 归因到账号 —— 实测同区域账号 429 率落差 5.4%↔75%。
+   * 全部 optional:未接线的 onResponse 调用点行为不变。
+   */
+  onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string; ttft?: number; upstream429?: number; upstreamAttempts?: number; accountId?: string }) => void
   onError?: (error: Error) => void
   onConfigChanged?: (config: ProxyConfig) => void  // API Key 用量更新时触发
   onStatusChange?: (running: boolean, port: number) => void
@@ -4392,9 +4402,15 @@ export class ProxyServer {
     // 惰性发一次。这样"未吐正文前失败"可无缝切号重放,不背"已提交正文"包袱(Invariant 1)。
     // currentRound>0(多轮工具续接)时 message_start 已在首轮发过,这里视为已发。
     let messageStartSent = currentRound !== 0
+    // TTFT(首 token 延迟)观测:首个语义正文写给客户端的时刻 - 请求进入时刻。
+    // RCA 2026-08-11 §3:此前全仓零 TTFT 打点,只有端到端 responseTime,
+    // 导致「首响慢」无法归因到「上游/排队慢」还是「流式输出慢」。
+    // 多轮工具续接(currentRound>0)时首轮已发过 message_start,不重复计。
+    let ttftMs: number | undefined
     const emitMessageStartOnce = () => {
       if (messageStartSent) return
       messageStartSent = true
+      if (ttftMs === undefined) ttftMs = Date.now() - startTime
       const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length / 3))
       const messageStart = createClaudeStreamEvent('message_start', {
         message: {
@@ -4422,6 +4438,8 @@ export class ProxyServer {
     }
 
     return new Promise((resolve) => {
+      // 纯观测计数器:统计本次请求内部的上游尝试 / 429 / 无效上传字节。
+      const attemptCounter = createUpstreamAttemptCounter()
       callKiroApiStream(
         account as any,
         kiroPayload,
@@ -4586,7 +4604,23 @@ export class ProxyServer {
           this.stats.cacheWriteTokens += usage.cacheWriteTokens || simulatedCacheUsage?.cacheCreationInputTokens || 0
           this.stats.reasoningTokens += usage.reasoningTokens || 0
           const respTime = Date.now() - startTime
-          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime })
+          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime, ttft: ttftMs, upstream429: attemptCounter.rateLimited, upstreamAttempts: attemptCounter.attempts, accountId: account.id })
+          // [Perf429] 单请求诊断行:把「一次客户端请求内部发生了什么」落成一条可 grep 的记录。
+          // 逐条 [Perf] 行只有单次尝试视角,拼不回请求级链路(实测事后拼链会误判)。
+          if (attemptCounter.rateLimited > 0 || attemptCounter.attempts > 1) {
+            const msg = `attempts=${attemptCounter.attempts} 429=${attemptCounter.rateLimited} wastedUpload=${(attemptCounter.wastedUploadBytes / 1e6).toFixed(2)}MB ttft=${ttftMs ?? -1}ms total=${respTime}ms in=${usage.inputTokens} acc=${account.id?.slice(0, 8) || '?'} model=${model}`
+            console.log(`[Perf429] ${msg}`)
+            proxyLogger.info('Perf429', msg, {
+              attempts: attemptCounter.attempts,
+              rateLimited: attemptCounter.rateLimited,
+              wastedUploadBytes: attemptCounter.wastedUploadBytes,
+              ttftMs: ttftMs ?? null,
+              totalMs: respTime,
+              inputTokens: usage.inputTokens,
+              accountId: account.id,
+              model
+            })
+          }
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
@@ -4689,7 +4723,8 @@ export class ProxyServer {
           resolve()
         },
         signal,
-        this.config.preferredEndpoint
+        this.config.preferredEndpoint,
+        attemptCounter
       ).catch(error => {
         if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
           const errorEvent = createClaudeStreamEvent('error', {

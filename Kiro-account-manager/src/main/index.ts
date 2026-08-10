@@ -6424,7 +6424,10 @@ app.whenReady().then(async () => {
 
   // 代理日志持久化（请求日志，与详细日志分开存储）
   const getProxyLogsPath = (): string => join(app.getPath('userData'), 'proxy-request-logs.json')
-  const MAX_LOGS = 100
+  // 保留条数上限。100 → 2000(RCA 2026-08-11 429-latency-throughput §3):
+  // 100 条在高峰期只覆盖几分钟,无法看「白天 vs 凌晨」的 429/延迟曲线,而这正是
+  // 定位限流与首响慢所必需的时间跨度。单条约 200-400B,2000 条 ≈ 0.8MB,可接受。
+  const MAX_LOGS = 2000
 
   // IPC: 保存代理日志
   ipcMain.handle('proxy-save-logs', async (_event, logs: Array<{ time: string; path: string; status: number; tokens?: number }>) => {

@@ -129,7 +129,7 @@ interface ProxyConfig {
 }
 
 // 反代请求日志：模块级持久化 + 单次订阅，避免切到其它页面 unmount 后日志清空、中间请求事件丢失
-type RecentLogEntry = { time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }
+type RecentLogEntry = { time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string; ttft?: number; upstream429?: number; upstreamAttempts?: number; accountId?: string }
 let _proxyRecentLogs: RecentLogEntry[] = []
 let _refSetProxyRecentLogs: ((v: RecentLogEntry[]) => void) | null = null
 let _proxyResponseListenerRegistered = false
@@ -158,8 +158,14 @@ function ensureProxyResponseListenerRegistered(): void {
       reasoningTokens: info.reasoningTokens,
       credits: info.credits,
       responseTime: info.responseTime,
-      error: info.error
-    }, ..._proxyRecentLogs.slice(0, 499)]
+      error: info.error,
+      ttft: info.ttft,
+      upstream429: info.upstream429,
+      upstreamAttempts: info.upstreamAttempts,
+      accountId: info.accountId
+      // 内存保留 2000 条,与主进程 MAX_LOGS 同口径(index.ts getProxyLogsPath 附近)。
+      // 两处必须一致:内存少于落盘上限 → 落盘永远拿不到那么多条,上限形同虚设。
+    }, ..._proxyRecentLogs.slice(0, 1999)]
     _refSetProxyRecentLogs?.(_proxyRecentLogs)
   })
 }
