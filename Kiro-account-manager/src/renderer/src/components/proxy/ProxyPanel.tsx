@@ -74,6 +74,8 @@ interface ProxyConfig {
   selectedAccountId?: string
   logRequests: boolean
   logStreamEvents?: boolean
+  /** 性能诊断落盘:按天 JSONL,供事后分析 429 与首响归因 */
+  enablePerfDiagLog?: boolean
   maxRetries?: number
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
   autoStart?: boolean
@@ -1464,6 +1466,25 @@ export function ProxyPanel() {
                 }}
               />
               <Label htmlFor="logStreamEvents" className="text-sm cursor-pointer">{isEn ? 'Stream Events' : '流式日志'}</Label>
+            </div>
+            <div className="flex items-center gap-2">
+              <Switch
+                id="enablePerfDiagLog"
+                checked={config.enablePerfDiagLog || false}
+                onCheckedChange={(checked) => {
+                  setConfig(prev => ({ ...prev, enablePerfDiagLog: checked }))
+                  window.api.proxyUpdateConfig({ enablePerfDiagLog: checked } as Partial<ProxyConfig>)
+                }}
+              />
+              <Label
+                htmlFor="enablePerfDiagLog"
+                className="text-sm cursor-pointer"
+                title={isEn
+                  ? 'Append every upstream attempt + request timing to userData/perf-logs/perf-YYYY-MM-DD.jsonl (never rotated, for post-hoc 429/TTFT analysis)'
+                  : '把每次上游尝试与每个请求的时序按天追加到 userData/perf-logs/perf-YYYY-MM-DD.jsonl(不滚动,供事后分析 429 与首响)'}
+              >
+                {isEn ? 'Perf Diag' : '性能诊断'}
+              </Label>
             </div>
           </div>
 

@@ -1,4 +1,4 @@
-﻿import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
 import { join, resolve } from 'path'
@@ -31,8 +31,14 @@ import {
   backgroundBatchCheck,
   type BatchCheckAccount
 } from './accountService/check'
-// 用量/订阅解析 SSOT(原先在本文件内联三份,分歧见 parseUsage.ts 头部注释)
-import { parseCreditUsage, parseSubscription } from './accountService/parseUsage'
+// 后台批量刷新 Token —— 服务器形态下唯一的续期路径（主进程调度器每 60s 调它）。
+// 原先内联在本文件(:3959)且只把结果 emit 给渲染进程,无渲染进程时静默丢失,见该文件头注释。
+import {
+  backgroundBatchRefresh,
+  type BackgroundRefreshAccount
+} from './accountService/backgroundRefresh'
+// 用量/订阅解析 SSOT 的最后一个 index.ts 消费点随 backgroundBatchRefresh 一并搬走
+// （parseCreditUsage / parseSubscription 现由 accountService 内部各业务函数直接引用）。
 import type { VerifyApiKeyResult } from '../shared/types/credential'
 import { buildCompleteLoginResult } from './proxy/profile-selection'
 import { checkPoolAdmission, logPoolAdmissionSkips, type PoolAdmissionSkip } from './proxy/activation'
@@ -51,6 +57,7 @@ import { refreshOidcTokenAcrossRegions } from './oidcRefresh'
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole, setLogTruncationEnabled } from './proxy/logger'
+import { perfDiag } from './proxy/perfDiag'
 import { installIpcSizeGuard } from './utils/emitToRenderer'
 import { installStdioGuard } from './utils/stdioGuard'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
@@ -601,6 +608,8 @@ function initProxyServer(): ProxyServer {
     baseMs: config.rateLimitRetryBaseMs,
     strategy: config.rateLimitRetryStrategy
   })
+  // 恢复性能诊断落盘开关 —— 必须在启动路径也接线,否则重启后用户开的开关静默失效
+  perfDiag.configure(config.enablePerfDiagLog === true, app.getPath('userData'))
   // 恢复 Agent 模式（vibe / spec）
   if (config.agentMode) {
     setAgentMode(config.agentMode)
@@ -2532,32 +2541,17 @@ const PROACTIVE_RENEWAL_LEAD_MS = 15 * 60 * 1000
 //
 // 背景：原先只有渲染进程的 setInterval 调度池内 token 刷新，窗口最小化到托盘后会被
 // Chromium 后台节流，导致 token 过期数分钟才刷新。这里把"调度"搬到主进程：主进程定时器
-// 不受窗口可见性影响，到点读 store 里的账号、刷新即将过期的 token，结果经
-// background-refresh-result 事件回流给渲染进程持久化（窗口隐藏但仍存活）。
+// 不受窗口可见性影响，到点读 store 里的账号、刷新即将过期的 token。
+//
+// **落盘由主进程自己完成**（accountService/backgroundRefresh.ts → persistBatchRefreshResults）。
+// 原先这里写的是"结果经 background-refresh-result 事件回流给渲染进程持久化" —— 那条路
+// 在服务器形态下不存在：无 BrowserWindow ⇒ `mainWindow?.webContents.send` 静默 no-op ⇒
+// 新签发的 refreshToken 永不上盘，而旧的已被 IdP 当场作废 ⇒ 重启后账号全死。
+// 事件仍照发（渲染进程 UI 的即时更新来源），但它不再是持久化路径。
 // 渲染进程定时器保留（已关后台节流）做信息同步/自动换号；两边的 token 刷新由
 // poolRefreshInFlightIds 去重，避免对同一 refreshToken 并发刷新把其中一个用作废。
-type BackgroundRefreshAccount = {
-  id: string
-  idp?: string
-  profileArn?: string
-  needsTokenRefresh?: boolean
-  machineId?: string
-  credentials: {
-    refreshToken: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    authMethod?: string
-    accessToken?: string
-    provider?: string
-    profileArn?: string
-    // external_idp (Azure AD) 刷新走微软 tokenEndpoint，缺字段会导致后台自动刷新失败
-    tokenEndpoint?: string
-    issuerUrl?: string
-    scopes?: string
-    audience?: string
-  }
-}
+//
+// 入参类型 BackgroundRefreshAccount 由 accountService/backgroundRefresh.ts 导出（SSOT）。
 /** background-batch-refresh 的核心实现（由 IPC 与主进程调度器共用）。在 whenReady 中赋值。 */
 let backgroundBatchRefreshImpl:
   | ((accounts: BackgroundRefreshAccount[], concurrency?: number, syncInfo?: boolean) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>)
@@ -3956,329 +3950,21 @@ app.whenReady().then(async () => {
   )
 
   // IPC: 后台批量刷新账号（在主进程执行，不阻塞 UI）
-  const backgroundBatchRefresh = async (accounts: BackgroundRefreshAccount[], concurrency: number = 10, syncInfo: boolean = true): Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }> => {
-    console.log(`[BackgroundRefresh] Starting batch refresh for ${accounts.length} accounts, concurrency: ${concurrency}, syncInfo: ${syncInfo}`)
-    
-    let completed = 0
-    let success = 0
-    let failed = 0
-
-    // 串行处理每批，避免并发过高
-    for (let i = 0; i < accounts.length; i += concurrency) {
-      const batch = accounts.slice(i, i + concurrency)
-      
-      await Promise.allSettled(
-        batch.map(async (account) => {
-          // 去重：渲染进程定时器与主进程调度器可能同时触发刷新，
-          // 对同一账号并发刷新会让其中一个用到被 rotate 作废的旧 refreshToken。
-          // 已在途则跳过本次（不计入成败，等在途那次的结果回流即可）。
-          if (account.id && poolRefreshInFlightIds.has(account.id)) {
-            return
-          }
-          if (account.id) poolRefreshInFlightIds.add(account.id)
-          try {
-            const { refreshToken, clientId, clientSecret, region, authMethod, accessToken, provider, tokenEndpoint, scopes } = account.credentials
-            const needsTokenRefresh = account.needsTokenRefresh !== false // 默认为 true（兼容旧版本）
-
-            // 查询账号绑定的代理（从主进程账号池）
-            const boundProxyUrl = proxyServer
-              ? proxyServer.getAccountPool().getAccount(account.id)?.proxyUrl
-              : undefined
-
-            // 确定正确的 idp
-            let idp = 'BuilderId'
-            if (authMethod === 'social') {
-              idp = provider || account.idp || 'BuilderId'
-            } else if (provider) {
-              idp = provider
-            }
-            
-            let newAccessToken = accessToken
-            let newRefreshToken = refreshToken
-            let newExpiresIn: number | undefined
-
-            // 只有需要刷新 Token 时才刷新
-            if (needsTokenRefresh) {
-              if (!refreshToken) {
-                failed++
-                completed++
-                return
-              }
-
-              // 刷新 Token（透传账号绑定代理）
-              const refreshResult = await refreshTokenByMethod(
-                refreshToken,
-                clientId || '',
-                clientSecret || '',
-                region || 'us-east-1',
-                authMethod,
-                boundProxyUrl,
-                { tokenEndpoint, scopes }
-              )
-
-              if (!refreshResult.success) {
-                failed++
-                completed++
-                // 通知渲染进程刷新失败
-                mainWindow?.webContents.send('background-refresh-result', {
-                  id: account.id,
-                  success: false,
-                  error: refreshResult.error
-                })
-                return
-              }
-
-              newAccessToken = refreshResult.accessToken || accessToken
-              newRefreshToken = refreshResult.refreshToken || refreshToken
-              newExpiresIn = refreshResult.expiresIn
-
-              // 仅当该账号是 Kiro IDE 当前激活账号时，同步新 token 到磁盘 token 文件。
-              // 否则 IDE 在 ~50min 后会用磁盘上"被自动刷新作废"的旧 refreshToken 调 OIDC → 401 → logoutAndForget。
-              // 判定优先级（任一命中）：1) 磁盘 refresh 匹配账号  2) lastSwitchedAccountId 匹配
-              if (newAccessToken && newRefreshToken && newExpiresIn) {
-                try {
-                  const diskToken = await readKiroAuthTokenFile()
-                  const matchByRefresh = !!diskToken && diskToken.refreshToken === refreshToken
-                  const matchByLastSwitch = lastSwitchedAccountId === account.id
-                  if (matchByRefresh || matchByLastSwitch) {
-                    const resolvedProfileArn = resolveProfileArnForWrite({
-                      profileArn: diskToken?.profileArn,
-                      authMethod,
-                      provider,
-                      region
-                    })
-                    await writeKiroAuthTokenFile({
-                      accessToken: newAccessToken,
-                      refreshToken: newRefreshToken,
-                      expiresAtIso: new Date(Date.now() + newExpiresIn * 1000).toISOString(),
-                      authMethod: (authMethod === 'social' ? 'social' : authMethod === 'external_idp' ? 'external_idp' : 'IdC'),
-                      provider: provider || (diskToken?.provider as string | undefined) || 'BuilderId',
-                      region: region || diskToken?.region,
-                      // background-batch-refresh 没传 startUrl，但 disk 的 clientIdHash 不再变；
-                      // helper 会用默认 startUrl 计算同一 hash，写入的 client 注册文件路径也不会变
-                      clientId: clientId || undefined,
-                      clientSecret: clientSecret || undefined,
-                      profileArn: resolvedProfileArn
-                    })
-                    lastWrittenTokenSignature = `${newAccessToken}|${newRefreshToken}`
-                    if (account.id) lastSwitchedAccountId = account.id
-                    console.log(`[BackgroundRefresh] Synced refreshed token to Kiro IDE for account ${account.id}`)
-                    if (proactiveRenewalEnabled && account.id) {
-                      scheduleProactiveRenewal(account.id, Date.now() + newExpiresIn * 1000)
-                    }
-                  }
-                } catch (e) {
-                  console.warn(`[BackgroundRefresh] sync to IDE failed for ${account.id}:`, e)
-                }
-              }
-            }
-
-            // Enterprise 账号：后台刷新后自动获取 profileArn（BuilderId/Social 不需要调 API）
-            const existingProfileArn = account.profileArn || account.credentials?.profileArn
-            let resolvedBgProfileArn: string | undefined
-            const isEnt = (provider || account.idp) === 'Enterprise' || authMethod === 'external_idp'
-            if (!existingProfileArn && newAccessToken && isEnt) {
-              try {
-                resolvedBgProfileArn = await fetchEnterpriseProfileArn({
-                  id: account.id || '',
-                  accessToken: newAccessToken,
-                  region: region || 'us-east-1',
-                  provider: provider || account.idp,
-                  authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined,
-                  machineId: account.machineId
-                })
-                if (resolvedBgProfileArn) {
-                  console.log(`[BackgroundRefresh] Enterprise profileArn auto-resolved: ${resolvedBgProfileArn} (${account.id})`)
-                }
-              } catch (e) {
-                console.warn(`[BackgroundRefresh] Failed to fetch Enterprise profileArn for ${account.id}:`, e)
-              }
-            }
-
-            // 获取账号信息
-            if (!newAccessToken) {
-              failed++
-              completed++
-              return
-            }
-
-            // 根据 syncInfo 决定是否检测账户信息
-            let parsedUsage: {
-              current: number
-              limit: number
-              baseCurrent: number
-              baseLimit: number
-              freeTrialCurrent: number
-              freeTrialLimit: number
-              freeTrialExpiry?: string
-              bonuses: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
-              nextResetDate?: string
-              resourceDetail?: {
-                displayName?: string
-                displayNamePlural?: string
-                resourceType?: string
-                currency?: string
-                unit?: string
-                overageRate?: number
-                overageCap?: number
-                overageEnabled?: boolean
-              }
-            } | undefined
-            let userInfoData: UserInfoResponse | undefined
-            let subscriptionData: { type: string; title: string; daysRemaining?: number; expiresAt?: number; overageCapability?: string; upgradeCapability?: string; subscriptionManagementTarget?: string } | undefined
-            let status = 'active'
-            let errorMessage: string | undefined
-
-            if (syncInfo) {
-              // 调用 getUsageAndLimits API（根据配置选择 REST 或 CBOR 格式）
-              try {
-                interface UsageBreakdownItem {
-                  resourceType?: string
-                  displayName?: string
-                  currentUsage?: number
-                  currentUsageWithPrecision?: number
-                  usageLimit?: number
-                  usageLimitWithPrecision?: number
-                  freeTrialInfo?: {
-                    freeTrialStatus?: string
-                    usageLimit?: number
-                    usageLimitWithPrecision?: number
-                    currentUsage?: number
-                    currentUsageWithPrecision?: number
-                    freeTrialExpiry?: string
-                  }
-                  bonuses?: Array<{
-                    bonusCode?: string
-                    displayName?: string
-                    usageLimit?: number
-                    usageLimitWithPrecision?: number
-                    currentUsage?: number
-                    currentUsageWithPrecision?: number
-                    expiresAt?: string
-                    status?: string
-                  }>
-                }
-                interface UsageResponse {
-                  usageBreakdownList?: UsageBreakdownItem[]
-                  nextDateReset?: string
-                  subscriptionInfo?: {
-                    subscriptionTitle?: string
-                    type?: string
-                    overageCapability?: string
-                    upgradeCapability?: string
-                    subscriptionManagementTarget?: string
-                  }
-                  overageConfiguration?: {
-                    overageStatus?: string
-                    overageEnabled?: boolean
-                    overageLimit?: number | null
-                  }
-                }
-                console.log(`[BackgroundRefresh] Account ${account.id} machineId: ${account.machineId || 'undefined'}`)
-                const rawUsage = await getUsageAndLimits(newAccessToken, idp, account.profileArn, account.machineId, region, undefined, authMethod) as UsageResponse
-                
-                // 解析使用量与订阅（走 accountService/parseUsage SSOT）
-                // 原先此处内联第三份副本，其 CREDIT 判据只认 resourceType，
-                // resourceType 缺失的响应会让额度恒为 0；SSOT 采用 displayName 兜底的宽判据。
-                const usage = parseCreditUsage(rawUsage)
-                const subscription = parseSubscription(rawUsage, { emptyTitleAsDefault: true })
-
-                parsedUsage = {
-                  current: usage.totalCurrent,
-                  limit: usage.totalLimit,
-                  baseCurrent: usage.baseCurrent,
-                  baseLimit: usage.baseLimit,
-                  freeTrialCurrent: usage.freeTrialCurrent,
-                  freeTrialLimit: usage.freeTrialLimit,
-                  freeTrialExpiry: usage.freeTrialExpiry,
-                  bonuses: usage.bonuses,
-                  nextResetDate: usage.nextResetDate,
-                  resourceDetail: usage.resourceDetail
-                }
-
-                subscriptionData = {
-                  type: subscription.type,
-                  title: subscription.title,
-                  daysRemaining: subscription.daysRemaining,
-                  expiresAt: subscription.expiresAt,
-                  overageCapability: subscription.overageCapability,
-                  upgradeCapability: subscription.upgradeCapability,
-                  subscriptionManagementTarget: subscription.managementTarget
-                }
-              } catch (apiError) {
-                const errMsg = apiError instanceof Error ? apiError.message : String(apiError)
-                console.log(`[BackgroundRefresh] Usage API error for ${account.id}:`, errMsg)
-                if (errMsg.includes('AccountSuspendedException') || errMsg.includes('423')) {
-                  status = 'error'
-                  errorMessage = errMsg
-                }
-              }
-
-              // 调用 GetUserInfo API 获取用户状态
-              try {
-                userInfoData = await getUserInfo(newAccessToken, idp, account.machineId)
-              } catch (apiError) {
-                const errMsg = apiError instanceof Error ? apiError.message : String(apiError)
-                if (errMsg.includes('AccountSuspendedException') || errMsg.includes('423')) {
-                  status = 'error'
-                  errorMessage = errMsg
-                }
-              }
-            }
-
-            success++
-            completed++
-
-            // 通知渲染进程更新账号
-            mainWindow?.webContents.send('background-refresh-result', {
-              id: account.id,
-              success: true,
-              data: {
-                accessToken: newAccessToken,
-                refreshToken: newRefreshToken,
-                expiresIn: newExpiresIn,
-                profileArn: resolvedBgProfileArn || undefined,
-                usage: parsedUsage,
-                subscription: subscriptionData,
-                userInfo: syncInfo ? userInfoData : undefined,
-                status,
-                errorMessage
-              }
-            })
-          } catch (e) {
-            failed++
-            completed++
-            mainWindow?.webContents.send('background-refresh-result', {
-              id: account.id,
-              success: false,
-              error: e instanceof Error ? e.message : 'Unknown error'
-            })
-          } finally {
-            if (account.id) poolRefreshInFlightIds.delete(account.id)
-          }
-        })
-      )
-
-      // 通知进度
-      mainWindow?.webContents.send('background-refresh-progress', {
-        completed,
-        total: accounts.length,
-        success,
-        failed
-      })
-
-      // 批次间延迟，让主进程有喘息时间
-      if (i + concurrency < accounts.length) {
-        await new Promise(resolve => setTimeout(resolve, 100))
-      }
-    }
-
-    console.log(`[BackgroundRefresh] Completed: ${success} success, ${failed} failed`)
-    return { success: true, completed, successCount: success, failedCount: failed }
-  }
+  //
+  // 实现在 accountService/backgroundRefresh.ts —— 与 backgroundBatchCheck 同构:
+  // 传输通道无关、可单测、服务端壳（无 BrowserWindow）可直接调。
+  // 原先本文件内联一份约 320 行的副本,且刷新结果**只** emit 给渲染进程由
+  // renderer store 落盘;服务器形态下 mainWindow 为 undefined ⇒ send 静默 no-op ⇒
+  // 新签发的 refreshToken 永不上盘。落盘现已在业务层收口(persistBatchRefreshResults)。
+  const backgroundBatchRefreshLocal = (
+    accounts: BackgroundRefreshAccount[],
+    concurrency: number = 10,
+    syncInfo: boolean = true
+  ): Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }> =>
+    backgroundBatchRefresh(accountServiceDeps, accounts, concurrency, syncInfo)
   // 暴露给主进程调度器复用（startMainPoolTokenRefresh）
-  backgroundBatchRefreshImpl = backgroundBatchRefresh
-  ipcMain.handle('background-batch-refresh', (_event, accounts: BackgroundRefreshAccount[], concurrency: number = 10, syncInfo: boolean = true) => backgroundBatchRefresh(accounts, concurrency, syncInfo))
+  backgroundBatchRefreshImpl = backgroundBatchRefreshLocal
+  ipcMain.handle('background-batch-refresh', (_event, accounts: BackgroundRefreshAccount[], concurrency: number = 10, syncInfo: boolean = true) => backgroundBatchRefreshLocal(accounts, concurrency, syncInfo))
   // 启动主进程池 token 刷新调度器（不依赖窗口可见/存活，挂托盘也照常刷新）
   startMainPoolTokenRefresh()
 
@@ -6011,6 +5697,10 @@ app.whenReady().then(async () => {
       // 同步流式日志开关
       if (config.logStreamEvents !== undefined) {
         setLogStreamEvents(config.logStreamEvents)
+      }
+      // 同步性能诊断落盘开关(按天 JSONL,不受内存日志滚动窗口影响)
+      if (config.enablePerfDiagLog !== undefined) {
+        perfDiag.configure(config.enablePerfDiagLog === true, app.getPath('userData'))
       }
       // 同步 payload 大小限制
       if (config.payloadSizeLimitKB !== undefined) {

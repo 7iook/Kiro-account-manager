@@ -23,6 +23,7 @@ import { AccountPool, ErrorType, classifyError, extractHttpStatusCode } from './
 import { SmoothWeightedRoundRobin } from '../utils/smoothWeightedRoundRobin'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, createUpstreamAttemptCounter, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
+import { perfDiag } from './perfDiag'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
   openaiToKiro,
@@ -4621,6 +4622,26 @@ export class ProxyServer {
               model
             })
           }
+          // request 级诊断落盘:**每个请求都记**(不只是撞过 429 的),
+          // 因为「正常请求的 TTFT 基线」正是判断慢不慢的对照组。
+          if (perfDiag.isEnabled()) {
+            perfDiag.write({
+              kind: 'request',
+              ts: new Date().toISOString(),
+              path: '/v1/messages',
+              model,
+              status: 200,
+              ttftMs: ttftMs ?? null,
+              totalMs: respTime,
+              inputTokens: usage.inputTokens,
+              outputTokens: usage.outputTokens,
+              cacheReadTokens: usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens,
+              attempts: attemptCounter.attempts,
+              rateLimited: attemptCounter.rateLimited,
+              wastedUploadBytes: attemptCounter.wastedUploadBytes,
+              account: account.id?.slice(0, 8)
+            })
+          }
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
@@ -4720,6 +4741,24 @@ export class ProxyServer {
 
           this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
+          // 失败路径同样落盘 —— 失败样本恰恰最有价值(429 撞爆 / 流中断 / 502
+          // 都走这里),只记成功会让事后统计系统性偏乐观。
+          if (perfDiag.isEnabled()) {
+            perfDiag.write({
+              kind: 'request',
+              ts: new Date().toISOString(),
+              path: '/v1/messages',
+              model,
+              status: 500,
+              ttftMs: ttftMs ?? null,
+              totalMs: Date.now() - startTime,
+              attempts: attemptCounter.attempts,
+              rateLimited: attemptCounter.rateLimited,
+              wastedUploadBytes: attemptCounter.wastedUploadBytes,
+              account: account.id?.slice(0, 8),
+              error: error.message?.slice(0, 300)
+            })
+          }
           resolve()
         },
         signal,

@@ -17,6 +17,7 @@ import type {
   ProxyAccount
 } from './types'
 import { proxyLogger } from './logger'
+import { perfDiag } from './perfDiag'
 import { getKProxyService } from '../kproxy'
 import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
 import {
@@ -2263,6 +2264,22 @@ export async function callKiroApiStream(
       const ttfb = Date.now() - tFetchStart
       const usingProxy = agent ? 'proxy' : 'direct'
       console.log(`[Perf] ep=${endpoint.name} region=${dataPlaneRegion || '?'} TTFB=${ttfb}ms status=${response.status} pay=${payloadStr.length}B via=${usingProxy} acc=${account.email || account.id?.slice(0, 8) || '?'}`)
+      // attempt 级诊断落盘(默认关;开启后按天 append,不受内存 10000 条滚动窗口影响)
+      if (perfDiag.isEnabled()) {
+        perfDiag.write({
+          kind: 'attempt',
+          ts: new Date().toISOString(),
+          endpoint: endpoint.name,
+          region: dataPlaneRegion || undefined,
+          status: response.status,
+          ttfbMs: ttfb,
+          payloadBytes: payloadStr.length,
+          retryIndex: 0,
+          waitedMs: 0,
+          account: account.email || account.id?.slice(0, 8),
+          via: usingProxy
+        })
+      }
 
       if (response.status === 429) {
         // 纯观测:首次 429(重试循环内的后续 429 在循环末尾累计)。
@@ -2304,10 +2321,27 @@ export async function callKiroApiStream(
           linked.dispose()
           linked = createAttemptAbort()
           if (attemptCounter) attemptCounter.attempts++
+          const tRetryStart = Date.now()
           response = agent
             ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal: linked.signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
             : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal: linked.signal })
           retried++
+          // attempt 级诊断落盘:429 重试链的每一跳都记,这是长尾的真实来源。
+          if (perfDiag.isEnabled()) {
+            perfDiag.write({
+              kind: 'attempt',
+              ts: new Date().toISOString(),
+              endpoint: endpoint.name,
+              region: dataPlaneRegion || undefined,
+              status: response.status,
+              ttfbMs: Date.now() - tRetryStart,
+              payloadBytes: payloadStr.length,
+              retryIndex: retried,
+              waitedMs: waitMs,
+              account: account.email || account.id?.slice(0, 8),
+              via: agent ? 'proxy' : 'direct'
+            })
+          }
           // 纯观测:重发后仍 429 → 又一次无效上传。
           if (response.status === 429 && attemptCounter) {
             attemptCounter.rateLimited++

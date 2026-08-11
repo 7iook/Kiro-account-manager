@@ -554,6 +554,19 @@ export interface ProxyConfig {
   selectedAccountIds: string[]
   logRequests: boolean
   logStreamEvents?: boolean
+  /**
+   * 性能诊断落盘(默认 false)。开启后把每次上游尝试与每个请求的时序写成
+   * **按天 append-only 的 JSONL 文件**,不受内存日志 10000 条滚动窗口影响。
+   *
+   * 为什么需要独立通道(RCA 2026-08-11 429-latency-throughput):
+   * 内存 store 实测 40 分钟即写满 10000 条并开始丢弃,而「白天限流 vs 凌晨空闲」
+   * 的对比需要跨小时甚至跨天的数据;界面日志表又只保留最近若干条。
+   * 结论:要判定 429 机制与首响归因,必须有一份不滚动、可事后聚合的原始记录。
+   *
+   * 落盘位置:`<userData>/perf-logs/perf-YYYY-MM-DD.jsonl`
+   * 关闭时零开销(不建流、不写盘、不拼字符串)。
+   */
+  enablePerfDiagLog?: boolean
   maxConcurrent: number
   // 重试配置
   maxRetries?: number
