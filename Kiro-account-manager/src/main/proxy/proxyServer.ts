@@ -2977,11 +2977,26 @@ export class ProxyServer {
     }
     
     // 3. 动态模型缺失时才添加静态兜底
+    //
+    // ⚠️ 静态清单是「模型固有元数据」(id / 窗口 / 倍率),不是「本账号本区域的可用性」——
+    // 两者必须分层看待。实测(2026-08-12)同一把 ksk:直连 ListAvailableModels 只返 6 个模型
+    // (Claude 全系被过滤),走代理返 17 个;不同订阅档/区域的可用子集也不同。
+    // 因此拉取失败时广告全量清单,可能列出该账号实际调不动的模型 → 用户遇到「列表里有但请求 400」。
+    // 取舍:宁可多列(用户可换号/查网络)也不给空列表(客户端直接不可用)——但必须让用户知道
+    // 这是未经账号校验的兜底清单,故 description 前缀标注 + 打 warn 日志。
     if (dynamicModels.length === 0) {
+      proxyLogger.warn(
+        'ProxyServer',
+        `ListAvailableModels 拉取失败或无可用账号 → 回落静态模型清单(未按账号/区域校验可用性)。` +
+        `其中部分模型在当前账号或网络环境下可能返回 400 INVALID_MODEL_ID。`
+      )
       for (const m of [...kiroOfficialModels, ...presetModels]) {
         if (!modelIds.has(m.id)) {
           modelIds.add(m.id)
-          allModels.push(m)
+          allModels.push({
+            ...m,
+            description: `[未校验兜底清单] ${m.description}`
+          })
         }
       }
     }
