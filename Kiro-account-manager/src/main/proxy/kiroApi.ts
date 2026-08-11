@@ -841,20 +841,37 @@ const CODEWHISPERER_MODEL_CACHE_TTL = 5 * 60 * 1000
 const codeWhispererModelCache = new Map<string, { models: KiroModel[]; timestamp: number }>()
 
 // 模型 ID 映射
+//
+// ⚠️ 上游只认 ListAvailableModels 白名单内的 canonical id。
+// 2026-08-12 受控对照实测(EU ksk + 7897 代理 · runtime.eu-central-1.kiro.dev):
+//   gpt-5.6-sol → 200 出流    claude-opus-5 → 200 出流   ← 对照锚点(通道正常)
+//   gpt-5.6 / gpt-5 / gpt-4o / gpt-5.7-sol → 全部 400 INVALID_MODEL_ID
+// 故任何裸名 / 老名 / 未来名都必须先归一到真实档,禁止原样透传赌上游二次解析。
+
+/** GPT 系列默认落档(裸名 gpt-5.6/gpt-5 + GPT-4 老名 + 未知 GPT 名统一落此档)。
+ *  Sol = 旗舰档 · rateMultiplier 2.4x(实测值)。
+ *  用户 2026-08-12 决策:宁可按最贵档计费也要给最强能力,不静默降档。
+ *  改这一个常量即可整体切档(如未来要改成 Terra 1.0x),不必逐行改映射表。 */
+const GPT_DEFAULT_TIER = 'gpt-5.6-sol'
+
+/** Kiro 上真实存在的 GPT canonical id(实测 ListAvailableModels 返回值)。
+ *  只有这几个可以原样进 payload;其余一律归一到 GPT_DEFAULT_TIER。 */
+const GPT_CANONICAL_IDS = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])
+
 const MODEL_ID_MAP: Record<string, string> = {
-  // GPT-5.6 系列(2026-07-24 修复 INVALID_MODEL_ID)
+  // GPT-5.6 系列(2026-07-24 修复 INVALID_MODEL_ID · 2026-08-12 补全裸名/老名归档)
   // Kiro catalog 的 canonical id 带 tier 后缀(gpt-5.6-sol / -terra / -luna),
-  // 裸 `gpt-5.6` 只有 CodeWhisperer 端点会做 catalog 二次解析,V2 KiroRuntime / AmazonQ
-  // 直接 400 INVALID_MODEL_ID → 表现为"有时成功(fallback 到第三个端点)、有时挂"。
+  // 裸 `gpt-5.6` 上游直接 400 INVALID_MODEL_ID(2026-08-12 实测坐实,三个端点一致)。
   // 客户端(如 Claude Code 的 ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6 · SUB 用 model:sonnet)
   // 常传裸别名,这里静态映射到旗舰 Sol,首个端点即命中。
-  // 官方证据:kiro.dev/docs/models GPT-5.6 Sol/Terra/Luna 三档 · 272K ctx · 2.4x/1.2x/0.6x credit
-  'gpt-5.6': 'gpt-5.6-sol',
-  'gpt-5-6': 'gpt-5.6-sol',
+  // 官方证据:kiro.dev/docs/models GPT-5.6 Sol/Terra/Luna 三档 · 272K ctx
+  // 实测倍率(端点权威,与官方博客的 1.2x/0.6x 不同——官方后来降过价):Sol 2.4 / Terra 1.0 / Luna 0.1
+  'gpt-5.6': GPT_DEFAULT_TIER,
+  'gpt-5-6': GPT_DEFAULT_TIER,
   'gpt-5.6-sol': 'gpt-5.6-sol',
   'gpt-5.6-terra': 'gpt-5.6-terra',
   'gpt-5.6-luna': 'gpt-5.6-luna',
-  'gpt-5': 'gpt-5.6-sol',
+  'gpt-5': GPT_DEFAULT_TIER,
   // Claude 5 系列(2026-07-24 Opus 5 发布)
   'claude-opus-5': 'claude-opus-5',
   'claude-sonnet-5': 'claude-sonnet-5',
@@ -873,11 +890,13 @@ const MODEL_ID_MAP: Record<string, string> = {
   'claude-3-opus': 'claude-sonnet-4.5',
   'claude-3-sonnet': 'claude-sonnet-4',
   'claude-3-haiku': 'claude-haiku-4.5',
-  // GPT 兼容映射 (映射到 Sonnet 4.5)
-  'gpt-4': 'claude-sonnet-4.5',
-  'gpt-4o': 'claude-sonnet-4.5',
-  'gpt-4-turbo': 'claude-sonnet-4.5',
-  'gpt-3.5-turbo': 'claude-sonnet-4.5',
+  // GPT-4 / 3.5 老名(2025-01 项目初期写的,当时 Kiro 上只有 Claude、无 OpenAI 模型可选,
+  // 故当年指向 claude-sonnet-4.5 是唯一可能;2026-07 上游新增 OpenAI 模型后该映射已过时。
+  // 2026-08-12 用户决策:改为同厂商就近替代,消除跨厂商静默换模型)
+  'gpt-4': GPT_DEFAULT_TIER,
+  'gpt-4o': GPT_DEFAULT_TIER,
+  'gpt-4-turbo': GPT_DEFAULT_TIER,
+  'gpt-3.5-turbo': GPT_DEFAULT_TIER,
   'default': 'claude-sonnet-4.5'
 }
 
@@ -910,7 +929,16 @@ export function mapModelId(model: string): string {
   if (MODEL_ID_MAP[lower]) return MODEL_ID_MAP[lower]
   // 2) Kiro 支持的动态模型家族原样透传，用于向前兼容尚未加入静态 alias 的新版本
   if (/^claude-(sonnet|haiku|opus)-/.test(lower)) return modelId
-  if (/^gpt-\d+(?:\.\d+)*(?:-[a-z0-9]+)*$/.test(lower)) return modelId
+  // 2.5) GPT 家族:只有白名单内的 canonical id 能原样透传。
+  //   旧实现用 /^gpt-\d+(\.\d+)*(-[a-z0-9]+)*$/ 放行任意 GPT 形状名做「前向兼容」,
+  //   2026-08-12 实测证伪:gpt-5.7-sol / gpt-6 / gpt-4.1 均 400 INVALID_MODEL_ID
+  //   —— Kiro 不做 GPT 名的模糊解析,透传未知名只会让用户吃 400。
+  //   故未知 GPT 名归一到 GPT_DEFAULT_TIER(同厂商可用档),而非 Claude default。
+  if (GPT_CANONICAL_IDS.has(lower)) return lower
+  if (/^gpt[-.]?\d/.test(lower)) {
+    console.warn(`[Kiro API] GPT model "${modelId}" 不在 Kiro 白名单(${[...GPT_CANONICAL_IDS].join(' / ')}) → 归一到 "${GPT_DEFAULT_TIER}"`)
+    return GPT_DEFAULT_TIER
+  }
   // 3) 完全未知的 model（用户拼错/不存在），兜底到 default 避免直接 400
   console.warn(`[Kiro API] Unknown model "${modelId}" → fallback to "${MODEL_ID_MAP.default}"`)
   return MODEL_ID_MAP.default

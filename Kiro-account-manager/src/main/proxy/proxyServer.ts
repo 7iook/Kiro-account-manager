@@ -186,6 +186,8 @@ function modelFamily(id: string): string {
   if (lower.includes('opus')) return 'claude-opus'
   if (lower.includes('sonnet')) return 'claude-sonnet'
   if (lower.includes('haiku')) return 'claude-haiku'
+  // GPT-5.6 三档同族(sol/terra/luna 是并列 tier,不是不同家族)
+  if (lower.startsWith('gpt-5')) return 'gpt-5.6'
   if (lower.includes('gpt-4o')) return 'gpt-4o'
   if (lower.includes('gpt-4')) return 'gpt-4'
   if (lower.includes('gpt-3.5')) return 'gpt-3.5'
@@ -2859,12 +2861,30 @@ export class ProxyServer {
     const now = Date.now()
     
     // Kiro 官方模型（与 UI 保持一致）
+    // ⚠️ 这份静态清单只是 fetchKiroModels 失败时的兜底(动态模型优先合并,见下方 step 1)。
+    // 窗口/倍率取自 ListAvailableModels 实测值(2026-08-12 · EU ksk + 代理拉到 17 个模型),
+    // 不写 maxInputTokens 会被 buildClientModel 落到 200000 默认值 → 1M/272K 档被低估。
     const kiroOfficialModels = [
-      buildClientModel({ id: 'auto', created: now, ownedBy: 'kiro-api', description: 'Auto select best model' }),
-      buildClientModel({ id: 'claude-sonnet-4.5', created: now, ownedBy: 'kiro-api', description: 'The latest Claude Sonnet model' }),
-      buildClientModel({ id: 'claude-sonnet-4', created: now, ownedBy: 'kiro-api', description: 'Hybrid reasoning and coding' }),
-      buildClientModel({ id: 'claude-haiku-4.5', created: now, ownedBy: 'kiro-api', description: 'The latest Claude Haiku model' }),
-      buildClientModel({ id: 'claude-opus-4.5', created: now, ownedBy: 'kiro-api', description: 'The most powerful model' })
+      buildClientModel({ id: 'auto', created: now, ownedBy: 'kiro-api', description: 'Auto select best model', modelName: 'Auto', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 1000000, maxOutputTokens: 64000, rateMultiplier: 1, rateUnit: 'Credit' }),
+      // GPT-5.6 三档(2026-07 上游新增 OpenAI 模型;实测 272K 入 / 128K 出 · 倍率 2.4 / 1.0 / 0.1)
+      buildClientModel({ id: 'gpt-5.6-sol', created: now, ownedBy: 'kiro-api', description: 'OpenAI GPT 5.6 Sol with 272k context window', modelName: 'GPT 5.6 Sol', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 272000, maxOutputTokens: 128000, rateMultiplier: 2.4, rateUnit: 'Credit' }),
+      buildClientModel({ id: 'gpt-5.6-terra', created: now, ownedBy: 'kiro-api', description: 'OpenAI GPT 5.6 Terra with 272k context window', modelName: 'GPT 5.6 Terra', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 272000, maxOutputTokens: 128000, rateMultiplier: 1, rateUnit: 'Credit' }),
+      buildClientModel({ id: 'gpt-5.6-luna', created: now, ownedBy: 'kiro-api', description: 'OpenAI GPT 5.6 Luna with 272k context window', modelName: 'GPT 5.6 Luna', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 272000, maxOutputTokens: 128000, rateMultiplier: 0.1, rateUnit: 'Credit' }),
+      // Claude 1M 档
+      buildClientModel({ id: 'claude-opus-5', created: now, ownedBy: 'kiro-api', description: 'Claude Opus 5 with 1M context window', modelName: 'Claude Opus 5', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 1000000, maxOutputTokens: 128000, rateMultiplier: 2.2, rateUnit: 'Credit' }),
+      buildClientModel({ id: 'claude-sonnet-5', created: now, ownedBy: 'kiro-api', description: 'Claude Sonnet 5 with 1M context window', modelName: 'Claude Sonnet 5', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 1000000, maxOutputTokens: 64000, rateMultiplier: 1.3, rateUnit: 'Credit' }),
+      buildClientModel({ id: 'claude-opus-4.8', created: now, ownedBy: 'kiro-api', description: 'Claude Opus 4.8 with 1M context window', modelName: 'Claude Opus 4.8', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 1000000, maxOutputTokens: 128000, rateMultiplier: 2.2, rateUnit: 'Credit' }),
+      buildClientModel({ id: 'claude-opus-4.7', created: now, ownedBy: 'kiro-api', description: 'Claude Opus 4.7 with 1M context window', modelName: 'Claude Opus 4.7', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 1000000, maxOutputTokens: 128000, rateMultiplier: 2.2, rateUnit: 'Credit' }),
+      buildClientModel({ id: 'claude-opus-4.6', created: now, ownedBy: 'kiro-api', description: 'Claude Opus 4.6 with 1M context window', modelName: 'Claude Opus 4.6', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 1000000, maxOutputTokens: 64000, rateMultiplier: 2.2, rateUnit: 'Credit' }),
+      buildClientModel({ id: 'claude-sonnet-4.6', created: now, ownedBy: 'kiro-api', description: 'Claude Sonnet 4.6 with 1M context window', modelName: 'Claude Sonnet 4.6', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 1000000, maxOutputTokens: 64000, rateMultiplier: 1.3, rateUnit: 'Credit' }),
+      // Claude 200K 档
+      buildClientModel({ id: 'claude-opus-4.5', created: now, ownedBy: 'kiro-api', description: 'The most powerful model', modelName: 'Claude Opus 4.5', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000, rateMultiplier: 2.2, rateUnit: 'Credit' }),
+      buildClientModel({ id: 'claude-sonnet-4.5', created: now, ownedBy: 'kiro-api', description: 'The latest Claude Sonnet model', modelName: 'Claude Sonnet 4.5', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000, rateMultiplier: 1.3, rateUnit: 'Credit' }),
+      buildClientModel({ id: 'claude-sonnet-4', created: now, ownedBy: 'kiro-api', description: 'Hybrid reasoning and coding', modelName: 'Claude Sonnet 4', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000, rateMultiplier: 1.3, rateUnit: 'Credit' }),
+      buildClientModel({ id: 'claude-haiku-4.5', created: now, ownedBy: 'kiro-api', description: 'The latest Claude Haiku model', modelName: 'Claude Haiku 4.5', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000, rateMultiplier: 0.4, rateUnit: 'Credit' }),
+      // 国产模型(实测在 EU/US 均返回)
+      buildClientModel({ id: 'minimax-m2.5', created: now, ownedBy: 'kiro-api', description: 'The MiniMax M2.5 model', modelName: 'MiniMax M2.5', supportedInputTypes: ['TEXT'], maxInputTokens: 196000, maxOutputTokens: 64000, rateMultiplier: 0.25, rateUnit: 'Credit' }),
+      buildClientModel({ id: 'qwen3-coder-next', created: now, ownedBy: 'kiro-api', description: 'Experimental preview of Qwen3 Coder Next', modelName: 'Qwen3 Coder Next', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 256000, maxOutputTokens: 64000, rateMultiplier: 0.05, rateUnit: 'Credit' })
     ]
 
     // 隐藏模型（未在官方 ListAvailableModels 中返回，但后端可能支持）
@@ -2877,11 +2897,17 @@ export class ProxyServer {
     ]
 
     // 预设模型（GPT 兼容别名）
+    // 这些名字在 Kiro 上游并不存在(2026-08-12 实测 gpt-4o → 400 INVALID_MODEL_ID),
+    // 但反代的 mapModelId 会把它们归一到 GPT-5.6 Sol,故对客户端仍是可用别名。
+    // 窗口按归一后的真实目标(272K)广告,而非 OpenAI 原版 gpt-4o 的 128K —— 否则客户端
+    // 会按错误上限裁剪上下文。裸名 gpt-5.6 / gpt-5 同理一并广告。
     const presetModels = [
-      buildClientModel({ id: 'gpt-4o', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' }),
-      buildClientModel({ id: 'gpt-4', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' }),
-      buildClientModel({ id: 'gpt-4-turbo', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' }),
-      buildClientModel({ id: 'gpt-3.5-turbo', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' })
+      buildClientModel({ id: 'gpt-5.6', created: now, ownedBy: 'kiro-proxy', description: 'Alias → GPT-5.6 Sol', modelName: 'GPT-5.6 (alias → Sol)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 272000, maxOutputTokens: 128000 }),
+      buildClientModel({ id: 'gpt-5', created: now, ownedBy: 'kiro-proxy', description: 'Alias → GPT-5.6 Sol', modelName: 'GPT-5 (alias → Sol)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 272000, maxOutputTokens: 128000 }),
+      buildClientModel({ id: 'gpt-4o', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro (→ GPT-5.6 Sol)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 272000, maxOutputTokens: 128000 }),
+      buildClientModel({ id: 'gpt-4', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro (→ GPT-5.6 Sol)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 272000, maxOutputTokens: 128000 }),
+      buildClientModel({ id: 'gpt-4-turbo', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro (→ GPT-5.6 Sol)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 272000, maxOutputTokens: 128000 }),
+      buildClientModel({ id: 'gpt-3.5-turbo', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro (→ GPT-5.6 Sol)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 272000, maxOutputTokens: 128000 })
     ]
 
     // 尝试从 Kiro API 获取动态模型

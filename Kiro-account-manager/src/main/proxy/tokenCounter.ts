@@ -113,7 +113,14 @@ export function getModelContextLength(modelId: string | undefined | null): numbe
   // 3. 关键词匹配兜底（首次请求 cache 未填充时使用）
   const id = modelId.toLowerCase()
 
-  // Claude 系列（默认 200K）
+  // Claude 系列
+  // 窗口值来自 ListAvailableModels 实测(2026-08-12 · EU ksk + 代理拉到 17 个模型的 tokenLimits)。
+  // ⚠️ 1M 档必须在 4.x 通配之前判:opus-5/sonnet-5/opus-4.8/4.7/4.6/sonnet-4.6 都是 1M,
+  //    若落到下面的 200K 通配会把窗口低估 5 倍 → 长上下文被提前误判超限。
+  if (/claude-(opus|sonnet)-5(\D|$)/.test(id)) return 1000000
+  if (/claude-opus-4[.-](6|7|8|9)(\D|$)/.test(id)) return 1000000
+  if (/claude-sonnet-4[.-](6|7|8|9)(\D|$)/.test(id)) return 1000000
+  // 200K 档(opus-4.5 / sonnet-4.5 / sonnet-4 / haiku-4.5 实测均 200000)
   if (id.includes('claude-opus-4') || id.includes('claude-sonnet-4') || id.includes('claude-haiku-4')) return 200000
   if (id.includes('claude-3-7') || id.includes('claude-3.7')) return 200000
   if (id.includes('claude-3-5') || id.includes('claude-3.5')) return 200000
@@ -123,6 +130,11 @@ export function getModelContextLength(modelId: string | undefined | null): numbe
   if (id.includes('claude-instant')) return 100000
 
   // GPT 系列
+  // Kiro 上真实可用的只有 GPT-5.6 三档,实测 maxInputTokens 均 272000。
+  // 必须在下面 gpt-4/3.5 老名分支之前判(否则 `gpt-5.6` 不含 gpt-4 会一路落到函数末尾 200K 兜底)。
+  if (/^gpt-5/.test(id) || id.includes('gpt-5.6')) return 272000
+  // 以下老名在 Kiro 上不存在(mapModelId 会归一到 GPT-5.6 Sol),
+  // 保留仅为直接用真实 OpenAI 模型名做本地 token 估算的场景。
   if (id.includes('gpt-4o') || id.includes('gpt-4-turbo')) return 128000
   if (id.includes('gpt-4.1')) return 1000000
   if (id.includes('gpt-4-32k')) return 32768

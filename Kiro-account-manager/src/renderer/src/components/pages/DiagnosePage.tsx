@@ -9,14 +9,23 @@ import { useAccountsStore } from '@/store/accounts'
 import { Card, CardContent, CardHeader, CardTitle, Button, Badge, Label, Input } from '../ui'
 import { cn } from '@/lib/utils'
 
-/** 账号测活：常用模型候选（可在输入框自定义其它模型 ID） */
+/** 账号测活：常用模型候选（可在输入框自定义其它模型 ID）
+ *  清单对齐 ListAvailableModels 实测值(2026-08-12)。GPT-5.6 用带 tier 的 canonical id ——
+ *  裸名 gpt-5.6 上游直接 400 INVALID_MODEL_ID,拿它测活会误判账号已死。 */
 const LIVENESS_MODELS = [
+  'auto',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'claude-opus-5',
+  'claude-sonnet-5',
+  'claude-opus-4.8',
+  'claude-sonnet-4.6',
   'claude-sonnet-4.5',
   'claude-sonnet-4',
   'claude-haiku-4.5',
   'claude-opus-4.5',
-  'claude-3.7-sonnet',
-  'auto'
+  'claude-3.7-sonnet'
 ]
 
 interface LivenessResult {
