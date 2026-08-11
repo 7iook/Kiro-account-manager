@@ -46,6 +46,7 @@ import {
 } from './config'
 import { assembleServer, readPanelConfig, readProxyConfig, shouldAutoStartProxy } from './assembly'
 import { createServerAdminKeyStore } from './adminKeyStore'
+import { createServerPersistenceHooks } from './persistence'
 import type { AssembledServer } from './assembly'
 
 /**
@@ -74,7 +75,16 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<A
   })
 
   // ④ 装配
-  const server = assembleServer({ config, adminKeyStore })
+  //
+  // `persistence` 必须传：不传时 `assembly.ts:buildProxyEvents` 的 `onAccountUpdate`
+  // 是「告警一次后丢弃」—— 反代刷出的新 token 只进内存池，进程重启后用回盘上的旧的。
+  // 而 IdP 轮换 refreshToken 时旧的一签发新的就当场作废 ⇒ 重启后刷新 401。
+  // 这比「压根不刷新」更糟：token 有效期内它看起来完全正常。
+  const server = assembleServer({
+    config,
+    adminKeyStore,
+    persistence: createServerPersistenceHooks()
+  })
 
   // ⑤ 面板（先于反代 —— 它是唯一的管理入口，见文件头启动顺序）
   const panelConfig = readPanelConfig(server.store, config)

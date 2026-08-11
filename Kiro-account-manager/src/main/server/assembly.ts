@@ -23,24 +23,22 @@
  * `ipc/panelProxyDeps.ts` 相反 —— 实测它**不** import electron（它叫 `ipc/` 只是历史
  * 归位），故 `buildPanelProxyDeps` 原样复用，反代六个面板端点不重写。
  *
- * ## ⚠️ 已知缺口：账号上游 API 层尚未抽出（本文件用可注入缝位占位，**不复制实现**）
+ * ## ⚠️ 已知缺口：**三个**上游 HTTP 函数尚未抽出（本文件用可注入缝位占位，**不复制实现**）
  *
  * 派单假设「K-1..K-3 已把服务端需要的端口全部抽出」。实测**有一层没抽**：
- * `AccountRuntimeDeps.api` 要的五个函数全是 `src/main/index.ts` 的**模块私有函数**，
- * 且它们各自缠着 electron 侧的模块级状态：
+ * `AccountRuntimeDeps.api` 的七个成员里，**四个已直接接上**（见 `wiredFreeMethods`），
+ * 剩下三个全是 `src/main/index.ts` 的**模块私有函数**，且各自缠着 index.ts 侧的模块级状态：
  *
- *   | 需要的 | 实际位置 | 为什么服务端拿不到 |
+ *   | 需要的 | 实际位置 | 状态 |
  *   |---|---|---|
- *   | `refreshTokenByMethod` | `index.ts:1161`（未 export） | 内部走 `fetchWithAppProxy`(:335) → `getNetworkAgent()`；social 分支还要 `getCurrentMachineId()`(:1221) |
- *   | `getUsageAndLimits` | `index.ts:1739`（未 export） | 闭包读模块级 `currentUsageApiType`(:285)，内部走 `getUsageLimitsRest`(:1601) |
- *   | `getUserInfo` | `index.ts:1893`（未 export） | 同上 |
- *   | `ssoDeviceAuth` | `index.ts:1239`（未 export） | 同上 |
- *   | `readKiroAuthTokenFile` / `writeKiroAuthTokenFile` / `resolveProfileArnForWrite` | `kiroAuthSync.ts`（已 export、零 electron） | ✅ 这三个可直接用 |
+ *   | `refreshTokenByMethod` | `index.ts:1170`（未 export） | ⛔ 内部走 `fetchWithAppProxy`(:342) → `getNetworkAgent()`；social 分支还要 `getCurrentMachineId()`(:1230) |
+ *   | `getUsageAndLimits` | `index.ts:1748`（未 export） | ⛔ 闭包读模块级 `currentUsageApiType`(:292)，内部走 `getUsageLimitsRest`(:1610) |
+ *   | `getUserInfo` | `index.ts:1902`（未 export） | ⛔ 委托 `kiroApiRequest`(:1421) |
+ *   | `fetchEnterpriseProfileArn` | `proxy/kiroApi.ts`（已 export、已在内核闭包内） | ✅ 已接线 |
+ *   | `readKiroAuthTokenFile` / `writeKiroAuthTokenFile` / `resolveProfileArnForWrite` | `kiroAuthSync.ts`（已 export、零 electron） | ✅ 已接线 |
  *
- * 也就是说 `kiroAuthSync` 那三个能拿到，**上游 HTTP 那四个拿不到**。
- *
- * 处置：定义 `ServerAccountApi` 缝位 + 一个**显式失败**的默认实现，**绝不在这里
- * 重写一份 token 刷新**。重写会造出决策卡不变量 I5 禁止的「分叉的第二实现」——
+ * 处置：定义 `ServerAccountApi` 缝位 + 一个**显式失败**的默认实现（只覆盖那三个），
+ * **绝不在这里重写一份 token 刷新**。重写会造出决策卡不变量 I5 禁止的「分叉的第二实现」——
  * 而 token 刷新恰好是最不能有两份的东西（两份对同一 refreshToken 的理解一旦分歧，
  * 结果是账号被上游踢下线，且只在生产上才看得见）。抽取那一层是独立工作包，
  * 它落地后把实现传进 `assembleServer({ accountApi })` 即可，本文件一行不用改。
@@ -89,7 +87,12 @@ import type { ProxyConfig, ProxySessionRecord } from '../proxy/types'
 import { setLogTruncationEnabled } from '../proxy/logger'
 import { initKProxyService } from '../kproxy/index'
 import { generateDeviceId } from '../kproxy/index'
-import { fetchKiroModels, fetchAvailableSubscriptions, fetchSubscriptionToken, setUserPreference } from '../proxy/kiroApi'
+import { fetchKiroModels, fetchAvailableSubscriptions, fetchSubscriptionToken, setUserPreference, fetchEnterpriseProfileArn } from '../proxy/kiroApi'
+import {
+  readKiroAuthTokenFile,
+  writeKiroAuthTokenFile,
+  resolveProfileArnForWrite
+} from '../kiroAuthSync'
 import { writeSecureBackup } from '../secureBackup'
 import { createAesGcmBackupCipher } from '../secureBackupCipher.aesGcm'
 import { dirname } from 'node:path'
@@ -105,19 +108,70 @@ import { PROXY_ORPHAN_SESSION_KEY, type ServerConfig } from './config'
 export type ServerAccountApi = AccountServiceApi
 
 /**
- * 默认实现：**每个方法都抛**，抛之前说清「为什么没有」与「谁该来填」。
+ * 缝位七个方法里，**四个今天就能接上** —— 它们压根不在 index.ts 里。
+ *
+ * 实测（2026-08-12）：桌面 `index.ts:3855-3863` 的 `api:` 对象是**纯符号转发**，
+ * 后四个转发的是它自己从外部模块 import 来的东西：
+ *
+ *   | 方法 | 真实来源 | 零 electron？ |
+ *   |---|---|---|
+ *   | `fetchEnterpriseProfileArn` | `proxy/kiroApi.ts` | ✅ 该文件已在内核闭包内（模块图闸门有显式自检断言它在 `graph.files` 里） |
+ *   | `readKiroAuthTokenFile` | `kiroAuthSync.ts:233` | ✅ 全部依赖是 `fs/promises` `fs` `path` `os` `crypto` |
+ *   | `writeKiroAuthTokenFile` | `kiroAuthSync.ts:157` | ✅ 同上 |
+ *   | `resolveProfileArnForWrite` | `kiroAuthSync.ts:84` | ✅ 纯函数 |
+ *
+ * 故这四个**直接 import 注入**，与桌面共用同一份实现（不是"服务端版本"）。
+ * 真正拿不到的只剩三个上游 HTTP 函数，它们是 index.ts 的模块私有函数。
+ *
+ * ## `readKiroAuthTokenFile` 的吞错形态在服务端不改变可观察行为（已核实，故不为它加兜底）
+ *
+ * 它把「文件不存在 / 读不了 / JSON 坏 / 字段缺」四种情况全归一成 `null`
+ * （契约 `accountService/types.ts:138` 就写的是 `| null`，另有独立任务在治它）。
+ * 消费点 `accountService/refresh.ts:125` 与 `backgroundRefresh.ts:200` 拿到 `null` 时
+ * 走的是「IDE 未登录，跳过磁盘同步」—— 而服务器上**本来就没有 Kiro IDE**，
+ * `~/.aws/sso/cache/kiro-auth-token.json` 正常缺席，`null` 就是期望值。
+ * 即：这个吞错在服务端形态下不产生任何行为差异，也不需要在装配层包一层兜底
+ * （包了就是在服务端造第二个真源）。
+ */
+function wiredFreeMethods(): Pick<
+  ServerAccountApi,
+  | 'fetchEnterpriseProfileArn'
+  | 'readKiroAuthTokenFile'
+  | 'writeKiroAuthTokenFile'
+  | 'resolveProfileArnForWrite'
+> {
+  return {
+    // 形状收窄：`AccountServiceApi` 声明的入参是它自己的最小字段集，
+    // 而 `fetchEnterpriseProfileArn` 收 `ProxyAccount`（超集，其余字段全可选）。
+    // 桌面侧同样直接转发这个符号（`index.ts:3860`），两端共用一份实现。
+    fetchEnterpriseProfileArn: (account) => fetchEnterpriseProfileArn(account),
+    readKiroAuthTokenFile,
+    writeKiroAuthTokenFile,
+    resolveProfileArnForWrite
+  }
+}
+
+/**
+ * 默认实现：**剩下三个上游 HTTP 方法抛**，抛之前说清「为什么没有」与「谁该来填」。
  *
  * 为什么不 no-op 返回 `{ success: false }`：那会让 token 刷新失败看起来像一次
  * 上游故障，池会把账号标成异常然后切下一个 —— 于是整池会被逐个「刷新失败」标记完，
  * 而真实原因（装配层没接上游 API）在日志里完全看不见。抛错至少把原因写在现场。
+ *
+ * 另外四个方法**已接线**（见 `wiredFreeMethods`）—— 它们不抛。
+ *
+ * 导出（而非模块私有）的理由：这个对象的**内容**就是「哪些接上了、哪些没有」这条命题
+ * 本身，测试必须能直接取到它。从 `AssembledServer` 反推不到（`accountApi` 只流进
+ * `buildProxyEvents` 与 `buildRuntimeDeps` 的闭包），而为了测它去 mock 装配就只能验到
+ * 测试自己传进去的东西 —— 那正是 E-052 的形态。
  */
-function unwiredAccountApi(): ServerAccountApi {
+export function defaultAccountApi(): ServerAccountApi {
   const missing = (name: string) => (): never => {
     throw new Error(
       `[server] 账号上游 API 未接线：${name}。\n` +
-        `原因：该函数今天是 src/main/index.ts 的模块私有函数（refreshTokenByMethod:1161 / ` +
-        `getUsageAndLimits:1739 / getUserInfo:1893 / ssoDeviceAuth:1239），未导出，且内部` +
-        `闭包引用 index.ts 的模块级状态（fetchWithAppProxy:335 / currentUsageApiType:285）。\n` +
+        `原因：该函数今天是 src/main/index.ts 的模块私有函数（refreshTokenByMethod:1170 / ` +
+        `getUsageAndLimits:1748 / getUserInfo:1902），未导出，且内部` +
+        `闭包引用 index.ts 的模块级状态（fetchWithAppProxy:342 / currentUsageApiType:292）。\n` +
         `处置：把那一层抽成独立的零 electron 模块，再 assembleServer({ accountApi }) 传进来。` +
         `绝不在服务端复制一份实现 —— token 刷新有两份实现的后果是账号被上游踢下线。`
     )
@@ -126,12 +180,16 @@ function unwiredAccountApi(): ServerAccountApi {
     getUsageAndLimits: missing('getUsageAndLimits'),
     getUserInfo: missing('getUserInfo'),
     refreshTokenByMethod: missing('refreshTokenByMethod'),
-    fetchEnterpriseProfileArn: missing('fetchEnterpriseProfileArn'),
-    readKiroAuthTokenFile: missing('readKiroAuthTokenFile'),
-    writeKiroAuthTokenFile: missing('writeKiroAuthTokenFile'),
-    resolveProfileArnForWrite: missing('resolveProfileArnForWrite')
+    ...wiredFreeMethods()
   } as unknown as ServerAccountApi
 }
+
+/** 未接线的方法名。`warnMissingAccountApi` 与测试共用这一份，防两处措辞漂移 */
+export const UNWIRED_ACCOUNT_API_METHODS = [
+  'getUsageAndLimits',
+  'getUserInfo',
+  'refreshTokenByMethod'
+] as const
 
 /**
  * 那三个「桌面推送 IPC、下游动作其实是落盘」的事件的服务端缝位。
@@ -140,9 +198,11 @@ function unwiredAccountApi(): ServerAccountApi {
  * 其余纯 UI 可丢。这三个的下游动作是持久化，桌面上靠 renderer 收 IPC 后
  * `saveToStorage` 转手落盘 —— 服务端没有 renderer，这条链断了。
  *
- * 主进程侧落盘由**另一个并行工作包**实现（它要同时改桌面 `index.ts` 与 renderer，
- * 属决策卡不变量 I5「两端共用同一内核」的范围）。故这里定义成可注入缝位而非硬编
- * no-op：那个包落地时把实现传进 `assembleServer({ persistence })`，本文件不用改。
+ * 主进程侧落盘由 `server/persistence.ts` 的 `createServerPersistenceHooks()` 实现
+ * （`entry.ts` 装配时传入），走 `accountService/persistAccountPatch` →
+ * `applyAccountDataMutation` 的既有写入收口，不另写一份落盘逻辑。
+ * 仍保留成**可注入缝位**而非在本文件里硬接：测试要能验「未注入时告警不静默」这条语义，
+ * 而那正是这个缺口曾经的形态。
  *
  * 未注入时的行为是**告警一次后丢弃**，不是静默丢弃 —— 静默丢弃的表现是
  * 「反代刷新了 token，但重启后又用回旧的」，那种 bug 在日志里查不到任何线索。
@@ -232,7 +292,7 @@ const DEFAULT_PROXY_CONFIG: ProxyConfig = {
  */
 export function assembleServer(options: AssembleOptions): AssembledServer {
   const { config, adminKeyStore } = options
-  const accountApi = options.accountApi ?? unwiredAccountApi()
+  const accountApi = options.accountApi ?? defaultAccountApi()
   if (!options.accountApi) warnMissingAccountApi()
 
   // 日志截断：桌面是 `setLogTruncationEnabled(app.isPackaged)`。服务端无 isPackaged,
@@ -345,8 +405,10 @@ function warnMissingAccountApi(): void {
     '[server] ⚠️ 账号上游 API 未接线：反代可以启动并转发，但**无法自动刷新 token**。\n' +
       '[server]    池中账号的 accessToken 过期后，刷新会失败（ProxyServer 拿不到 onTokenRefresh 结果）。\n' +
       '[server]    即「关机后反代仍在服务」在 token 有效期内成立、之后不成立。\n' +
-      '[server]    缺的那一层是 src/main/index.ts 里未导出的 refreshTokenByMethod / getUsageAndLimits /\n' +
-      '[server]    getUserInfo / ssoDeviceAuth，需先抽成零 electron 模块再注入。'
+      `[server]    缺的是 src/main/index.ts 里未导出的 ${UNWIRED_ACCOUNT_API_METHODS.join(' / ')}，\n` +
+      '[server]    需先抽成零 electron 模块再注入。（fetchEnterpriseProfileArn /\n' +
+      '[server]    readKiroAuthTokenFile / writeKiroAuthTokenFile / resolveProfileArnForWrite\n' +
+      '[server]    已从 proxy/kiroApi 与 kiroAuthSync 直接接上，不在缺口内。）'
   )
 }
 
@@ -576,7 +638,12 @@ function buildProxyEvents(
         id: account.id,
         accessToken: account.accessToken,
         refreshToken: account.refreshToken,
-        expiresAt: account.expiresAt
+        expiresAt: account.expiresAt,
+        // `profileArn` 必须转发：hook 契约声明了这个字段（见 `ServerPersistenceHooks`），
+        // 而桌面侧那个 handler（`renderer/src/App.tsx:412`）**只**处理 profileArn
+        // —— 它就是 Enterprise profileArn 运行时自愈的落盘路径。不转发的话该字段
+        // 在契约上存在、在实现里恒为 undefined，即一个静默的死字段。
+        profileArn: account.profileArn
       })
     },
     onAccountSuspended: (info) => {
