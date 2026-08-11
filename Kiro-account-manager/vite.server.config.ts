@@ -175,7 +175,51 @@ export default defineConfig({
         // 单文件产物：服务端没有 code-splitting 的消费者（不存在按需加载的浏览器），
         // 而多 chunk 会让 `node out/server/index.js` 依赖同目录的兄弟文件，
         // 拷贝产物时少拷一个就是运行时 MODULE_NOT_FOUND。
-        inlineDynamicImports: true
+        inlineDynamicImports: true,
+        /**
+         * **default import 一个 ESM-only 包时，产物必须带 `__esModule` 探测。**
+         *
+         * rollup 的默认值是 `'default'`，它假定**所有 external 都是 CJS** ——
+         * 即 `require(x)` 的返回值本身就是 default 导出，于是
+         * `import Conf from 'conf'` 被直接译成 `const Conf = require("conf")`，
+         * 不带任何 interop 包装。
+         *
+         * 对真 CJS 包这条假定成立。对真 ESM 包不成立：`conf@15.0.2` 是
+         * `"type":"module"` 且无 CJS 入口，`require(真ESM)` 返回的是
+         * `{__esModule:true, default:<class>}` 这个命名空间对象 —— `typeof` 是
+         * `'object'`、**不可调用**，于是 `new Conf(...)` 抛
+         * `TypeError: Conf is not a constructor`。
+         *
+         * 实测(2026-08-12 · node v22.20.0)：`node out/server/index.js` 退出码 69，
+         * 栈是 `createConfAccountStore → assembleServer → bootstrap`。
+         *
+         * ## 为什么修在这里，而不是在 `accountStore.conf.ts` 的调用点
+         *
+         * 调用点改法（`const C = (Conf as any).default ?? Conf`）能让今天这一处变绿，
+         * 但错误假定仍留在产物边界上 —— 它对**每一个** external 都成立。今天只有
+         * `conf` 用 default import 所以只炸它；下一个 ESM-only 包会以完全相同的方式
+         * 复发，而且：构建绿、顶层 `require(产物)` 绿、只在执行到那行时才炸。
+         * 那正是最难归因的一类，也是本仓 E-052 母题（局部对、整条链断）。
+         *
+         * 于是修在边界：`'auto'` 让 rollup 为每个 default import 发一个探测助手
+         * （`e && e.__esModule ? e : { default: e }`），**两个方向都对** ——
+         * 真 ESM 取其 `.default`，真 CJS 包一层。产物形态（实测）：
+         *   const Conf = require("conf");
+         *   const Conf__default = _interopDefault(Conf);
+         *   new Conf__default.default({...})
+         *
+         * 与文件头段那份 `require(esm)` 实测记录不矛盾、而是补上了它漏掉的一步：
+         * 那次验的是 `require('conf')` **不抛**（真的不抛，且 `.default` 可构造），
+         * 但没验产物里**取的是哪一个** —— 断言点在模块顶层，而失败在函数体内。
+         *
+         * 不改成 ESM 产物（那样 `import` 语义天然正确）的理由见文件头段：
+         * `webPanelAssetRoot.ts:88` 用 `__dirname`，ESM 下它不存在，
+         * 失败形态是「启动看着正常、有人访问面板时才炸」——比本缺陷更难查。
+         *
+         * 闸门：`test/main/architecture/server_bundle_esm_interop.test.ts`
+         * （L1 钉本行 · L2 从真实产物**真启动一台服务端** · L3 扫全部 external）。
+         */
+        interop: 'auto'
       }
     }
   }

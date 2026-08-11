@@ -46,6 +46,7 @@ import {
   ADMIN_KEY_FILE_NAME
 } from '@main/server/adminKeyStore'
 import { PanelAuth } from '@main/webPanel/auth'
+import { EXIT, ServerConfigError } from '@main/server/config'
 import { ACCOUNT_STORE_NAME, ACCOUNT_STORE_ENCRYPTION_KEY } from '@main/persistence/accountStorePort'
 
 function tempDir(tag: string): string {
@@ -564,5 +565,151 @@ describe('W-B 零 electron 依赖（服务端形态的前提）', () => {
 
     const store = createServerAdminKeyStore({ dataDir: dir, env: emptyEnv(), print: () => {} })
     expect(store.get()).toBeTruthy()
+  })
+})
+
+describe('W-B 拒启退出码分类（运维在 journalctl 里要能区分该改哪里）', () => {
+  /**
+   * 为什么这一族必须有分类退出码，而不是一律 69：
+   *
+   * `config.ts` 头部的退出码表把 73 EX_CANTCREAT 明确分配给「密钥文件权限设不上」、
+   * 把 78 EX_CONFIG 明确分配给「环境变量与密钥文件冲突」——那两句描述的就是本文件
+   * 这四道拒启闸门，不是账号数据那一族（数据那族的四态已由 `preflightForServerWithExitCode`
+   * 覆盖 64/65/73）。而实测(2026-08-12 · Linux 容器 · node v22.23.2)四道闸门全部退 **69**：
+   * `entry.ts:214` 只对 `ServerConfigError` 取 `exitCode`，`adminKeyStore` 抛的是裸 `Error`，
+   * 于是统统落进 `EXIT.UNAVAILABLE` 兜底。
+   *
+   * 后果是运维视角的：`chmod` 问题、编排文件里两个真源冲突、端口被占、面板起不来
+   * 在 `systemctl status` 里长得**完全一样**（都是 69），而这四件事的修法互不相同。
+   * 决策卡「运营注册 · 启动失败反馈」要求的正是「四种拒启都有可读退出信息」。
+   */
+  it('权限过宽拒启 → 带 EXIT.CANNOT_CREATE(73)，不是兜底的 69', () => {
+    const dir = tempDir('exit-perm')
+    writeFileSync(join(dir, ADMIN_KEY_FILE_NAME), 'pre-existing-key-value-aaaaaaaaaaaaaaaaaaa\n')
+
+    let thrown: unknown = null
+    try {
+      createServerAdminKeyStore({
+        dataDir: dir,
+        env: emptyEnv(),
+        platform: 'linux',
+        print: () => {}
+      })
+    } catch (e) {
+      thrown = e
+    }
+
+    expect(thrown).toBeInstanceOf(ServerConfigError)
+    expect((thrown as ServerConfigError).exitCode).toBe(EXIT.CANNOT_CREATE)
+    expect((thrown as Error).message).toMatch(/权限|chmod/)
+  })
+
+  it('env 与文件不一致拒启 → 带 EXIT.CONFIG(78)（此前 78 全仓零生产用点）', () => {
+    const dir = tempDir('exit-conflict')
+    writeFileSync(join(dir, ADMIN_KEY_FILE_NAME), 'key-from-file-aaaaaaaaaaaaaaaaaaaaaaaaaa\n')
+
+    let thrown: unknown = null
+    try {
+      createServerAdminKeyStore({
+        dataDir: dir,
+        env: { ...emptyEnv(), [ADMIN_KEY_ENV]: 'key-from-env-bbbbbbbbbbbbbbbbbbbbbbbb' },
+        platform: 'win32', // 排除权限闸门这个变量，单看冲突这一条
+        print: () => {}
+      })
+    } catch (e) {
+      thrown = e
+    }
+
+    expect(thrown).toBeInstanceOf(ServerConfigError)
+    expect((thrown as ServerConfigError).exitCode).toBe(EXIT.CONFIG)
+    expect((thrown as Error).message).toMatch(new RegExp(ADMIN_KEY_ENV))
+  })
+
+  it('env 设置但为空拒启 → 带 EXIT.USAGE(64)（环境变量用法错，非数据也非权限）', () => {
+    const dir = tempDir('exit-emptyenv')
+
+    let thrown: unknown = null
+    try {
+      createServerAdminKeyStore({
+        dataDir: dir,
+        env: { ...emptyEnv(), [ADMIN_KEY_ENV]: '   ' },
+        platform: 'linux',
+        print: () => {}
+      })
+    } catch (e) {
+      thrown = e
+    }
+
+    expect(thrown).toBeInstanceOf(ServerConfigError)
+    expect((thrown as ServerConfigError).exitCode).toBe(EXIT.USAGE)
+  })
+
+  it('密钥文件在但内容为空拒启 → 带 EXIT.DATA_ERROR(65)（盘上的东西坏了，同数据族语义）', () => {
+    const dir = tempDir('exit-zerobyte')
+    writeFileSync(join(dir, ADMIN_KEY_FILE_NAME), '')
+
+    let thrown: unknown = null
+    try {
+      createServerAdminKeyStore({
+        dataDir: dir,
+        env: emptyEnv(),
+        platform: 'linux',
+        print: () => {}
+      })
+    } catch (e) {
+      thrown = e
+    }
+
+    expect(thrown).toBeInstanceOf(ServerConfigError)
+    expect((thrown as ServerConfigError).exitCode).toBe(EXIT.DATA_ERROR)
+  })
+
+  it('四道闸门的退出码互不相同（否则运维读一个码仍不知该改哪里）', () => {
+    const codes = new Set<number>()
+
+    const permDir = tempDir('distinct-perm')
+    writeFileSync(join(permDir, ADMIN_KEY_FILE_NAME), 'k'.repeat(40) + '\n')
+    try {
+      createServerAdminKeyStore({ dataDir: permDir, env: emptyEnv(), platform: 'linux', print: () => {} })
+    } catch (e) {
+      codes.add((e as ServerConfigError).exitCode)
+    }
+
+    const conflictDir = tempDir('distinct-conflict')
+    writeFileSync(join(conflictDir, ADMIN_KEY_FILE_NAME), 'f'.repeat(40) + '\n')
+    try {
+      createServerAdminKeyStore({
+        dataDir: conflictDir,
+        env: { ...emptyEnv(), [ADMIN_KEY_ENV]: 'e'.repeat(40) },
+        platform: 'win32',
+        print: () => {}
+      })
+    } catch (e) {
+      codes.add((e as ServerConfigError).exitCode)
+    }
+
+    const emptyDir = tempDir('distinct-empty')
+    try {
+      createServerAdminKeyStore({
+        dataDir: emptyDir,
+        env: { ...emptyEnv(), [ADMIN_KEY_ENV]: '  ' },
+        platform: 'linux',
+        print: () => {}
+      })
+    } catch (e) {
+      codes.add((e as ServerConfigError).exitCode)
+    }
+
+    const zeroDir = tempDir('distinct-zero')
+    writeFileSync(join(zeroDir, ADMIN_KEY_FILE_NAME), '')
+    try {
+      createServerAdminKeyStore({ dataDir: zeroDir, env: emptyEnv(), platform: 'linux', print: () => {} })
+    } catch (e) {
+      codes.add((e as ServerConfigError).exitCode)
+    }
+
+    // 四道闸门各退一个不同的码，且没有一个是兜底的 UNAVAILABLE
+    expect(codes.size).toBe(4)
+    expect(codes.has(EXIT.UNAVAILABLE)).toBe(false)
   })
 })

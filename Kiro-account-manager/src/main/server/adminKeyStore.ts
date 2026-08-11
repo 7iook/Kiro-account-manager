@@ -49,6 +49,7 @@ import {
 import { join, resolve } from 'node:path'
 
 import { generateAdminKey, type AdminKeyStore } from '../webPanel/auth'
+import { EXIT, ServerConfigError } from './config'
 
 /**
  * 预置密钥的环境变量名（适配 Docker secrets / systemd `Environment=` / 编排工具）。
@@ -189,10 +190,13 @@ export function createServerAdminKeyStore(
   //    静默生成的后果：运维以为编排文件里那个（其实没渲染出值的）变量在生效，
   //    实际登录用的是一把他从没见过的钥匙，而下次他修好变量就变成冲突拒启。
   if (hasPreset && preset.length === 0) {
-    throw new Error(
+    // EX_USAGE：环境变量的**用法**错了（给了变量但没给值），不是数据坏也不是权限问题。
+    // 与 `readServerConfig` 里缺 KIRO_DATA_DIR / 端口非法同族 —— 运维看到 64 就该去查编排文件。
+    throw new ServerConfigError(
       `环境变量 ${ADMIN_KEY_ENV} 已设置但为空（或只有空白字符）：拒绝启动。\n` +
         `不把它当成「未设置」而静默生成新密钥 —— 那会让你以为预置生效了，实际用的是另一把钥匙。\n` +
-        `请给它一个真实值，或彻底移除该变量（移除后首次启动会生成并打印一把新密钥）。`
+        `请给它一个真实值，或彻底移除该变量（移除后首次启动会生成并打印一把新密钥）。`,
+      EXIT.USAGE
     )
   }
 
@@ -212,10 +216,13 @@ export function createServerAdminKeyStore(
     //    猜任何一边都会造成「运维以为改了密钥，实际没生效」，而这种误解只会在
     //    他登不进去时才暴露 —— 那时他会怀疑服务坏了，不会怀疑有两个真源。
     if (onDisk.state === 'present' && onDisk.key !== preset) {
-      throw new Error(
+      // EX_CONFIG：配置自相矛盾（两个真源不一致）—— `config.ts` 的退出码表把 78 就是
+      // 分配给这一条。它与「权限」「数据坏」都不同：要修的是编排配置或那个文件，二选一。
+      throw new ServerConfigError(
         `adminKey 有两个不一致的来源：环境变量 ${ADMIN_KEY_ENV} 与密钥文件 ${file}。拒绝启动。\n` +
           `不猜哪个优先 —— 猜错的那一半会让你以为已经换了密钥，而实际生效的是另一把。\n` +
-          `请二选一：删除该环境变量（改用文件里的密钥），或删除该文件（改用环境变量的密钥）。`
+          `请二选一：删除该环境变量（改用文件里的密钥），或删除该文件（改用环境变量的密钥）。`,
+        EXIT.CONFIG
       )
     }
 
@@ -271,21 +278,23 @@ function readKeyFile(file: string): KeyFileState {
   } catch (e) {
     if (isNotFound(e)) return { state: 'absent' }
     const code = (e as NodeJS.ErrnoException).code ?? ''
-    throw new Error(
+    throw new ServerConfigError(
       `adminKey 密钥文件存在但无法读取：${file}（${code}）。拒绝启动。\n` +
         `绝不把「读不出来」当成「没有密钥」而生成新的 —— 那一次写入会覆盖掉你正在用的凭据，` +
         `连手机上已保存的登录也会一起失效。\n` +
-        `请检查该路径是文件而非目录、且服务账户对它有读权限。原始错误：${(e as Error).message}`
+        `请检查该路径是文件而非目录、且服务账户对它有读权限。原始错误：${(e as Error).message}`,
+      EXIT.CANNOT_CREATE
     )
   }
 
   const key = raw.trim()
   if (key.length === 0) {
-    throw new Error(
+    throw new ServerConfigError(
       `adminKey 密钥文件存在但内容为空（长度 0 或只有空白字符）：${file}。拒绝启动。\n` +
         `这通常是上一次写入被中断留下的残骸。不当成「没有密钥」而生成新的 —— ` +
         `覆盖它会静默换掉凭据，而它旁边可能还有一份能用的备份。\n` +
-        `确认无需恢复后，删除该文件再重启即可重新生成并打印一把新密钥。`
+        `确认无需恢复后，删除该文件再重启即可重新生成并打印一把新密钥。`,
+      EXIT.DATA_ERROR
     )
   }
 
@@ -314,11 +323,12 @@ function enforceKeyFilePermission(
     return
   }
 
-  throw new Error(
+  throw new ServerConfigError(
     `adminKey 密钥文件权限过宽：${file} 当前为 ${verdict.mode.toString(8).padStart(4, '0')}，` +
       `属主之外仍有权限位（${verdict.offending.toString(8).padStart(3, '0')}）。拒绝启动。\n` +
       `世界可读的凭据文件等于没有凭据 —— 同机上任何其他用户都能直接登录面板。\n` +
-      `补救：chmod 600 ${file}（必要时先 chown 到运行服务的用户）。`
+      `补救：chmod 600 ${file}（必要时先 chown 到运行服务的用户）。`,
+    EXIT.CANNOT_CREATE
   )
 }
 
@@ -358,10 +368,11 @@ function writeKeyFileSecurely(
     } catch {
       // 它本来就没建出来 —— 无需处理，原始错误更重要
     }
-    throw new Error(
+    throw new ServerConfigError(
       `无法写入 adminKey 密钥文件：${file}（${(e as NodeJS.ErrnoException).code ?? ''}）。拒绝启动。\n` +
         `密钥必须能持久化，否则每次重启都会换一把 —— 面板上的登录会随机失效。\n` +
-        `请确认该目录存在且服务账户可写。原始错误：${(e as Error).message}`
+        `请确认该目录存在且服务账户可写。原始错误：${(e as Error).message}`,
+      EXIT.CANNOT_CREATE
     )
   }
 
