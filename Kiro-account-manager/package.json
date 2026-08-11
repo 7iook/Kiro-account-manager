@@ -24,7 +24,12 @@
     "test:watch": "vitest",
     "test:e2e": "node test/e2e-fullsuite/run.mjs",
     "test:e2e:only": "node test/e2e-fullsuite/run.mjs --only",
-    "build:webpanel": "vite build --config vite.webPanel.config.ts"
+    "build:webpanel": "vite build --config vite.webPanel.config.ts",
+    "build:server": "npm run typecheck:node && vite build --config vite.server.config.ts && npm run build:webpanel",
+    "start:server": "node --enable-source-maps out/server/index.js"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
@@ -34,6 +39,7 @@
     "cbor-x": "^1.6.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "conf": "^15.0.2",
     "electron-store": "^11.0.2",
     "electron-updater": "^6.3.9",
     "framer-motion": "^12.40.0",

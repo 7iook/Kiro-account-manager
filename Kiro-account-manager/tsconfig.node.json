@@ -3,6 +3,7 @@
   "include": [
     "electron.vite.config.*",
     "vite.webPanel.config.*",
+    "vite.server.config.*",
     "src/main/**/*",
     "src/preload/**/*",
     "src/shared/**/*"

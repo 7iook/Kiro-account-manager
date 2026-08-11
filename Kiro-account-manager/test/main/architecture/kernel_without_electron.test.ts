@@ -119,6 +119,16 @@ const REPO_ROOT = resolve(__dirname, '../../..')
  * 端口文件在运行时其实不在模块图里，靠它「间接进闭包」是把闸门建在一条会消失的边上。
  * 服务端实现 `accountStore.conf.ts` 由端口文件的 value 消费者带入？不 —— 它没有被
  * 端口 import（方向相反）。故也显式列为入口。
+ *
+ * `server/entry.ts` 是 K-5 补的，也是这份清单里**最承重的一个**：它是服务端进程的
+ * 真入口（`node out/server/index.js` 跑的就是它），即「服务端形态要加载的东西」
+ * 从此有了唯一的、真实的根。此前那 9 个入口是**代表**服务端会用到的子树，
+ * 是人手挑的；从今天起闭包由真入口自己长出来 —— 这正是本文件头段说的
+ * 「入口是手列的，覆盖多少取决于列全没列全」那个残余风险的收口。
+ * 加它之后闭包从 44 涨到实测规模，且它把 `webPanel/*` 与 `ipc/panelProxyDeps.ts`
+ * 一并拉进来（此前两者都不在任何入口的闭包里 —— 面板服务器本身从未被这道闸门覆盖过）。
+ * `server/config.ts` / `server/assembly.ts` / `server/adminKeyStore.ts` 都由它带入，
+ * 不必单列。
  */
 const KERNEL_ENTRY_POINTS = [
   'src/main/kproxy/index.ts',
@@ -129,7 +139,8 @@ const KERNEL_ENTRY_POINTS = [
   'src/main/accountService/state.ts',
   'src/main/accountService/accounts.ts',
   'src/main/persistence/accountStorePort.ts',
-  'src/main/persistence/accountStore.conf.ts'
+  'src/main/persistence/accountStore.conf.ts',
+  'src/main/server/entry.ts'
 ]
 
 /**
