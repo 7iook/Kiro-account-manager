@@ -3,8 +3,10 @@
  *
  * 为什么这组测试值钱：logger 是「共享内核在纯 node 下加载不起来」这条链的第一环
  * （`accountService/verify.ts` → `proxy/kiroApi.ts` → `proxy/logger.ts`）。
- * 而 `electron` 在本仓是 **devDependency**（`package.json`），服务器上
- * `npm install --omit=dev` 之后该模块根本不存在 —— 静态 `import { app } from 'electron'`
+ * 而 `electron` 在本仓是 **devDependency**（`package.json`），且 `dependencies` 里
+ * **无任何包 peer 上它**（这第二个条件曾一度不成立，见 `src/main/proxy/logger.ts` 头部
+ * 与 `prod_tree_has_no_electron.test.ts`）。两个条件都成立，服务器上
+ * `npm install --omit=dev` 之后该模块才根本不存在 —— 静态 `import { app } from 'electron'`
  * 会在模块加载期解析失败，整条链直接死在 require 上。
  *
  * ## 关于「怎样让加载测试不是假绿」

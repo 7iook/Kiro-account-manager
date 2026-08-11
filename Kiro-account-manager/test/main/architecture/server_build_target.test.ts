@@ -244,7 +244,8 @@ describe('服务端构建目标 · L3 真实产物（需已 build:server）', ()
     expect(
       hits,
       `服务端产物引用了 electron 包。服务端跑在纯 node 下（electron 是 devDependency，\n` +
-        `--omit=dev 后不存在）—— 这在 Linux 上是启动即 MODULE_NOT_FOUND。\n` +
+        `且无任何 prod 依赖 peer 上它，--omit=dev 后不存在）—— 这在 Linux 上是启动即\n` +
+        `MODULE_NOT_FOUND。\n` +
         `（注释与非说明符字符串已归一化，故此处命中是真实依赖，不是文案。）`
     ).toEqual([])
   })

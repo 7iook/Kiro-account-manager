@@ -4,8 +4,16 @@
 //
 // 本模块是**共享内核**的一部分（`accountService/verify.ts` → `proxy/kiroApi.ts` →
 // 本文件），既要在 Electron 桌面端跑，也要在 Linux 服务器的裸 node 下跑。
-// 而 `electron` 在本仓是 **devDependency**：服务器 `npm install --omit=dev`
-// 之后该模块根本不存在，任何静态 import 都会让整条链死在模块解析期。
+// 而 `electron` 在本仓是 **devDependency**，且 `dependencies` 里**没有任何包 peer 上它**
+// —— 两个条件都成立，服务器 `npm install --omit=dev` 之后该模块才真的不存在，
+// 任何静态 import 都会让整条链死在模块解析期。
+//
+// 第二个条件不是废话：`@electron-toolkit/utils` / `@electron-toolkit/preload` 曾长期
+// 待在 `dependencies` 里，它们的 `peerDependencies.electron` 会把 electron 拖回 prod 树
+// （npm 认为这是设计行为，见 npm/cli#6282），于是「electron 是 devDependency」这句话
+// 在当时是**假的**。已于 2026-08-12 把两包移入 devDependencies 修正。
+// 闸门：`test/main/architecture/prod_tree_has_no_electron.test.ts`（防有人再加一个
+// peer 上 electron 的 prod 依赖，把这条前提悄悄推翻）。
 //
 // 处理姿态与 `utils/webPanelAssetRoot.ts` 一致：**把平台差异推到装配层，
 // 并从共享代码里删掉分支**。所以这里既不做 DI 容器，也不写

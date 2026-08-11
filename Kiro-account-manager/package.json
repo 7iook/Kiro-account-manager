@@ -15,7 +15,7 @@
     "start": "electron-vite preview",
     "dev": "chcp 65001 >nul && electron-vite dev",
     "build": "npm run typecheck && electron-vite build && npm run build:webpanel",
-    "postinstall": "electron-builder install-app-deps",
+    "postinstall": "node scripts/postinstall.mjs",
     "build:unpack": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
     "build:mac": "npm run build && electron-builder --mac",
@@ -32,8 +32,6 @@
     "node": "^20.19.0 || >=22.12.0"
   },
   "dependencies": {
-    "@electron-toolkit/preload": "^3.0.2",
-    "@electron-toolkit/utils": "^4.0.0",
     "@tailwindcss/vite": "^4.1.17",
     "@tanstack/react-virtual": "^3.13.12",
     "cbor-x": "^1.6.0",
@@ -58,7 +56,9 @@
   "devDependencies": {
     "@electron-toolkit/eslint-config-prettier": "^3.0.0",
     "@electron-toolkit/eslint-config-ts": "^3.1.0",
+    "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/tsconfig": "^2.0.0",
+    "@electron-toolkit/utils": "^4.0.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",

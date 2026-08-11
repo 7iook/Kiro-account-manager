@@ -98,7 +98,7 @@ function failOnElectronImport(): Plugin {
         `服务端产物闭包里出现了 electron 依赖：'${source}'\n` +
           `  引入方: ${importer ?? '(入口)'}\n` +
           `服务端跑在纯 node 下（Linux 服务器，且 electron 是 devDependency，` +
-          `--omit=dev 后压根不存在）。\n` +
+          `又无任何 prod 依赖 peer 上它，--omit=dev 后压根不存在）。\n` +
           `平台差异应推到装配层（见 src/main/utils/webPanelAssetRoot.ts 头部注释的既有姿态），` +
           `不要把它加进 external 让构建变绿 —— 那只是把 MODULE_NOT_FOUND 推迟到线上。`
       )
@@ -109,6 +109,13 @@ function failOnElectronImport(): Plugin {
 /**
  * 运行时依赖一律 external（姿态同 `electron.vite.config.ts` 的 `externalizeDepsPlugin()`）：
  * 只打包本仓源码，第三方包由 `npm i --omit=dev` 在服务器上装。
+ *
+ * 「从 `dependencies` 读」这条与 `externalizeDepsPlugin()` 同形，还带来一个**刻意的
+ * 副作用**：桌面独有的包一旦被移出 `dependencies`，两侧都自动改为**内联**而非 external。
+ * 2026-08-12 把 `@electron-toolkit/utils` / `@electron-toolkit/preload` 移入
+ * devDependencies 时正是靠这条 —— 桌面产物里的 `require("@electron-toolkit/utils")`
+ * 消失、实现被内联，于是 electron-builder 剪掉 devDependencies 后桌面照样能启动。
+ * 详见 `proxy/logger.ts` 头部。
  *
  * 刻意**从 `dependencies` 读**而非手列：手列清单会随 package.json 漂移，而漂移的
  * 失败方式是「某个包被打进产物」——安静且难查。`ELECTRON_ONLY` 在此被剔除，

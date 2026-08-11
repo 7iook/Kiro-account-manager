@@ -15,7 +15,8 @@
  *
  * 那个文件第 17 行 `import { ipcMain } from 'electron'` —— 它是**刻意**放在 `ipc/` 下的
  * electron 边界层（见其文件头）。服务端引用它会在加载阶段就死（`electron` 是
- * devDependency，`--omit=dev` 后压根不存在）。故面板在这里直接
+ * devDependency，且 `dependencies` 里无任何包 peer 上它，`--omit=dev` 后压根不存在
+ * —— 见 `proxy/logger.ts` 头部对这条前提的完整说明与闸门）。故面板在这里直接
  * `new PanelAuth(...) + new WebPanelServer(...)` 拼装，`PanelRouteDeps` 也直接构造。
  * 侦察报告 §7 冲突热点 4 推荐的正是这条（改动面更小，且不必去拆一个正在工作的文件）。
  *

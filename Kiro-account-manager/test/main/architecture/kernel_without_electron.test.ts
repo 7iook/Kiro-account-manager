@@ -424,7 +424,8 @@ describe('architecture: 共享内核零 electron 依赖（模块图闸门）', (
     expect(
       graph.violations.map((v) => v.file),
       `以下文件从内核入口可达，却依赖 electron。共享内核必须能在纯 node（Linux 服务器，\n` +
-        `无 Electron 运行时；且 electron 是 devDependency，--omit=dev 后压根不存在）下加载。\n` +
+        `无 Electron 运行时；且 electron 是 devDependency、无 prod 依赖 peer 上它，\n` +
+        `--omit=dev 后压根不存在）下加载。\n` +
         `平台差异应推到装配层（见 src/main/utils/webPanelAssetRoot.ts 头部注释的既有姿态），\n` +
         `而不是在内核里分支或用动态 import 规避静态依赖。\n${detail}`
     ).toEqual([])
