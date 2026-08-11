@@ -24,6 +24,7 @@ import { SmoothWeightedRoundRobin } from '../utils/smoothWeightedRoundRobin'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, createUpstreamAttemptCounter, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
 import { perfDiag } from './perfDiag'
+import { classifyNoAccountHold, type NoAccountHoldDecision } from './holdDecision'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
   openaiToKiro,
@@ -3989,23 +3990,26 @@ export class ProxyServer {
         //   - 有 pre-body 错误但非永久请求级错(429/5xx/跨区/未知)→ 挂起等恢复
         //   - 有永久请求级错(400 malformed / 明确密钥吊销)→ 立即报错
         //   - 从未 attempt 过就无号可用 → 立即报错
-        const decision = this.decideHoldAction(preBodyErrorRef.current)
+        const held = this.classifyHold(preBodyErrorRef.current)
+        const decision = held.action
         const poolBlocked = this.shouldHoldForNoAccount()
         const errKind = preBodyErrorRef.current
           ? (this.isAccountLevelAuthFailure(preBodyErrorRef.current) ? 'account-level-auth-failure' : 'non-account-level')
           : 'none'
         if (holdDebugEnabled) {
-          console.log(`[HoldGate][DEBUG] hold decision=${decision} · triedIds=${triedIds.size} · poolBlocked=${poolBlocked} · lastErrorKind=${errKind} · lastErrorMsg=${preBodyErrorRef.current?.message?.slice(0, 150) ?? 'null'}`)
+          console.log(`[HoldGate][DEBUG] hold decision=${decision} · reason=${held.reason} · triedIds=${triedIds.size} · poolBlocked=${poolBlocked} · lastErrorKind=${errKind} · lastErrorMsg=${preBodyErrorRef.current?.message?.slice(0, 150) ?? 'null'}`)
         }
         // 挂起是用户可感知的强干预(请求被冻结等换号)→ 无条件留痕到 proxyLogger(UI 可见)。
         // RCA 2026-08-04:此前 holdGate.ts 零日志 + 决策日志只在 HOLD_DEBUG=1 下走 console,
         // 用户报「账号明明正常却被闸门拦住」时后端查不到任何现场,只能翻源码反推。
         if (decision === 'hold') {
           const blockedList = this.accountPool.describeBlockedAccounts()
-          const why = poolBlocked ? '池内有号被封禁/额度耗尽'
-            : errKind === 'account-level-auth-failure' ? '最近错误是账号级授权失效'
-            : '池内无号可试(池空 / UI 指定号不在池 / 池未同步)'
+          // 文案由 held.reason 驱动(单一判定 → 单一说法),不再另算一遍。
+          const why = held.reason === 'account-blocked' ? '池内有号被封禁/额度耗尽'
+            : held.reason === 'account-auth-failure' ? '最近错误是账号级授权失效'
+            : '池内无号可试(池空 / 池未同步)'
           proxyLogger.warn('HoldGate', `请求被挂起 · ${why}`, {
+            holdReason: held.reason,
             triedAccounts: triedIds.size,
             poolBlocked,
             blockedAccounts: blockedList.length ? blockedList : ['(none)'],
@@ -4014,16 +4018,29 @@ export class ProxyServer {
           })
         }
         if (decision === 'giveup') {
-          console.warn(`[ProxyServer] No account available · decision=giveup · reason=${preBodyErrorRef.current ? 'non-account-level error (429/5xx/malformed/net)' : 'no attempt made'} · errMsg=${preBodyErrorRef.current?.message?.slice(0, 200) ?? 'null'}`)
+          // RCA 2026-08-11:`selected-account-missing` 是**配置错误**,此前被当成账号问题挂起
+          // → 用户看到「账号封禁或额度上限」却查不出问题,且永远等不到(不存在的 id 不会进池)。
+          // 现在如实报出真因与下一步动作。
+          const giveupWhy = held.clientMessage ?? (preBodyErrorRef.current
+            ? 'non-account-level error (429/5xx/malformed/net)'
+            : 'no attempt made')
+          console.warn(`[ProxyServer] No account available · decision=giveup · reason=${held.reason} · detail=${giveupWhy.slice(0, 220)}`)
+          if (held.reason === 'selected-account-missing' || held.reason === 'hold-disabled') {
+            proxyLogger.warn('HoldGate', `请求未挂起 · ${held.reason === 'selected-account-missing' ? '界面选中账号不在反代池(配置问题)' : '挂起门闸已关闭'}`, {
+              holdReason: held.reason,
+              poolSize: this.accountPool.size,
+              selectedAccountIds: this.config.selectedAccountIds ?? [],
+              detail: giveupWhy
+            })
+          }
           onNoHoldGiveUp()
           this.recordRequestFailed()
           return
         }
-        // 时间线观测(决策卡 hold-gate-observability):把已经算好的决策事实映射成 HoldReason。
-        // 分类口径复用上面同一组变量(poolBlocked / errKind),不新建第二套判据。
-        const holdReason: HoldReason = poolBlocked
+        // 时间线观测(决策卡 hold-gate-observability):直接用 held.reason,不再第二次分类。
+        const holdReason: HoldReason = held.reason === 'account-blocked'
           ? 'account-blocked'
-          : errKind === 'account-level-auth-failure'
+          : held.reason === 'account-auth-failure'
             ? 'account-auth-failure'
             : 'pool-empty'
         const holdDetail = decision === 'hold' ? this.accountPool.describeBlockedAccounts() : []
@@ -4143,12 +4160,29 @@ export class ProxyServer {
    *
    * 2026-08-03 补:无 pre-body 错误 = 根本没进入 attempt 循环 = 池里没号能试。
    * 门闸开关的用户直觉就是"没号就挂等换号",不该因为"没 attempt 过" fallback 到 giveup。
+   *
+   * 2026-08-11 起判据收口到 `proxy/holdDecision.ts`(SSOT · 可单测)。本方法只做
+   * 「取运行时状态 → 委托纯函数」,不再自己写判据 —— 此前决策与 holdReason 分两处各算一遍,
+   * 导致「决策挂起、原因说成账号封禁、真因其实是 UI 指定号不在池」的三方不一致。
+   *
+   * 三处修正见 holdDecision.ts 头部:① 指定号不在池 = 配置错误(挂起是永久死等)→ 立即报错;
+   * ② 新增 selected-account-missing 原因,界面说真话;③ holdWhenNoAccount 关闭时任何分支都不挂。
    */
-  private decideHoldAction(lastPreBodyError: Error | null): 'hold' | 'giveup' {
-    if (this.shouldHoldForNoAccount()) return 'hold'
-    if (this.isAccountLevelAuthFailure(lastPreBodyError)) return 'hold'
-    if (!lastPreBodyError) return 'hold'  // 无 attempt = 账号问题(池空/指定号不在池)→ 挂起等换号
-    return 'giveup'  // 有 attempt 错误但非账号级(429/5xx/400/网络/未知)→ 立即报错
+  private classifyHold(lastPreBodyError: Error | null): NoAccountHoldDecision {
+    const selectedIds = this.config.selectedAccountIds ?? []
+    const selectedId = selectedIds[0]
+    return classifyNoAccountHold({
+      holdEnabled: this.config.holdWhenNoAccount === true,
+      poolSize: this.accountPool.size,
+      selectedAccountIds: selectedIds,
+      // 单账号模式才存在「指定号」概念;多账号轮询下 selectedAccountIds 不作为唯一来源,
+      // 故仅在非多账号模式下才把「不在池」判为配置错误,避免误伤轮询模式。
+      selectedAccountInPool: this.config.enableMultiAccount
+        ? true
+        : (selectedId ? !!this.accountPool.getAccount(selectedId) : true),
+      poolHasBlockedAccount: this.shouldHoldForNoAccount(),
+      lastPreBodyError
+    })
   }
 
   /**
