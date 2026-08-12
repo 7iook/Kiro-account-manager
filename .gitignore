@@ -45,3 +45,17 @@ Kiro register
 docs/mail.chatgpt.org.uk.har
 docs/mail.chatgpt.org.uk/
 .ace-tool/
+
+# agent-workspace 的**原始转储**不入库：读数已写进各自的 findings.md，
+# 原始文件不增加信息量，却一次能带进数 MB。报告 (*.md) 与小体积探针脚本仍要入库。
+# 2026-08-13：一次目录级 `git add` 曾把 5.8MB 这类文件扫进提交，故在此钉死。
+Kiro-account-manager/.agent-workspace/**/full*.json
+Kiro-account-manager/.agent-workspace/**/suite*.json
+Kiro-account-manager/.agent-workspace/**/green*.json
+Kiro-account-manager/.agent-workspace/**/red*.json
+Kiro-account-manager/.agent-workspace/**/package-lock.*.json
+# 上游 API 抽取时的函数体 old/new 对照缓存（`classify-diff` 的中间产物，可重新生成）
+Kiro-account-manager/.agent-workspace/**/bodies/
+Kiro-account-manager/.agent-workspace/**/bodies-cache-before/
+# 编辑器/脚本留下的原文件备份
+*.orig
