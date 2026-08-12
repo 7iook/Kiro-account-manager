@@ -26,6 +26,7 @@ import { resolveLoggedModel } from './modelLogLabel'
 import { proxyLogger } from './logger'
 import { perfDiag } from './perfDiag'
 import { classifyNoAccountHold, type NoAccountHoldDecision } from './holdDecision'
+import { resolveSelectedPreference } from './selectedAccountFallback'
 import { detectGptHalt, isGptModel, GPT_HALT_NUDGE } from './gptHalt'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -1889,11 +1890,45 @@ export class ProxyServer {
           }
         }
         if (!account) {
-          // 严格模式：单账号模式下指定的账号不在池里，直接报错而不您默 fallback 到其他账号。
-          // 旧行为“fallback 到 first available”会导致：用户配“只用 A”却您默用 B
-          // （可能是死账号或已被封账号），背景报 SUSPENDED/402，啊啦把“指定账号不在池里”这个真问题掩盖了。
-          console.warn(`[ProxyServer] Selected account ${this.config.selectedAccountIds[0]} not found in pool (pool size=${this.accountPool.size}). Refuse to fallback to a random account. Please check that the account is not error/suspended, or re-sync the account pool.`)
-          account = null
+          // 选中项是**偏好而非硬约束**(RCA 2026-08-12,判据见 selectedAccountFallback.ts)。
+          //
+          // 旧行为是「拿不到选中号就返回 null」,理由是「避免用户配了只用 A 却静默用 B」。
+          // 该考虑在手动挑号时成立,但长期运行的反代里账号会被封、会被换、id 会随重新导入
+          // 漂移 —— 生产实测:池里有 1 个健康号,却因选中项指向一个已不存在的 id,
+          // 92 次请求被直接 giveup(客户端收 503),而同期挂起门闸本身工作正常(挂了 77.6 分钟)。
+          // 拒绝服务的代价远大于它要防的问题,故改为「回退 + 告警」:必须服务,但如实告知。
+          const preferredId = this.config.selectedAccountIds[0]
+          const outcome = resolveSelectedPreference<ProxyAccount>({
+            selectedId: preferredId,
+            getById: (id) => this.accountPool.getAccount(id),
+            isUsable: (acc) => isAllowed(acc)
+              && !this.accountPool.isSuspended(acc)
+              && !this.accountPool.isQuotaExhausted(acc),
+            pickAnyUsable: () => this.accountPool.getNextAvailableAccount(new Set<string>())
+          })
+          if (outcome.kind === 'none') {
+            // 池里一个可用号都没有 → 交回上层按池状态决定挂起/报错(不在这里预判)。
+            console.warn(`[ProxyServer] Selected account ${preferredId} unavailable (${outcome.why}) and no usable account in pool (size=${this.accountPool.size}) → 交由挂起门闸决策`)
+            account = null
+          } else {
+            account = outcome.account
+            const why = outcome.kind === 'fallback'
+              ? (outcome.why === 'missing'
+                  ? '选中账号已不在账号池(可能已删除/重新导入导致 id 变化)'
+                  : '选中账号当前不可用(封禁/额度耗尽/冷却中)')
+              : ''
+            if (outcome.kind === 'fallback') {
+              const msg = `选中账号未被使用 · ${why} → 本次改用 ${account.email || account.id.slice(0, 8)}`
+              console.warn(`[ProxyServer] ${msg}`)
+              proxyLogger.warn('ProxyServer', msg, {
+                preferredAccountId: preferredId,
+                usedAccountId: account.id,
+                usedAccount: account.email,
+                reason: outcome.why,
+                poolSize: this.accountPool.size
+              })
+            }
+          }
         }
       } else {
         // 没有指定账号，使用第一个可用账号
@@ -4156,15 +4191,12 @@ export class ProxyServer {
           })
         }
         if (decision === 'giveup') {
-          // RCA 2026-08-11:`selected-account-missing` 是**配置错误**,此前被当成账号问题挂起
-          // → 用户看到「账号封禁或额度上限」却查不出问题,且永远等不到(不存在的 id 不会进池)。
-          // 现在如实报出真因与下一步动作。
           const giveupWhy = held.clientMessage ?? (preBodyErrorRef.current
             ? 'non-account-level error (429/5xx/malformed/net)'
             : 'no attempt made')
           console.warn(`[ProxyServer] No account available · decision=giveup · reason=${held.reason} · detail=${giveupWhy.slice(0, 220)}`)
-          if (held.reason === 'selected-account-missing' || held.reason === 'hold-disabled') {
-            proxyLogger.warn('HoldGate', `请求未挂起 · ${held.reason === 'selected-account-missing' ? '界面选中账号不在反代池(配置问题)' : '挂起门闸已关闭'}`, {
+          if (held.reason === 'hold-disabled') {
+            proxyLogger.warn('HoldGate', '请求未挂起 · 挂起门闸已关闭', {
               holdReason: held.reason,
               poolSize: this.accountPool.size,
               selectedAccountIds: this.config.selectedAccountIds ?? [],
@@ -4303,12 +4335,10 @@ export class ProxyServer {
    * 「取运行时状态 → 委托纯函数」,不再自己写判据 —— 此前决策与 holdReason 分两处各算一遍,
    * 导致「决策挂起、原因说成账号封禁、真因其实是 UI 指定号不在池」的三方不一致。
    *
-   * 三处修正见 holdDecision.ts 头部:① 指定号在账号总表里都不存在 = 配置错误(挂起是永久死等)
-   * → 立即报错;② 新增 selected-account-missing 原因,界面说真话;③ holdWhenNoAccount 关闭时不挂。
-   *
-   * 2026-08-12 回归修复:① 的判据必须是「总表不存在」而非「不在可用池」——
-   * 被封/超额的号也不在可用池,那是账号问题,挂起等恢复才对(详见 holdDecision.ts
-   * selectedAccountExists 字段注释)。
+   * ⚠️ 本函数**不判定**「选中号拿不到」—— 那是选号阶段的问题,由
+   * `selectedAccountFallback.resolveSelectedPreference` 回退到池内其它可用号 + 告警。
+   * 能走到这里说明池里一个可用号都没有,此时只该看池状态(详见 holdDecision.ts 文件头
+   * 「一条走过的弯路」:曾把它塞进挂起判据,压过了「有号被封 → 挂起」)。
    */
   private classifyHold(lastPreBodyError: Error | null): NoAccountHoldDecision {
     const selectedIds = this.config.selectedAccountIds ?? []
@@ -4317,22 +4347,16 @@ export class ProxyServer {
       holdEnabled: this.config.holdWhenNoAccount === true,
       poolSize: this.accountPool.size,
       selectedAccountIds: selectedIds,
-      // 单账号模式才存在「指定号」概念;多账号轮询下 selectedAccountIds 不作为唯一来源,
-      // 故仅在非多账号模式下才把「不存在」判为配置错误,避免误伤轮询模式。
-      //
-      // ⚠️ getAccount() 查的是**账号总表**(this.accounts),被封/超额的号仍在其中(只是被标记),
-      // 所以它恰好就是「id 是否真的存在」的判据 —— 而不是「当前是否可用」。
-      // RCA 2026-08-12:上一版把这个值当成 selectedAccountInPool 用,导致被封账号被误判为
-      // 配置错误 → 立即 giveup,挂起功能从 2 小时退化成 20 分钟内彻底失败。
-      selectedAccountExists: this.config.enableMultiAccount
-        ? true
-        : (selectedId ? !!this.accountPool.getAccount(selectedId) : true),
-      // 可用池视角(仅供日志归因,不参与判定)。accountPool 没有 per-id 可用性查询接口,
-      // 这里用「在总表里 且 池中至少有一个可用号」近似 —— 不为一个纯日志字段新增公开方法
-      // (那会扩大池的对外契约)。判定权在 selectedAccountExists,不受本近似影响。
+      // 仅供日志归因(不参与判定):选中号此刻是否可用。
+      // 「拿不到选中号」已在选号阶段由 selectedAccountFallback 回退处理,
+      // 能走到这里说明池里一个可用号都没有 —— 判定只看池状态。
       selectedAccountInPool: selectedId
-        ? this.accountPool.getAllAccounts().some(a => a.id === selectedId)
-          && this.accountPool.availableCount > 0
+        ? (() => {
+            const acc = this.accountPool.getAccount(selectedId)
+            return !!acc
+              && !this.accountPool.isSuspended(acc)
+              && !this.accountPool.isQuotaExhausted(acc)
+          })()
         : true,
       poolHasBlockedAccount: this.shouldHoldForNoAccount(),
       lastPreBodyError

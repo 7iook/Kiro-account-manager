@@ -9,24 +9,27 @@
  * 收口成一个函数后,`action` / `reason` / `clientMessage` 由同一次判定产出,
  * 结构上不可能再各说各话;且可脱离 http/Electron 单测。
  *
- * ## 本轮修正的三个缺陷(RCA 2026-08-11 · 生产日志 137 次误挂起)
+ * ## 已修正的缺陷
  *
- * 现场:界面选中账号 `30475c44-…` 不在反代池 → `getAccount()` 返回 null → 严格模式拒绝
- * fallback → 一次上游请求都没发 → `preBodyError = null` → 旧实现
- * `if (!lastPreBodyError) return 'hold'` 命中 → 挂起,界面显示「账号封禁或额度上限」。
+ * ① **开关失效**:该挂起路径曾不检查 `holdWhenNoAccount`,用户关掉门闸后仍被挂起。
+ *    门闸开关是用户可见承诺 —— 关了就不该挂,故 `holdEnabled` 是第一道判据。
+ * ② **决策与文案分裂**:「挂不挂」与「界面显示什么原因」曾分两处各算一遍同一组变量,
+ *    出现过「决策挂起、原因说成账号封禁、真因其实是别的」的三方不一致。现在同一次判定
+ *    产出 action/reason/clientMessage,结构上不可能再各说各话。
  *
- * ① **语义混淆**:旧实现把「无 attempt」一律当成账号问题。但两种成因的正确处置相反:
- *    - 池空 / 池内号被封 → 挂起等换号**有意义**(号可能恢复,或用户会补号)
- *    - UI 指定号不在池 → **配置错误**,没有任何机制会把不存在的 id 变进池里 ⇒ 挂起 = 永久死等
- *    决定性证据:19:56:45 池已热更新到 size=2,同一秒仍报 `not found in pool (pool size=2)`
- *    ⇒ 不是同步延迟,该 id 从来不在池里。
- * ② **原因失真**:`pool-empty` 这一档同时覆盖「池真空」与「指定号不在池」,界面文案把
- *    用户排查方向引向账号状态,而真问题在配置。故新增 `selected-account-missing`。
- * ③ **开关失效**:该挂起路径不检查 `holdWhenNoAccount`,用户关掉门闸后仍被挂起。
- *    门闸开关是用户可见承诺 —— 关了就不该挂,故 `holdEnabled` 成为第一道判据。
+ * ## 一条走过的弯路(2026-08-12,两次修错后回退)
+ *
+ * 曾在这里加过「UI 选中号不在池 → 判为配置错误、立即报错」,并让它**优先于**
+ * account-blocked。结果它压过了「有号被封 → 挂起」这条正确分支:生产实测 92 次请求
+ * 因此直接 giveup(客户端收 503),而同期门闸本身工作正常(挂了 77.6 分钟)。
+ *
+ * 根本错误是**分层**:「拿不到选中号」是选号阶段的问题,不是挂起判据该回答的。
+ * 选中项只是**偏好** —— 拿不到就回退到池内其它可用号并告警
+ * (见 `selectedAccountFallback.ts`)。只有池里一个可用号都没有时才走到本函数,
+ * 那时该看的只有池状态,与「选中项是谁」无关。
  */
 
-/** 挂起原因(与 holdGate.HoldReason 同口径,新增 selected-account-missing)。 */
+/** 挂起原因(与 holdGate.HoldReason 同口径)。 */
 export type NoAccountHoldReason =
   /** 池内有号被封禁 / 额度耗尽 —— 挂起等其恢复或换号 */
   | 'account-blocked'
@@ -34,8 +37,6 @@ export type NoAccountHoldReason =
   | 'account-auth-failure'
   /** 池空 / 池未同步 —— 挂起等补号 */
   | 'pool-empty'
-  /** UI 指定的账号不在池里 —— **配置错误**,立即报错(挂起会永久死等) */
-  | 'selected-account-missing'
   /** 有 attempt 且是非账号级瞬时错误(429/5xx/400/网络)—— 立即报错 */
   | 'transient-error'
   /** 门闸开关关闭 —— 不挂起 */
@@ -49,20 +50,12 @@ export interface NoAccountHoldInput {
   /** `config.selectedAccountIds`(单账号模式下 UI 指定的号) */
   selectedAccountIds: string[]
   /**
-   * 指定的那个 id 在**账号总表**里是否存在(`accountPool.getAccount(id) !== null`)。
+   * 选中号是否在**可用池**里。**仅用于日志归因,不参与判定**。
    *
-   * ## 为什么必须与 `selectedAccountInPool` 分开(RCA 2026-08-12 回归修复)
-   * 7c63d4c 只用「是否在池里」判定配置错误,而账号**被上游封禁 / 额度耗尽时也会不在池**
-   * (实测日志:`lazy-refill: N 个账号未入反代池 —— xxx: 已被上游拒绝([TEMPORARILY_SUSPENDED])`)。
-   * 于是「账号被封」被误判成「用户配错 id」→ giveup,而这恰恰是门闸最该挂起的场景。
-   * 用户表现:挂起从 2 小时退化成「立刻 503 + 客户端重试 10 次 ≈ 20 分钟后彻底失败」。
-   *
-   * 判据分工:
-   *   - 总表里**不存在** → 配置错误(残留旧 id / 已删除账号)→ 立即报错
-   *   - 总表里存在但不在可用池 → 账号级不可用(封禁/超额/冷却)→ 挂起等恢复
+   * 判定刻意不看它:选号阶段已由 `selectedAccountFallback` 处理过「选中号拿不到就回退」,
+   * 能走到本函数说明池里一个可用号都没有 —— 此时「选中项是谁」已无关。
+   * 曾用它做判定并优先于 account-blocked,导致被封账号被误判为配置错误(见文件头「弯路」)。
    */
-  selectedAccountExists: boolean
-  /** 指定的那个号当前是否在**可用池**里(排除封禁/超额/冷却后仍可选) */
   selectedAccountInPool: boolean
   /** `accountPool.hasBlockedAccount()` */
   poolHasBlockedAccount: boolean
@@ -94,9 +87,8 @@ export function isAccountLevelAuthFailure(err: Error | null): boolean {
 export function classifyNoAccountHold(input: NoAccountHoldInput): NoAccountHoldDecision {
   const {
     holdEnabled, poolSize, selectedAccountIds,
-    selectedAccountExists, selectedAccountInPool, poolHasBlockedAccount, lastPreBodyError
+    selectedAccountInPool, poolHasBlockedAccount, lastPreBodyError
   } = input
-  void selectedAccountInPool  // 保留入参用于日志归因;判定只看「总表是否存在」(见字段注释)
 
   // ③ 开关优先:用户关掉门闸就是不要挂起行为,任何分支都不得越过它。
   if (!holdEnabled) {
@@ -107,23 +99,12 @@ export function classifyNoAccountHold(input: NoAccountHoldInput): NoAccountHoldD
     }
   }
 
-  // ① 指定号在**账号总表里都不存在** —— 必须先于 account-blocked 判定。
-  // 现场组合正是「池里那个号被封(blocked=true) + UI 选的是另一个不存在的 id」:
-  // 若先命中 account-blocked 就继续挂起,用户永远等不到,且原因仍然说错。
-  //
-  // ⚠️ 判据是「总表不存在」而**不是**「不在可用池」(RCA 2026-08-12 回归):
-  // 被封 / 超额的号也不在可用池,但它是账号问题,挂起等恢复才对。
-  const selectedId = selectedAccountIds[0]
-  if (selectedId && !selectedAccountExists) {
-    return {
-      action: 'giveup',
-      reason: 'selected-account-missing',
-      clientMessage:
-        `界面选中的账号不在反代池中(id=${selectedId},当前池 ${poolSize} 个号)。` +
-        `这是配置问题而非账号问题 —— 挂起也等不到它出现。` +
-        `请点「同步账号」或在界面重新选择一个池内账号。`
-    }
-  }
+  // ⚠️ 这里**刻意不判定**「选中号不在池 → 配置错误」(见文件头「弯路」)。
+  // 能走到本函数 = 池里一个可用号都没有,此时只该看池状态。
+  // 以下三个入参仅供日志归因,不参与判定。
+  void selectedAccountInPool
+  void selectedAccountIds
+  void poolSize
 
   // 池内有号被封禁 / 额度耗尽 → 挂起等恢复或换号(门闸原始设计意图)
   if (poolHasBlockedAccount) {
