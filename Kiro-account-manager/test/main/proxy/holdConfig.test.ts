@@ -4,13 +4,21 @@
 //   - holdPingIntervalMs: clamp [1000, 40000];非有限→默认 10000
 //   - holdMaxWaitMs / holdTotalBudgetMs: clamp [10000, 21600000];且 holdMaxWaitMs ≤ holdTotalBudgetMs
 //   - holdGraceMs: clamp [1000, 60000] 且 < holdTotalBudgetMs
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { normalizeHoldConfig, HOLD_DEFAULTS } from '@main/proxy/holdConfig'
+import { proxyLogger } from '@main/proxy/logger'
 
 describe('normalizeHoldConfig · 挂起门闸配置 clamp / 跨字段校验', () => {
   it('空输入 → 全部回落默认值', () => {
     const r = normalizeHoldConfig({})
     expect(r).toEqual(HOLD_DEFAULTS)
+  })
+
+  it('默认配置不再输出已失效的 Layer C 时间兼容告警', () => {
+    const warn = vi.spyOn(proxyLogger, 'warn').mockImplementation(() => {})
+    normalizeHoldConfig({})
+    expect(warn.mock.calls.some((args) => args.some((arg) => String(arg).includes('Layer C')))).toBe(false)
+    warn.mockRestore()
   })
 
   it('holdPingIntervalMs 越下限(500)→ clamp 到 1000', () => {
@@ -73,7 +81,7 @@ describe('normalizeHoldConfig · 挂起门闸配置 clamp / 跨字段校验', ()
       holdGraceMs: 20000,
       holdTimeoutAction: 'graceful_stop',
       // 自动放行两字段也给合法值:enabled 取 false(与默认 true 相反,证明是读输入而非落默认);
-      // interval 取 120000(在 [60000, 预算] 内、且低于 Layer C 兼容阈 150000,不触发 warn)。
+      // interval 取 120000(在 [60000, 预算] 内,证明合法值原样保留)。
       holdAutoReleaseEnabled: false,
       holdAutoReleaseIntervalMs: 120000
     })

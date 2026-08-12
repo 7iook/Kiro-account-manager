@@ -108,6 +108,7 @@ describe('HoldGate 多路径接线(task#5 · built-but-not-wired 守门员)', ()
 
     expect(server.getHeldRequestsCount()).toBe(0)
     expect(callKiroApiMock).toHaveBeenCalledTimes(1)     // 用新号跑完
+    expect(callKiroApiMock.mock.calls[0].at(-1)).toEqual({ skipFirstChunkTimeout: true })
     expect(res.statusCode).toBe(200)
     const bodyCount = res.writes.filter((w) => w.includes('claude-nonstream-ok')).length
     expect(bodyCount).toBe(1)                            // 无重复输出
@@ -190,6 +191,7 @@ describe('HoldGate 多路径接线(task#5 · built-but-not-wired 守门员)', ()
 
     expect(server.getHeldRequestsCount()).toBe(0)
     expect(callKiroApiStreamMock).toHaveBeenCalledTimes(1)
+    expect(callKiroApiStreamMock.mock.calls[0].at(-1)).toEqual({ skipFirstChunkTimeout: true })
     expect(res.writes.filter((w) => w.includes('openai-stream-ok')).length).toBe(1)  // 无重复
     expect(res.writes.some((w) => w.includes('[DONE]'))).toBe(true)
   })
@@ -336,6 +338,7 @@ describe('HoldGate 多路径接线 · responses + Gemini(task#5)', () => {
 
     expect(server.getHeldRequestsCount()).toBe(0)
     expect(callKiroApiStreamMock).toHaveBeenCalledTimes(1)
+    expect(callKiroApiStreamMock.mock.calls[0].at(-1)).toEqual({ skipFirstChunkTimeout: true })
     expect(res.writes.filter((w) => w.includes('gemini-stream-ok')).length).toBe(1)
   })
 })

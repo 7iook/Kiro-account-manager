@@ -21,7 +21,7 @@ import type {
 } from './types'
 import { AccountPool, ErrorType, classifyError, extractHttpStatusCode } from './accountPool'
 import { SmoothWeightedRoundRobin } from '../utils/smoothWeightedRoundRobin'
-import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, createUpstreamAttemptCounter, sampleTailShape, type KiroModel } from './kiroApi'
+import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, createUpstreamAttemptCounter, sampleTailShape, type KiroModel, type KiroApiExecutionOptions } from './kiroApi'
 import { resolveLoggedModel } from './modelLogLabel'
 import { proxyLogger } from './logger'
 import { perfDiag } from './perfDiag'
@@ -48,6 +48,10 @@ import { HoldGate, realClock, type HoldGateRuntimeConfig, type HeldRequestHooks,
 import { normalizeHoldConfig } from './holdConfig'
 import { ensureProxySelfSignedCert, type ProxySelfSignedCert } from './selfSignedCert'
 
+type HoldAttemptContext = {
+  /** 请求是否曾被 HoldGate 成功放行;一旦为 true,本请求剩余生命周期不再复位。 */
+  resumedFromHold: boolean
+}
 
 /**
  * 该错误是否属于「上游终止类失败」—— 上游内容过滤器截断 / 上游异常终止。
@@ -1875,65 +1879,60 @@ export class ProxyServer {
         }
       }
     } else {
-      // 禁用多账号轮询时，优先使用指定的账号
-      if (this.config.selectedAccountIds && this.config.selectedAccountIds.length > 0) {
-        // 使用指定的第一个账号
-        account = this.accountPool.getAccount(this.config.selectedAccountIds[0])
-        // 检查指定账号是否配额耗尽，若是则尝试自动切换
-        if (account && this.accountPool.isQuotaExhausted(account) && this.config.autoSwitchOnQuotaExhausted) {
-          const nextAccount = this.accountPool.getNextAvailableAccount(account.id)
-          if (nextAccount) {
-            console.log(`[ProxyServer] Selected account ${account.email || account.id} quota exhausted, auto-switching to ${nextAccount.email || nextAccount.id}`)
-            this.config.selectedAccountIds = [nextAccount.id]
-            this.events.onAccountUpdate?.(nextAccount)
-            account = nextAccount
-          }
-        }
-        if (!account) {
-          // 选中项是**偏好而非硬约束**(RCA 2026-08-12,判据见 selectedAccountFallback.ts)。
-          //
-          // 旧行为是「拿不到选中号就返回 null」,理由是「避免用户配了只用 A 却静默用 B」。
-          // 该考虑在手动挑号时成立,但长期运行的反代里账号会被封、会被换、id 会随重新导入
-          // 漂移 —— 生产实测:池里有 1 个健康号,却因选中项指向一个已不存在的 id,
-          // 92 次请求被直接 giveup(客户端收 503),而同期挂起门闸本身工作正常(挂了 77.6 分钟)。
-          // 拒绝服务的代价远大于它要防的问题,故改为「回退 + 告警」:必须服务,但如实告知。
-          const preferredId = this.config.selectedAccountIds[0]
-          const outcome = resolveSelectedPreference<ProxyAccount>({
-            selectedId: preferredId,
-            getById: (id) => this.accountPool.getAccount(id),
-            isUsable: (acc) => isAllowed(acc)
-              && !this.accountPool.isSuspended(acc)
-              && !this.accountPool.isQuotaExhausted(acc),
-            pickAnyUsable: () => this.accountPool.getNextAvailableAccount(new Set<string>())
-          })
-          if (outcome.kind === 'none') {
-            // 池里一个可用号都没有 → 交回上层按池状态决定挂起/报错(不在这里预判)。
-            console.warn(`[ProxyServer] Selected account ${preferredId} unavailable (${outcome.why}) and no usable account in pool (size=${this.accountPool.size}) → 交由挂起门闸决策`)
-            account = null
-          } else {
-            account = outcome.account
-            const why = outcome.kind === 'fallback'
-              ? (outcome.why === 'missing'
-                  ? '选中账号已不在账号池(可能已删除/重新导入导致 id 变化)'
-                  : '选中账号当前不可用(封禁/额度耗尽/冷却中)')
-              : ''
-            if (outcome.kind === 'fallback') {
-              const msg = `选中账号未被使用 · ${why} → 本次改用 ${account.email || account.id.slice(0, 8)}`
-              console.warn(`[ProxyServer] ${msg}`)
-              proxyLogger.warn('ProxyServer', msg, {
-                preferredAccountId: preferredId,
-                usedAccountId: account.id,
-                usedAccount: account.email,
-                reason: outcome.why,
-                poolSize: this.accountPool.size
-              })
-            }
-          }
-        }
+      // 单账号模式的所有候选路径共用这一份准入 + 可用性判据。
+      // UI 选中项只是偏好；API Key 绑定 / 分组 / capability 则是不可越过的授权边界。
+      const preferredId = this.config.selectedAccountIds?.[0]
+      const preferredAccount = preferredId ? this.accountPool.getAccount(preferredId) : null
+      const isUsable = (acc: ProxyAccount): boolean =>
+        isAllowed(acc)
+        && !this.accountPool.isSuspended(acc)
+        && !this.accountPool.isQuotaExhausted(acc)
+        && acc.isAvailable !== false
+        && !(acc.expiresAt && acc.expiresAt < Date.now() && !acc.refreshToken)
+      const excludedIds = new Set(
+        this.accountPool.getAllAccounts()
+          .filter(acc => !isAllowed(acc))
+          .map(acc => acc.id)
+      )
+      const outcome = resolveSelectedPreference<ProxyAccount>({
+        selectedId: preferredId,
+        getById: (id) => this.accountPool.getAccount(id),
+        isUsable,
+        pickAnyUsable: () => this.accountPool.getNextAvailableAccount(excludedIds)
+      })
+
+      if (outcome.kind === 'none') {
+        // 绑定子集内没有可用号时必须返回 null，交回上层走正常挂起/报错路径；不得越权。
+        console.warn(`[ProxyServer] Selected account ${preferredId || '(none)'} unavailable (${outcome.why}) and no usable allowed account in pool (size=${this.accountPool.size}) → 交由挂起门闸决策`)
+        account = null
       } else {
-        // 没有指定账号，使用第一个可用账号
-        const allAccounts = this.accountPool.getAllAccounts()
-        account = allAccounts.length > 0 ? allAccounts[0] : null
+        account = outcome.account
+        if (outcome.kind === 'fallback') {
+          const why = outcome.why === 'missing'
+            ? '选中账号已不在账号池(可能已删除/重新导入导致 id 变化)'
+            : '选中账号当前不可用或不在调用方授权范围内'
+          const msg = `选中账号未被使用 · ${why} → 本次改用 ${account.email || account.id.slice(0, 8)}`
+          console.warn(`[ProxyServer] ${msg}`)
+          proxyLogger.warn('ProxyServer', msg, {
+            preferredAccountId: preferredId,
+            usedAccountId: account.id,
+            usedAccount: account.email,
+            reason: outcome.why,
+            poolSize: this.accountPool.size
+          })
+
+          // 该设置仍只控制「额度耗尽后是否把回退号提升为新的 UI 偏好」。
+          // 即使关闭，也允许本次请求按“偏好而非硬约束”的语义回退，且不改写用户选择。
+          if (
+            preferredAccount
+            && this.accountPool.isQuotaExhausted(preferredAccount)
+            && this.config.autoSwitchOnQuotaExhausted
+          ) {
+            console.log(`[ProxyServer] Selected account ${preferredAccount.email || preferredAccount.id} quota exhausted, auto-switching preference to ${account.email || account.id}`)
+            this.config.selectedAccountIds = [account.id]
+            this.events.onAccountUpdate?.(account)
+          }
+        }
       }
     }
     
@@ -3450,7 +3449,8 @@ export class ProxyServer {
     // Hold Gate 接线(task#5,ADR-0001 边界 2):首字节前上游失败时回调。
     // 返回 true = 已被挂起门闸接管(不发 error chunk,交给 resume 重试);false = 未接管,按现状发 error。
     // 仅在"尚未写出任何语义正文(initial/content/tool chunk)"时才可能被调用。
-    onPreBodyError?: (error: Error) => boolean
+    onPreBodyError?: (error: Error) => boolean,
+    executionOptions: KiroApiExecutionOptions = {}
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -3634,7 +3634,9 @@ export class ProxyServer {
           resolve()
         },
         signal,
-        this.config.preferredEndpoint
+        this.config.preferredEndpoint,
+        undefined,
+        executionOptions
       ).catch(error => {
         if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
@@ -3668,13 +3670,16 @@ export class ProxyServer {
     if (stream) {
       // 先建 SSE 连接;initial chunk 由 handleOpenAIStream 惰性延迟到首字节。
       if (!this.isResponseClosed(res)) res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
-      const attempt = (acc: ProxyAccount, recordError: (err: Error) => void): Promise<'done' | 'pre_body_failed'> => new Promise((resolveAttempt) => {
+      const attempt = (acc: ProxyAccount, recordError: (err: Error) => void, context: HoldAttemptContext): Promise<'done' | 'pre_body_failed'> => new Promise((resolveAttempt) => {
         const toolNameRegistry = new ToolNameRegistry()
         const kiroPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, thinkingConfig)
         this.events.onRequest?.({ path: '/v1/chat/completions', method: 'POST', accountId: acc.id })
         let settled = false
         const onPreBodyError = (e: Error): boolean => { if (!settled) { settled = true; recordError(e); resolveAttempt('pre_body_failed') } ; return true }
-        this.handleOpenAIStream(res, acc, kiroPayload, model, startTime, 0, undefined, true, matchedApiKey, toolNameRegistry, signal, onPreBodyError)
+        this.handleOpenAIStream(
+          res, acc, kiroPayload, model, startTime, 0, undefined, true, matchedApiKey, toolNameRegistry, signal,
+          onPreBodyError, { skipFirstChunkTimeout: context.resumedFromHold }
+        )
           .then(() => { if (!settled) { settled = true; resolveAttempt('done') } })
           .catch(() => { if (!settled) { settled = true; resolveAttempt('done') } })
       })
@@ -3690,11 +3695,14 @@ export class ProxyServer {
     // 非流式
     await this.runJsonRequestWithHold<{ result: Awaited<ReturnType<typeof callKiroApi>>; toolNameRegistry: ToolNameRegistry }>({
       res, startTime, signal, seedAccount, path: '/v1/chat/completions', model, pickAccount,
-      doCall: async (acc) => {
+      doCall: async (acc, context) => {
         const toolNameRegistry = new ToolNameRegistry()
         this.events.onRequest?.({ path: '/v1/chat/completions', method: 'POST', accountId: acc.id })
         const { result, account: usedAccount } = await this.callWithRetry(
-          acc, async (a) => callKiroApi(a, openaiToKiro(processedRequest, a.profileArn, toolNameRegistry, thinkingConfig), signal),
+          acc, async (a) => callKiroApi(
+            a, openaiToKiro(processedRequest, a.profileArn, toolNameRegistry, thinkingConfig), signal,
+            { skipFirstChunkTimeout: context.resumedFromHold }
+          ),
           '/v1/chat/completions', signal, model
         )
         return { result: { result, toolNameRegistry } as any, account: usedAccount }
@@ -3743,11 +3751,14 @@ export class ProxyServer {
     await this.runJsonRequestWithHold<{ result: Awaited<ReturnType<typeof callKiroApi>>; toolNameRegistry: ToolNameRegistry }>({
       res, startTime, signal, seedAccount, path: '/v1/responses', model,
       pickAccount: (_tried) => this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, model),
-      doCall: async (acc) => {
+      doCall: async (acc, context) => {
         const toolNameRegistry = new ToolNameRegistry()
         this.events.onRequest?.({ path: '/v1/responses', method: 'POST', accountId: acc.id })
         const { result, account: usedAccount } = await this.callWithRetry(
-          acc, async (a) => callKiroApi(a, openaiToKiro(processedRequest, a.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model)), signal),
+          acc, async (a) => callKiroApi(
+            a, openaiToKiro(processedRequest, a.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model)), signal,
+            { skipFirstChunkTimeout: context.resumedFromHold }
+          ),
           '/v1/responses', signal, model
         )
         return { result: { result, toolNameRegistry } as any, account: usedAccount }
@@ -3827,7 +3838,7 @@ export class ProxyServer {
 
     if (isStream) {
       if (!this.isResponseClosed(res)) res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' })
-      const attempt = (acc: ProxyAccount, recordError: (err: Error) => void): Promise<'done' | 'pre_body_failed'> => new Promise((resolveAttempt) => {
+      const attempt = (acc: ProxyAccount, recordError: (err: Error) => void, context: HoldAttemptContext): Promise<'done' | 'pre_body_failed'> => new Promise((resolveAttempt) => {
         const toolNameRegistry = new ToolNameRegistry()
         const kiroPayload = openaiToKiro(openaiRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(model))
         this.events.onRequest?.({ path: '/v1beta', method: 'POST', accountId: acc.id })
@@ -3881,7 +3892,8 @@ export class ProxyServer {
             res.end()
             if (!settled) { settled = true; resolveAttempt('done') }
           },
-          signal, this.config.preferredEndpoint
+          signal, this.config.preferredEndpoint, undefined,
+          { skipFirstChunkTimeout: context.resumedFromHold }
         ).catch(() => { if (!settled) { settled = true; resolveAttempt('done') } })
       })
       await this.runWithHold({
@@ -3896,10 +3908,13 @@ export class ProxyServer {
     // 非流式
     await this.runJsonRequestWithHold<Awaited<ReturnType<typeof callKiroApi>>>({
       res, startTime, signal, seedAccount, path: '/v1beta', model: modelId, pickAccount,
-      doCall: async (acc) => {
+      doCall: async (acc, context) => {
         const toolNameRegistry = new ToolNameRegistry()
         this.events.onRequest?.({ path: '/v1beta', method: 'POST', accountId: acc.id })
-        const result = await callKiroApi(acc, openaiToKiro(openaiRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(model)), signal)
+        const result = await callKiroApi(
+          acc, openaiToKiro(openaiRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(model)), signal,
+          { skipFirstChunkTimeout: context.resumedFromHold }
+        )
         return { result, account: acc }
       },
       writeSuccess: (result, usedAccount) => {
@@ -4099,7 +4114,7 @@ export class ProxyServer {
      * 上报给主循环,主循环用它做「挂起 vs 立即报错」精细化决策(RCA 2026-08-03)。
      * 遗漏调用不会崩,但会退化到"未知错误" fallback = 挂起(保守偏严侧)。
      */
-    attempt: (acc: ProxyAccount, recordError: (err: Error) => void) => Promise<'done' | 'pre_body_failed'>
+    attempt: (acc: ProxyAccount, recordError: (err: Error) => void, context: HoldAttemptContext) => Promise<'done' | 'pre_body_failed'>
     /** 挂起态心跳(流式写 SSE ping / 注释行;非流式无通道则 no-op)。 */
     sendPing: () => void
     /** 超时收尾 - error(触及绝对 deadline 且 timeoutAction=error):按端点格式发失败信号。 */
@@ -4117,6 +4132,8 @@ export class ProxyServer {
     const onNoHoldGiveUp = opts.onNoHoldGiveUp ?? onTimeoutError
     // 本次请求已试过的账号(避免 resume/切号反复命中同一挂账号)。
     const triedIds = new Set<string>()
+    // 请求来源事实:第一次成功 resume 后永久为 true,覆盖后续换号/重试/再次挂起。
+    let resumedFromHold = false
     // 最近一次 pre-body 错误(attempt 通过 recordError 上报),用于挂起决策(§decideHoldAction)。
     // 用 { current } ref 结构避开 TS「闭包外看不到写入 → 类型收窄成 never」的问题。
     const preBodyErrorRef: { current: Error | null } = { current: null }
@@ -4216,6 +4233,7 @@ export class ProxyServer {
         const holdDetail = decision === 'hold' ? this.accountPool.describeBlockedAccounts() : []
         const shouldRetry = await waitInHold(holdReason, holdDetail)
         if (!shouldRetry) return // 超时/abort 终态
+        resumedFromHold = true
         acc = await pickFresh()
         if (!acc) { triedIds.clear(); acc = await pickFresh() } // resume 后仍未拿到(去抖竞争),清 tried 再试一次
         if (!acc) {
@@ -4227,7 +4245,7 @@ export class ProxyServer {
       }
       triedIds.add(acc.id)
       if (holdDebugEnabled) console.log(`[HoldGate][DEBUG] attempt start · account=${acc.email || acc.id} · triedCount=${triedIds.size}`)
-      const outcome = await attempt(acc, recordError)
+      const outcome = await attempt(acc, recordError, { resumedFromHold })
       if (outcome === 'done') {
         // 拿到号并跑完一次完整转发 → 客户端真的收到了语义正文(甲世界)。
         // 若本次是被放行唤醒后才跑成的,这一笔就是「放行真的续上了命」的直接证据。
@@ -4341,23 +4359,8 @@ export class ProxyServer {
    * 「一条走过的弯路」:曾把它塞进挂起判据,压过了「有号被封 → 挂起」)。
    */
   private classifyHold(lastPreBodyError: Error | null): NoAccountHoldDecision {
-    const selectedIds = this.config.selectedAccountIds ?? []
-    const selectedId = selectedIds[0]
     return classifyNoAccountHold({
       holdEnabled: this.config.holdWhenNoAccount === true,
-      poolSize: this.accountPool.size,
-      selectedAccountIds: selectedIds,
-      // 仅供日志归因(不参与判定):选中号此刻是否可用。
-      // 「拿不到选中号」已在选号阶段由 selectedAccountFallback 回退处理,
-      // 能走到这里说明池里一个可用号都没有 —— 判定只看池状态。
-      selectedAccountInPool: selectedId
-        ? (() => {
-            const acc = this.accountPool.getAccount(selectedId)
-            return !!acc
-              && !this.accountPool.isSuspended(acc)
-              && !this.accountPool.isQuotaExhausted(acc)
-          })()
-        : true,
       poolHasBlockedAccount: this.shouldHoldForNoAccount(),
       lastPreBodyError
     })
@@ -4381,16 +4384,16 @@ export class ProxyServer {
     path: string
     model: string
     pickAccount: (triedIds: Set<string>) => Promise<ProxyAccount | null>
-    doCall: (acc: ProxyAccount) => Promise<{ result: T; account: ProxyAccount }>
+    doCall: (acc: ProxyAccount, context: HoldAttemptContext) => Promise<{ result: T; account: ProxyAccount }>
     writeSuccess: (result: T, usedAccount: ProxyAccount) => void
     /** 超时收尾 - error:按端点格式发失败响应(headers 尚未发,可直接 writeHead+end)。 */
     onTimeoutError: () => void
     /** 超时收尾 - graceful_stop:按端点格式发"干净结束"响应。 */
     onTimeoutGracefulStop: () => void
   }): Promise<void> {
-    const attempt = async (acc: ProxyAccount, recordError: (err: Error) => void): Promise<'done' | 'pre_body_failed'> => {
+    const attempt = async (acc: ProxyAccount, recordError: (err: Error) => void, context: HoldAttemptContext): Promise<'done' | 'pre_body_failed'> => {
       try {
-        const { result, account: usedAccount } = await opts.doCall(acc)
+        const { result, account: usedAccount } = await opts.doCall(acc, context)
         if (this.isResponseClosed(opts.res)) return 'done'
         opts.writeSuccess(result, usedAccount)
         return 'done'
@@ -4449,7 +4452,7 @@ export class ProxyServer {
 
     // 用一个账号做一次完整流式转发。返回 'done'(终态:成功/已吐正文的失败/abort)
     // 或 'pre_body_failed'(首字节前失败,可切号或挂起)。
-    const attempt = (acc: ProxyAccount, recordError: (err: Error) => void): Promise<'done' | 'pre_body_failed'> => {
+    const attempt = (acc: ProxyAccount, recordError: (err: Error) => void, context: HoldAttemptContext): Promise<'done' | 'pre_body_failed'> => {
       return new Promise<'done' | 'pre_body_failed'>((resolveAttempt) => {
         const toolNameRegistry = new ToolNameRegistry()
         const kiroPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, claudeThinkingConfig)
@@ -4469,7 +4472,8 @@ export class ProxyServer {
         this.handleClaudeStream(
           res, acc, kiroPayload, model, startTime, 0, undefined, true, 0, matchedApiKey, toolNameRegistry, signal,
           cacheProfile ? { ...cacheUsage, cacheProfile, accountId: acc.id } : undefined,
-          onPreBodyError
+          onPreBodyError,
+          { skipFirstChunkTimeout: context.resumedFromHold }
         ).then(() => {
           // handleClaudeStream 走完(成功收尾 / 已吐正文的 error / abort)。若不是被 onPreBodyError 接管的,即终态。
           if (!settled) { settled = true; resolveAttempt('done') }
@@ -4536,7 +4540,7 @@ export class ProxyServer {
     }>({
       res, startTime, signal, seedAccount, path: '/v1/messages', model,
       pickAccount: (_tried) => this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id, model),
-      doCall: async (acc) => {
+      doCall: async (acc, context) => {
         const toolNameRegistry = new ToolNameRegistry()
         const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, claudeThinkingConfig)).length * 0.3))
         const cacheProfile = promptCacheTracker.buildClaudeProfile(processedRequest.system, processedRequest.messages, processedRequest.tools, estimatedInputTokens, processedRequest.model)
@@ -4544,7 +4548,10 @@ export class ProxyServer {
         this.events.onRequest?.({ path: '/v1/messages', method: 'POST', accountId: acc.id })
         const { result, account: usedAccount } = await this.callWithRetry(
           acc,
-          async (a) => callKiroApi(a, claudeToKiro(processedRequest, a.profileArn, toolNameRegistry, claudeThinkingConfig), signal),
+          async (a) => callKiroApi(
+            a, claudeToKiro(processedRequest, a.profileArn, toolNameRegistry, claudeThinkingConfig), signal,
+            { skipFirstChunkTimeout: context.resumedFromHold }
+          ),
           '/v1/messages', signal, model
         )
         return { result: { result, cacheProfile, cacheUsage, toolNameRegistry } as any, account: usedAccount }
@@ -4592,7 +4599,8 @@ export class ProxyServer {
     // Hold Gate 接线(task#3,ADR-0001 边界 2):首字节前上游失败时回调。
     // 返回 true = 已被挂起门闸接管(不发 SSE error,交给 resume 重试);false = 未接管,按现状发 error。
     // 仅在"尚未发出 message_start(未写入任何语义正文)"时才可能被调用 —— 一旦吐了正文,重放会重复输出。
-    onPreBodyError?: (error: Error) => boolean
+    onPreBodyError?: (error: Error) => boolean,
+    executionOptions: KiroApiExecutionOptions = {}
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -4604,8 +4612,7 @@ export class ProxyServer {
 
     const id = msgId || `msg_${uuidv4()}`
     let currentBlockIndex = contentBlockIndex
-    let hasStartedTextBlock = false
-    let hasStartedThinkingBlock = false
+    let activeContentBlock: 'text' | 'thinking' | null = null
     let pendingThinkingSignature: string | undefined
     let collectedContent = ''
     const pendingToolCalls: Map<string, { name: string; input: Record<string, unknown> }> = new Map()
@@ -4650,6 +4657,17 @@ export class ProxyServer {
       pendingThinkingSignature = undefined
     }
 
+    // 活跃块类型是内容块生命周期的单一真源。stop + 索引推进 + 清空状态必须原子发生，
+    // 避免 boolean 与 currentBlockIndex 分别维护后漂移出「新索引仍被标记为已打开」。
+    const closeActiveContentBlock = () => {
+      if (!activeContentBlock) return
+      if (activeContentBlock === 'thinking') flushThinkingSignature()
+      const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+      res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
+      currentBlockIndex++
+      activeContentBlock = null
+    }
+
     return new Promise((resolve) => {
       // 纯观测计数器:统计本次请求内部的上游尝试 / 429 / 无效上传字节。
       const attemptCounter = createUpstreamAttemptCounter()
@@ -4663,19 +4681,7 @@ export class ProxyServer {
           emitMessageStartOnce()
           // 优先处理 redacted_thinking（加密的 thinking 块，需单独 content_block）
           if (redactedContent) {
-            if (hasStartedTextBlock) {
-              const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
-              res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
-              currentBlockIndex++
-              hasStartedTextBlock = false
-            }
-            if (hasStartedThinkingBlock) {
-              flushThinkingSignature()
-              const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
-              res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
-              currentBlockIndex++
-              hasStartedThinkingBlock = false
-            }
+            closeActiveContentBlock()
             const blockStart = createClaudeStreamEvent('content_block_start', {
               index: currentBlockIndex,
               content_block: { type: 'redacted_thinking', data: redactedContent }
@@ -4689,19 +4695,14 @@ export class ProxyServer {
           if (text && text.trim()) {
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 Anthropic thinking block
-              if (hasStartedTextBlock) {
-                const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
-                res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
-                currentBlockIndex++
-                hasStartedTextBlock = false
-              }
-              if (!hasStartedThinkingBlock) {
+              if (activeContentBlock === 'text') closeActiveContentBlock()
+              if (activeContentBlock !== 'thinking') {
                 const blockStart = createClaudeStreamEvent('content_block_start', {
                   index: currentBlockIndex,
                   content_block: { type: 'thinking', thinking: '' }
                 })
                 res.write(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`)
-                hasStartedThinkingBlock = true
+                activeContentBlock = 'thinking'
               }
               const delta = createClaudeStreamEvent('content_block_delta', {
                 index: currentBlockIndex,
@@ -4713,21 +4714,15 @@ export class ProxyServer {
               }
             } else {
               // 普通文本内容
-              if (hasStartedThinkingBlock) {
-                flushThinkingSignature()
-                const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
-                res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
-                currentBlockIndex++
-                hasStartedThinkingBlock = false
-              }
+              if (activeContentBlock === 'thinking') closeActiveContentBlock()
               collectedContent += text
-              if (!hasStartedTextBlock) {
+              if (activeContentBlock !== 'text') {
                 const blockStart = createClaudeStreamEvent('content_block_start', {
                   index: currentBlockIndex,
                   content_block: { type: 'text', text: '' }
                 })
                 res.write(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`)
-                hasStartedTextBlock = true
+                activeContentBlock = 'text'
               }
               const delta = createClaudeStreamEvent('content_block_delta', {
                 index: currentBlockIndex,
@@ -4736,32 +4731,20 @@ export class ProxyServer {
               res.write(`event: content_block_delta\ndata: ${JSON.stringify(delta)}\n\n`)
             }
           } else if (isThinking && reasoningSignature) {
-            if (!hasStartedThinkingBlock) {
+            if (activeContentBlock === 'text') closeActiveContentBlock()
+            if (activeContentBlock !== 'thinking') {
               const blockStart = createClaudeStreamEvent('content_block_start', {
                 index: currentBlockIndex,
                 content_block: { type: 'thinking', thinking: '' }
               })
               res.write(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`)
-              hasStartedThinkingBlock = true
+              activeContentBlock = 'thinking'
             }
             pendingThinkingSignature = reasoningSignature
           }
           if (toolUse) {
             const restoredToolUse = toolNameRegistry.restoreToolUse(toolUse)
-            if (hasStartedThinkingBlock) {
-              flushThinkingSignature()
-              const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
-              res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
-              currentBlockIndex++
-              hasStartedThinkingBlock = false
-            }
-            // 结束之前的文本块
-            if (hasStartedTextBlock) {
-              const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
-              res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
-              currentBlockIndex++
-              hasStartedTextBlock = false
-            }
+            closeActiveContentBlock()
             // 记录工具调用
             pendingToolCalls.set(toolUse.toolUseId, { name: toolUse.name, input: toolUse.input })
             // 开始工具块
@@ -4790,20 +4773,7 @@ export class ProxyServer {
           }
           // 空响应(上游未吐任何 chunk 即完成)也需补发 message_start,保证 SSE 协议完整。
           emitMessageStartOnce()
-          if (hasStartedThinkingBlock) {
-            flushThinkingSignature()
-            const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
-            res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
-            currentBlockIndex++
-            hasStartedThinkingBlock = false
-          }
-
-          // 结束最后的文本块
-          if (hasStartedTextBlock) {
-            const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
-            res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
-            currentBlockIndex++
-          }
+          closeActiveContentBlock()
 
           this.recordRequestSuccess()
           this.stats.totalTokens += usage.inputTokens + usage.outputTokens
@@ -4929,24 +4899,25 @@ export class ProxyServer {
                 injected: true
               })
             }
-            // 介入:把提示作为正文追加到当前文本块。
+            // 介入:完成回调已关闭上游最后一个内容块，提示必须作为一个完整的新文本块发出。
             // 为什么不改 stop_reason:本项目 clientDrivenToolExecution=true,工具由客户端执行,
             // 服务端没有多轮循环 —— 改成 tool_use 会让客户端去找不存在的工具调用(协议撕裂)。
             // 追加正文则是协议内的合法输出,模型下一轮能看到它并自行决定继续还是汇报。
             if (!this.isResponseClosed(res)) {
-              if (!hasStartedTextBlock) {
+              if (activeContentBlock !== 'text') {
                 const blockStart = createClaudeStreamEvent('content_block_start', {
                   index: currentBlockIndex,
                   content_block: { type: 'text', text: '' }
                 })
                 res.write(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`)
-                hasStartedTextBlock = true
+                activeContentBlock = 'text'
               }
               const nudge = createClaudeStreamEvent('content_block_delta', {
                 index: currentBlockIndex,
                 delta: { type: 'text_delta', text: GPT_HALT_NUDGE }
               })
               res.write(`event: content_block_delta\ndata: ${JSON.stringify(nudge)}\n\n`)
+              closeActiveContentBlock()
             }
           } else if (isGptModel(model) && perfDiag.isEnabled()) {
             // A(观测):GPT 未命中也落盘,用于事后核对判据是否过紧 —— 只有分母才能算命中率。
@@ -5048,7 +5019,8 @@ export class ProxyServer {
         },
         signal,
         this.config.preferredEndpoint,
-        attemptCounter
+        attemptCounter,
+        executionOptions
       ).catch(error => {
         if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
           const errorEvent = createClaudeStreamEvent('error', {

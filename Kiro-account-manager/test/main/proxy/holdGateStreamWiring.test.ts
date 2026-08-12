@@ -217,6 +217,8 @@ describe('HoldGate 流式接线(built-but-not-wired 守门员)', () => {
 
     // A 首字节前失败 → 无号可切 → 挂起(不发 SSE error, 不发 message_start)
     expect(server.getHeldRequestsCount()).toBe(1)
+    const initialAttempt = callKiroApiStreamMock.mock.calls.find((c) => (c[0] as ProxyAccount).id === 'A')
+    expect(initialAttempt?.at(-1)).not.toEqual({ skipFirstChunkTimeout: true })
     let events = countEvents(res.writes)
     expect(events['message_start']).toBeUndefined()
     expect(events['error']).toBeUndefined()
@@ -229,6 +231,7 @@ describe('HoldGate 流式接线(built-but-not-wired 守门员)', () => {
     expect(server.getHeldRequestsCount()).toBe(0)
     const bIdCalls = callKiroApiStreamMock.mock.calls.filter((c) => (c[0] as ProxyAccount).id === 'B')
     expect(bIdCalls.length).toBe(1)
+    expect(bIdCalls[0].at(-1)).toEqual({ skipFirstChunkTimeout: true })
     events = countEvents(res.writes)
     expect(events['message_start']).toBe(1)
     expect(res.writes.filter((w) => w.includes('recovered on new account')).length).toBe(1)

@@ -169,6 +169,45 @@ describe('wrapStreamWithStallDetection · Layer C 上游静默看门狗', () => 
     expect((r.err as StallError).bytes).toBe(0)
     expect(onStallAbort).toHaveBeenCalledTimes(1)
   })
+
+  // C13 —— HoldGate 放行后的请求跳过 TTFT 预算,但开始出字后仍受 inter-chunk 保护
+  it('C13 跳过首 chunk 超时后首 chunk 可迟到,其后的静默仍触发 inter_chunk 且只 abort 一次', async () => {
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined
+    const upstream = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c
+      }
+    })
+    const options = {
+      skipFirstChunkTimeout: true,
+      firstChunkTimeoutMs: 20_000,
+      stallTimeoutMs: 30_000
+    }
+    const wrapped = wrapStreamWithStallDetection(upstream, onStallAbort, options)
+    const reader = wrapped.getReader()
+    const firstRead = reader.read()
+
+    await vi.advanceTimersByTimeAsync(20_000 + 50)
+    expect(onStallAbort).not.toHaveBeenCalled()
+
+    controller!.enqueue(enc.encode('late-first-chunk'))
+    const first = await firstRead
+    expect(first.done).toBe(false)
+    expect(first.value).toEqual(enc.encode('late-first-chunk'))
+
+    const stalledRead = reader.read().then(
+      () => ({ ok: true as const }),
+      (e: unknown) => ({ ok: false as const, err: e })
+    )
+    await vi.advanceTimersByTimeAsync(30_000 + 50)
+
+    const result = await stalledRead
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.err).toBeInstanceOf(StallError)
+    expect((result.err as StallError).reason).toBe('inter_chunk')
+    expect(onStallAbort).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('wrapStreamWithStallDetection · 字段读数 / 计时器清理 / fail-open / 开关', () => {

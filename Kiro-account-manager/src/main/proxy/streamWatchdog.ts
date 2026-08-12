@@ -99,6 +99,8 @@ function formatSeconds(ms: number): string {
 }
 
 export interface StallDetectionOptions {
+  /** HoldGate 已放行的请求不受首 chunk(TTFT)预算约束;首 chunk 后仍正常检测 inter-chunk 静默。 */
+  skipFirstChunkTimeout?: boolean
   firstChunkTimeoutMs?: number
   stallTimeoutMs?: number
   /** 仅供日志观测;实现不得依赖其返回值,也不得让它改写抛出的 error。 */
@@ -250,12 +252,12 @@ function buildWatchdogStream(
     try {
       clearTimers()
       awaitingUpstream = true
-      if (chunkCount === 0) {
+      if (chunkCount === 0 && !options.skipFirstChunkTimeout) {
         firstChunkTimer = setTimeout(() => {
           firstChunkTimer = null
           fireStall('first_chunk')
         }, firstChunkTimeoutMs)
-      } else {
+      } else if (chunkCount > 0) {
         stallTimer = setTimeout(() => {
           stallTimer = null
           fireStall('inter_chunk')

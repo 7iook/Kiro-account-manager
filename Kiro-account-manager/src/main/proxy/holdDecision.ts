@@ -45,18 +45,6 @@ export type NoAccountHoldReason =
 export interface NoAccountHoldInput {
   /** `config.holdWhenNoAccount === true` */
   holdEnabled: boolean
-  /** 当前反代池大小 */
-  poolSize: number
-  /** `config.selectedAccountIds`(单账号模式下 UI 指定的号) */
-  selectedAccountIds: string[]
-  /**
-   * 选中号是否在**可用池**里。**仅用于日志归因,不参与判定**。
-   *
-   * 判定刻意不看它:选号阶段已由 `selectedAccountFallback` 处理过「选中号拿不到就回退」,
-   * 能走到本函数说明池里一个可用号都没有 —— 此时「选中项是谁」已无关。
-   * 曾用它做判定并优先于 account-blocked,导致被封账号被误判为配置错误(见文件头「弯路」)。
-   */
-  selectedAccountInPool: boolean
   /** `accountPool.hasBlockedAccount()` */
   poolHasBlockedAccount: boolean
   /** 本请求最近一次 pre-body 错误(null = 一次上游请求都没发出) */
@@ -86,8 +74,7 @@ export function isAccountLevelAuthFailure(err: Error | null): boolean {
 
 export function classifyNoAccountHold(input: NoAccountHoldInput): NoAccountHoldDecision {
   const {
-    holdEnabled, poolSize, selectedAccountIds,
-    selectedAccountInPool, poolHasBlockedAccount, lastPreBodyError
+    holdEnabled, poolHasBlockedAccount, lastPreBodyError
   } = input
 
   // ③ 开关优先:用户关掉门闸就是不要挂起行为,任何分支都不得越过它。
@@ -98,13 +85,6 @@ export function classifyNoAccountHold(input: NoAccountHoldInput): NoAccountHoldD
       clientMessage: 'No account available (hold gate disabled)'
     }
   }
-
-  // ⚠️ 这里**刻意不判定**「选中号不在池 → 配置错误」(见文件头「弯路」)。
-  // 能走到本函数 = 池里一个可用号都没有,此时只该看池状态。
-  // 以下三个入参仅供日志归因,不参与判定。
-  void selectedAccountInPool
-  void selectedAccountIds
-  void poolSize
 
   // 池内有号被封禁 / 额度耗尽 → 挂起等恢复或换号(门闸原始设计意图)
   if (poolHasBlockedAccount) {

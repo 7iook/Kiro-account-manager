@@ -69,7 +69,9 @@ export function resolveSelectedPreference<T>(
 
   if (!selectedId) {
     const any = pickAnyUsable()
-    return any ? { kind: 'selected', account: any } : { kind: 'none', why: 'no-preference' }
+    return any && isUsable(any)
+      ? { kind: 'selected', account: any }
+      : { kind: 'none', why: 'no-preference' }
   }
 
   const selected = getById(selectedId)
@@ -82,7 +84,11 @@ export function resolveSelectedPreference<T>(
   const why: 'missing' | 'unusable' = selected ? 'unusable' : 'missing'
 
   const alternative = pickAnyUsable()
-  if (alternative) return { kind: 'fallback', account: alternative, why }
+  // 候选选择器可能只负责排序/初筛；安全边界仍以同一个 isUsable 判据为准。
+  // 尤其 API Key 账号绑定必须在这里二次确认，不能信任 pickAnyUsable 的返回值。
+  if (alternative && isUsable(alternative)) {
+    return { kind: 'fallback', account: alternative, why }
+  }
 
   return { kind: 'none', why }
 }

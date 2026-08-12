@@ -11,8 +11,29 @@
 //   本模块只答「能不能拿到号」;拿不到时的挂起/报错由 holdDecision 决定。
 import { describe, it, expect } from 'vitest'
 import { resolveSelectedPreference } from '@main/proxy/selectedAccountFallback'
+import { ProxyServer } from '@main/proxy/proxyServer'
+import type { ProxyAccount } from '@main/proxy/types'
 
 type Acc = { id: string; usable: boolean }
+
+function proxyAccount(id: string, extra: Partial<ProxyAccount> = {}): ProxyAccount {
+  return {
+    id,
+    email: `${id}@example.com`,
+    accessToken: `token-${id}`,
+    refreshToken: `refresh-${id}`,
+    isAvailable: true,
+    ...extra
+  }
+}
+
+async function pickAccount(server: ProxyServer, apiKeyId?: string): Promise<ProxyAccount | null> {
+  return await (
+    server as unknown as {
+      getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string): Promise<ProxyAccount | null>
+    }
+  ).getAvailableAccount(undefined, undefined, apiKeyId)
+}
 
 function harness(accounts: Acc[], selectedId?: string) {
   const byId = new Map(accounts.map(a => [a.id, a]))
@@ -72,5 +93,117 @@ describe('选中账号 = 偏好,服务优先', () => {
   it('回退绝不选一个不可用的号(服务优先不等于乱选)', () => {
     const r = harness([{ id: 'A', usable: false }, { id: 'C', usable: false }], 'A')
     expect(r.kind).toBe('none')
+  })
+})
+
+describe('ProxyServer · 选中账号偏好的生产接线', () => {
+  it('选中 id 缺失时的回退不得逃出 API Key 账号绑定', async () => {
+    const server = new ProxyServer({
+      enableMultiAccount: false,
+      selectedAccountIds: ['gone'],
+      apiKeyAccountBindings: { keyA: ['A'] }
+    })
+    const pool = server.getAccountPool()
+    pool.addAccount(proxyAccount('B'))
+    pool.addAccount(proxyAccount('A'))
+
+    const picked = await pickAccount(server, 'keyA')
+
+    expect(picked?.id).toBe('A')
+  })
+
+  it('绑定子集没有可用账号时返回 null,不得借偏好回退越权', async () => {
+    const server = new ProxyServer({
+      enableMultiAccount: false,
+      selectedAccountIds: ['gone'],
+      apiKeyAccountBindings: { keyA: ['A'] }
+    })
+    const pool = server.getAccountPool()
+    pool.addAccount(proxyAccount('B'))
+    pool.addAccount(proxyAccount('A', {
+      quotaExhaustedAt: Date.now(),
+      quotaUsed: 100,
+      quotaLimit: 100
+    }))
+
+    const picked = await pickAccount(server, 'keyA')
+
+    expect(picked).toBeNull()
+  })
+
+  it('未配置 UI 偏好时,绑定子集没有可用账号也必须返回 null', async () => {
+    const server = new ProxyServer({
+      enableMultiAccount: false,
+      selectedAccountIds: [],
+      apiKeyAccountBindings: { keyA: ['A'] }
+    })
+    const pool = server.getAccountPool()
+    pool.addAccount(proxyAccount('B'))
+    pool.addAccount(proxyAccount('A', {
+      quotaExhaustedAt: Date.now(),
+      quotaUsed: 100,
+      quotaLimit: 100
+    }))
+
+    const picked = await pickAccount(server, 'keyA')
+
+    expect(picked).toBeNull()
+  })
+
+  it('直接选中的账号不在 API Key 绑定内时也必须回退到绑定内账号', async () => {
+    const server = new ProxyServer({
+      enableMultiAccount: false,
+      selectedAccountIds: ['B'],
+      apiKeyAccountBindings: { keyA: ['A'] }
+    })
+    const pool = server.getAccountPool()
+    pool.addAccount(proxyAccount('B'))
+    pool.addAccount(proxyAccount('A'))
+
+    const picked = await pickAccount(server, 'keyA')
+
+    expect(picked?.id).toBe('A')
+  })
+
+  it('选中账号存在但额度耗尽且关闭自动切换时,本次请求仍回退但不改写偏好', async () => {
+    const server = new ProxyServer({
+      enableMultiAccount: false,
+      selectedAccountIds: ['Q'],
+      autoSwitchOnQuotaExhausted: false
+    })
+    const pool = server.getAccountPool()
+    pool.addAccount(proxyAccount('Q', {
+      quotaExhaustedAt: Date.now(),
+      quotaUsed: 100,
+      quotaLimit: 100
+    }))
+    pool.addAccount(proxyAccount('H'))
+
+    const picked = await pickAccount(server)
+
+    expect(picked?.id).toBe('H')
+    expect(server.getConfig().selectedAccountIds).toEqual(['Q'])
+  })
+
+  it('额度自动切换候选也必须受 API Key 绑定约束', async () => {
+    const server = new ProxyServer({
+      enableMultiAccount: false,
+      selectedAccountIds: ['Q'],
+      autoSwitchOnQuotaExhausted: true,
+      apiKeyAccountBindings: { keyA: ['A'] }
+    })
+    const pool = server.getAccountPool()
+    pool.addAccount(proxyAccount('Q', {
+      quotaExhaustedAt: Date.now(),
+      quotaUsed: 100,
+      quotaLimit: 100
+    }))
+    pool.addAccount(proxyAccount('B'))
+    pool.addAccount(proxyAccount('A'))
+
+    const picked = await pickAccount(server, 'keyA')
+
+    expect(picked?.id).toBe('A')
+    expect(server.getConfig().selectedAccountIds).toEqual(['A'])
   })
 })

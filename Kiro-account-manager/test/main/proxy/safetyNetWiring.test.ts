@@ -32,7 +32,7 @@ import {
   setModelContextWindow,
   trimHistoryByTokens
 } from '@main/proxy/kiroApi'
-import { StallError, STREAM_FIRST_CHUNK_TIMEOUT_MS } from '@main/proxy/streamWatchdog'
+import { StallError, STREAM_FIRST_CHUNK_TIMEOUT_MS, STREAM_STALL_TIMEOUT_MS } from '@main/proxy/streamWatchdog'
 import type { KiroHistoryMessage, KiroPayload, KiroToolWrapper } from '@main/proxy/types'
 
 afterEach(() => {
@@ -71,6 +71,7 @@ function makeStreamPayload(): KiroPayload {
 
 function stubStallingFetch(): {
   close: () => void
+  enqueue: (chunk: Uint8Array) => void
   get signal(): AbortSignal | undefined
 } {
   let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined
@@ -88,6 +89,7 @@ function stubStallingFetch(): {
   vi.stubGlobal('fetch', vi.fn(impl))
   return {
     close: () => bodyController?.close(),
+    enqueue: (chunk) => bodyController?.enqueue(chunk),
     get signal() { return fetchSignal }
   }
 }
@@ -115,6 +117,39 @@ describe('Layer C 接线 · 生产请求路径真的经过静默看门狗', () =
     })
     expect(upstream.signal?.aborted).toBe(true)
     expect(external.signal.aborted).toBe(false)
+  })
+
+  it('Hold 放行选项:跨过首 chunk 阈值不报错,首个原始 chunk 后静默仍报 inter_chunk', async () => {
+    vi.useFakeTimers()
+    setEnableProxyContextSafetyNet(true)
+    const upstream = stubStallingFetch()
+    const onError = vi.fn()
+
+    const request = callKiroApiStream(
+      makeStreamAccount(),
+      makeStreamPayload(),
+      () => {},
+      () => {},
+      onError,
+      undefined,
+      undefined,
+      undefined,
+      { skipFirstChunkTimeout: true }
+    )
+    await vi.advanceTimersByTimeAsync(STREAM_FIRST_CHUNK_TIMEOUT_MS + 1)
+    expect(onError).not.toHaveBeenCalled()
+    expect(upstream.signal?.aborted).toBe(false)
+
+    upstream.enqueue(new Uint8Array([0]))
+    await vi.advanceTimersByTimeAsync(STREAM_STALL_TIMEOUT_MS + 1)
+    await request
+
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0][0]).toMatchObject({
+      code: 'upstream_stream_stall',
+      reason: 'inter_chunk'
+    })
+    expect(upstream.signal?.aborted).toBe(true)
   })
 
   it('开关 OFF:跨过同一静默阈值仍纯透传，直到上游正常 EOF 才完成', async () => {
@@ -538,11 +573,14 @@ describe('接线闸门 · 生产调用点必须真实存在(反死代码)', () =
   it('每一处 parseEventStream 调用都传了 stall abort 回调 —— 两条路径都被守住', () => {
     // 接线点选在 parseEventStream **内部**,故调用点的义务只剩「传 onStallAbort」。
     // 该参数是必填的,漏传编译不过;这条断言额外锁住「传的是 linked.abort 而不是外部 signal」。
-    const calls = kiroApiSrc.match(/await parseEventStream\([^\n]*/g) ?? []
+    const callStarts = [...kiroApiSrc.matchAll(/await parseEventStream\(/g)].map((match) => match.index)
     // 今天两处:主路径 + THINKING_SIGNATURE_INVALID 重试
-    expect(calls.length).toBe(2)
-    for (const call of calls) {
-      expect(call).toContain('linked.abort(')
+    expect(callStarts.length).toBe(2)
+    for (const start of callStarts) {
+      // 调用允许格式化成多行;只检查该调用附近的必填 abort 接线,避免单行源码正则误报。
+      const callWindow = kiroApiSrc.slice(start, start + 600)
+      expect(callWindow).toContain('linked.abort(')
+      expect(callWindow).toContain('executionOptions')
     }
   })
 

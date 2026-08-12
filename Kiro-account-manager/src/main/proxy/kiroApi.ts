@@ -33,6 +33,11 @@ import { wrapStreamWithStallDetection } from './streamWatchdog'
 // 重新导出以保持向后兼容（proxyServer.ts 等模块仍 from './kiroApi' 导入）
 export { setModelContextWindow, getModelContextWindow }
 
+/** 单次请求执行期行为。沿内部 endpoint / signature / content-filter 重试保持不变。 */
+export interface KiroApiExecutionOptions {
+  skipFirstChunkTimeout?: boolean
+}
+
 // 是否使用 K-Proxy 代理发送 API 请求（从主进程导入）
 let useKProxyForApi = false
 let logStreamEvents = false
@@ -2145,7 +2150,8 @@ export async function callKiroApiStream(
   signal?: AbortSignal,
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli',
   /** 纯观测计数器(可选)。传入则累计上游尝试 / 429 / 无效上传字节;不传时零行为变化。 */
-  attemptCounter?: UpstreamAttemptCounter
+  attemptCounter?: UpstreamAttemptCounter,
+  executionOptions: KiroApiExecutionOptions = {}
 ): Promise<void> {
   const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
 
@@ -2424,7 +2430,11 @@ export async function callKiroApiStream(
         }
         onComplete(u)
       }
-      await parseEventStream(response.body!, onChunk, completeGuard, onError, () => linked.abort(new Error('upstream stream stall — aborted by watchdog')), inputChars, signal, requestedModelId, payloadStr)
+      await parseEventStream(
+        response.body!, onChunk, completeGuard, onError,
+        () => linked.abort(new Error('upstream stream stall — aborted by watchdog')),
+        inputChars, signal, requestedModelId, payloadStr, executionOptions
+      )
       if (retryFilteredEmpty) {
         const waitMs = CONTENT_FILTER_RETRY_BACKOFF_MS[contentFilterRetryAttempt]
         contentFilterRetryAttempt++
@@ -2557,7 +2567,11 @@ export async function callKiroApiStream(
             ? await undiciFetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal: linked.signal, dispatcher: retryAgent } as UndiciRequestInit) as unknown as Response
             : await fetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal: linked.signal })
           if (retryResponse.ok) {
-            await parseEventStream(retryResponse.body!, onChunk, onComplete, onError, () => linked.abort(new Error('upstream stream stall — aborted by watchdog')), retryStr.length, signal, getPayloadModelId(retryPayload), retryStr)
+            await parseEventStream(
+              retryResponse.body!, onChunk, onComplete, onError,
+              () => linked.abort(new Error('upstream stream stall — aborted by watchdog')),
+              retryStr.length, signal, getPayloadModelId(retryPayload), retryStr, executionOptions
+            )
             return
           }
           const retryBody = await retryResponse.text()
@@ -2808,14 +2822,17 @@ async function parseEventStream(
   inputChars: number = 0,  // 输入字符长度（兜底估算用）
   signal?: AbortSignal,
   modelId?: string,        // 模型 ID，用于 contextUsagePercentage 反推 inputTokens
-  payloadStr?: string      // 请求 payload JSON 字符串，用于 tiktoken 精确计算
+  payloadStr?: string,     // 请求 payload JSON 字符串，用于 tiktoken 精确计算
+  executionOptions: KiroApiExecutionOptions = {}
 ): Promise<void> {
   // Layer C:先给上游原始字节流套静默看门狗,再取 reader。
   // 总开关关闭 / KIRO_PROXY_LAYER_C=false / 看门狗自身构建失败 → 原样返回上游流(纯透传)。
   // 计时按**原始上游 chunk**,不按 SSE 输出 —— 推理模型会长时间零 SSE 输出但分片一直在到,
   // 按输出计时会误掐正常的慢思考请求(见 streamWatchdog.ts 顶部)。
   const guardedBody = enableProxyContextSafetyNet
-    ? wrapStreamWithStallDetection(body, onStallAbort)
+    ? wrapStreamWithStallDetection(body, onStallAbort, {
+        skipFirstChunkTimeout: executionOptions.skipFirstChunkTimeout
+      })
     : body
   const reader = guardedBody.getReader()
   const abort = () => {
@@ -3832,7 +3849,8 @@ async function parseEventStream(
 export async function callKiroApi(
   account: ProxyAccount,
   payload: KiroPayload,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  executionOptions: KiroApiExecutionOptions = {}
 ): Promise<{
   content: string
   toolUses: KiroToolUse[]
@@ -3889,7 +3907,10 @@ export async function callKiroApi(
         resolve({ content, toolUses, usage })
       },
       reject,
-      signal
+      signal,
+      undefined,
+      undefined,
+      executionOptions
     ).catch(reject)
   })
 }

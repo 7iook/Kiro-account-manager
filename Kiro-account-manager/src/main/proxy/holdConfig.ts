@@ -6,7 +6,6 @@
 //   totalBudgetMs/graceMs/timeoutAction),proxyServer 归一化后直接注入 HoldGate。
 import type { ProxyConfig } from './types'
 import type { HoldGateRuntimeConfig, HoldTimeoutAction } from './holdGate'
-import { proxyLogger } from './logger'
 
 /** 挂起门闸运行配置默认值(方案 §3 表)。 */
 export const HOLD_DEFAULTS: HoldGateRuntimeConfig = {
@@ -39,16 +38,6 @@ const GRACE_MAX = 60000
 
 // 自动放行间隔下限 60s:每轮放行都真发一次上游请求,过短会加深 RCA 2026-08-04 的 429 误标风险。
 const AUTO_RELEASE_MIN = 60000
-
-// 跨模块时间约束(决策卡 §3):并行分支 feat/proxy-context-safety-net 的 Layer C 设计了上游流停发
-// 看守,首字节超时默认 200s,触发即 abort 上游并向下游发错误。若自动放行间隔 ≥ 该超时,
-// 放行后重跑的上游会在下一次自动放行**之前**被 Layer C 掐死 → 用户看到「自动放行开着但请求还是失败」。
-//
-// **若 Layer C 落地且实际值不同,改这里**(它是本约束的唯一真源;Layer C 落地方有义务回写实际值)。
-// 2026-08-09 实测:Layer C 尚未落地(git grep + 文件系统级检索双向零结果),故这是设计约定而非在飞冲突。
-const LAYER_C_FIRST_CHUNK_TIMEOUT_MS_ASSUMED = 200000
-// 0.75 系数留出上游首字节抖动余量 → 按 200s 假定值算,兼容上限 150s。
-const LAYER_C_SAFETY_RATIO = 0.75
 
 const VALID_ACTIONS: readonly HoldTimeoutAction[] = ['keep_blocking', 'error', 'graceful_stop']
 
@@ -96,19 +85,6 @@ export function normalizeHoldConfig(config: Partial<ProxyConfig>): HoldGateRunti
     HOLD_DEFAULTS.autoReleaseIntervalMs
   )
   if (autoReleaseIntervalMs > totalBudgetMs) autoReleaseIntervalMs = totalBudgetMs
-
-  // 跨模块时间约束:**只 warn 不强制下调** —— Layer C 未落地时下调反而无谓缩短周期、
-  // 增加上游压力(每轮放行都是一次真实上游请求)。用户按提示自行取舍。
-  if (autoReleaseEnabled && autoReleaseIntervalMs >= LAYER_C_FIRST_CHUNK_TIMEOUT_MS_ASSUMED * LAYER_C_SAFETY_RATIO) {
-    proxyLogger.warn(
-      'HoldGate',
-      `自动放行间隔 ${autoReleaseIntervalMs}ms 不满足与上游停发看守(Layer C)的兼容式 ` +
-        `interval < ${LAYER_C_FIRST_CHUNK_TIMEOUT_MS_ASSUMED}ms × ${LAYER_C_SAFETY_RATIO};` +
-        `Layer C 落地后本间隔会导致放行重跑的请求在下一次自动放行前被提前掐断。` +
-        `当前 Layer C 尚未落地,故仅告警不下调。`,
-      { autoReleaseIntervalMs, assumedFirstChunkTimeoutMs: LAYER_C_FIRST_CHUNK_TIMEOUT_MS_ASSUMED }
-    )
-  }
 
   return { pingIntervalMs, maxWaitMs, totalBudgetMs, graceMs, timeoutAction, autoReleaseEnabled, autoReleaseIntervalMs }
 }
