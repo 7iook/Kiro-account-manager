@@ -4286,8 +4286,12 @@ export class ProxyServer {
    * 「取运行时状态 → 委托纯函数」,不再自己写判据 —— 此前决策与 holdReason 分两处各算一遍,
    * 导致「决策挂起、原因说成账号封禁、真因其实是 UI 指定号不在池」的三方不一致。
    *
-   * 三处修正见 holdDecision.ts 头部:① 指定号不在池 = 配置错误(挂起是永久死等)→ 立即报错;
-   * ② 新增 selected-account-missing 原因,界面说真话;③ holdWhenNoAccount 关闭时任何分支都不挂。
+   * 三处修正见 holdDecision.ts 头部:① 指定号在账号总表里都不存在 = 配置错误(挂起是永久死等)
+   * → 立即报错;② 新增 selected-account-missing 原因,界面说真话;③ holdWhenNoAccount 关闭时不挂。
+   *
+   * 2026-08-12 回归修复:① 的判据必须是「总表不存在」而非「不在可用池」——
+   * 被封/超额的号也不在可用池,那是账号问题,挂起等恢复才对(详见 holdDecision.ts
+   * selectedAccountExists 字段注释)。
    */
   private classifyHold(lastPreBodyError: Error | null): NoAccountHoldDecision {
     const selectedIds = this.config.selectedAccountIds ?? []
@@ -4297,10 +4301,22 @@ export class ProxyServer {
       poolSize: this.accountPool.size,
       selectedAccountIds: selectedIds,
       // 单账号模式才存在「指定号」概念;多账号轮询下 selectedAccountIds 不作为唯一来源,
-      // 故仅在非多账号模式下才把「不在池」判为配置错误,避免误伤轮询模式。
-      selectedAccountInPool: this.config.enableMultiAccount
+      // 故仅在非多账号模式下才把「不存在」判为配置错误,避免误伤轮询模式。
+      //
+      // ⚠️ getAccount() 查的是**账号总表**(this.accounts),被封/超额的号仍在其中(只是被标记),
+      // 所以它恰好就是「id 是否真的存在」的判据 —— 而不是「当前是否可用」。
+      // RCA 2026-08-12:上一版把这个值当成 selectedAccountInPool 用,导致被封账号被误判为
+      // 配置错误 → 立即 giveup,挂起功能从 2 小时退化成 20 分钟内彻底失败。
+      selectedAccountExists: this.config.enableMultiAccount
         ? true
         : (selectedId ? !!this.accountPool.getAccount(selectedId) : true),
+      // 可用池视角(仅供日志归因,不参与判定)。accountPool 没有 per-id 可用性查询接口,
+      // 这里用「在总表里 且 池中至少有一个可用号」近似 —— 不为一个纯日志字段新增公开方法
+      // (那会扩大池的对外契约)。判定权在 selectedAccountExists,不受本近似影响。
+      selectedAccountInPool: selectedId
+        ? this.accountPool.getAllAccounts().some(a => a.id === selectedId)
+          && this.accountPool.availableCount > 0
+        : true,
       poolHasBlockedAccount: this.shouldHoldForNoAccount(),
       lastPreBodyError
     })

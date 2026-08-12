@@ -48,7 +48,21 @@ export interface NoAccountHoldInput {
   poolSize: number
   /** `config.selectedAccountIds`(单账号模式下 UI 指定的号) */
   selectedAccountIds: string[]
-  /** 指定的那个号当前是否真在池里 */
+  /**
+   * 指定的那个 id 在**账号总表**里是否存在(`accountPool.getAccount(id) !== null`)。
+   *
+   * ## 为什么必须与 `selectedAccountInPool` 分开(RCA 2026-08-12 回归修复)
+   * 7c63d4c 只用「是否在池里」判定配置错误,而账号**被上游封禁 / 额度耗尽时也会不在池**
+   * (实测日志:`lazy-refill: N 个账号未入反代池 —— xxx: 已被上游拒绝([TEMPORARILY_SUSPENDED])`)。
+   * 于是「账号被封」被误判成「用户配错 id」→ giveup,而这恰恰是门闸最该挂起的场景。
+   * 用户表现:挂起从 2 小时退化成「立刻 503 + 客户端重试 10 次 ≈ 20 分钟后彻底失败」。
+   *
+   * 判据分工:
+   *   - 总表里**不存在** → 配置错误(残留旧 id / 已删除账号)→ 立即报错
+   *   - 总表里存在但不在可用池 → 账号级不可用(封禁/超额/冷却)→ 挂起等恢复
+   */
+  selectedAccountExists: boolean
+  /** 指定的那个号当前是否在**可用池**里(排除封禁/超额/冷却后仍可选) */
   selectedAccountInPool: boolean
   /** `accountPool.hasBlockedAccount()` */
   poolHasBlockedAccount: boolean
@@ -80,8 +94,9 @@ export function isAccountLevelAuthFailure(err: Error | null): boolean {
 export function classifyNoAccountHold(input: NoAccountHoldInput): NoAccountHoldDecision {
   const {
     holdEnabled, poolSize, selectedAccountIds,
-    selectedAccountInPool, poolHasBlockedAccount, lastPreBodyError
+    selectedAccountExists, selectedAccountInPool, poolHasBlockedAccount, lastPreBodyError
   } = input
+  void selectedAccountInPool  // 保留入参用于日志归因;判定只看「总表是否存在」(见字段注释)
 
   // ③ 开关优先:用户关掉门闸就是不要挂起行为,任何分支都不得越过它。
   if (!holdEnabled) {
@@ -92,11 +107,14 @@ export function classifyNoAccountHold(input: NoAccountHoldInput): NoAccountHoldD
     }
   }
 
-  // ① 指定号不在池 —— 必须**先于** account-blocked 判定。
+  // ① 指定号在**账号总表里都不存在** —— 必须先于 account-blocked 判定。
   // 现场组合正是「池里那个号被封(blocked=true) + UI 选的是另一个不存在的 id」:
   // 若先命中 account-blocked 就继续挂起,用户永远等不到,且原因仍然说错。
+  //
+  // ⚠️ 判据是「总表不存在」而**不是**「不在可用池」(RCA 2026-08-12 回归):
+  // 被封 / 超额的号也不在可用池,但它是账号问题,挂起等恢复才对。
   const selectedId = selectedAccountIds[0]
-  if (selectedId && !selectedAccountInPool) {
+  if (selectedId && !selectedAccountExists) {
     return {
       action: 'giveup',
       reason: 'selected-account-missing',
