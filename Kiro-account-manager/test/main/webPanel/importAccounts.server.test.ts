@@ -7,13 +7,18 @@
  *
  * 姿态照 `staticAssets.server.test.ts`：真服务器、真 cookie、真 CSRF 头。
  */
-import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
+import { describe, it, expect, afterAll, beforeAll, beforeEach, vi } from 'vitest'
 import { WebPanelServer } from '../../../src/main/webPanel/server'
 import { PanelAuth } from '../../../src/main/webPanel/auth'
 import { PANEL_PATH_PREFIX } from '../../../src/main/webPanel/cookie'
 import { CSRF_HEADER, CSRF_HEADER_VALUE } from '../../../src/webPanel/api/client'
 import type { PanelRouteDeps } from '../../../src/main/webPanel/routes'
-import type { AccountsBlob, ApplyResult, Mutator, ApplyOpts } from '../../../src/main/accountService/state'
+import type {
+  AccountsBlob,
+  ApplyResult,
+  Mutator,
+  ApplyOpts
+} from '../../../src/main/accountService/state'
 import type { VerifyApiKeyResult } from '../../../src/shared/types/credential'
 
 const ADMIN_KEY = 'test-admin-key-0123456789abcdef'
@@ -51,7 +56,8 @@ let checkCalledIds: string[]
 
 function stubRouteDeps(): PanelRouteDeps {
   return {
-    loadAccountsBlob: disk.loadAccountsBlob,
+    // 文件级共享 server；每次请求都读 beforeEach 刚换好的那份内存盘。
+    loadAccountsBlob: () => disk.loadAccountsBlob(),
     importApiKeys: async (input) => {
       const { importApiKeys } = await import('../../../src/main/accountService/importApiKey')
       const result = await importApiKeys(
@@ -82,22 +88,23 @@ function stubRouteDeps(): PanelRouteDeps {
   }
 }
 
-const servers: ServerType[] = []
+let server: ServerType
 let base: string
 let cookie: string
 
 async function startServer(): Promise<void> {
   const auth = new PanelAuth({ get: () => ADMIN_KEY, set: () => undefined })
-  const server = new WebPanelServer({
+  server = new WebPanelServer({
     auth,
     routeDeps: stubRouteDeps(),
     getConfig: () => ({ enabled: true, port: 0, host: '127.0.0.1' })
   })
-  servers.push(server)
   await server.start()
   const addr = server.getListeningAddress()
   base = `http://127.0.0.1:${addr?.port}${PANEL_PATH_PREFIX}`
+}
 
+async function login(): Promise<void> {
   const res = await fetch(`${base}/api/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', [CSRF_HEADER]: CSRF_HEADER_VALUE },
@@ -110,7 +117,11 @@ async function startServer(): Promise<void> {
 function post(path: string, body: unknown): Promise<Response> {
   return fetch(`${base}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', [CSRF_HEADER]: CSRF_HEADER_VALUE, Cookie: cookie },
+    headers: {
+      'Content-Type': 'application/json',
+      [CSRF_HEADER]: CSRF_HEADER_VALUE,
+      Cookie: cookie
+    },
     body: JSON.stringify(body)
   })
 }
@@ -119,7 +130,7 @@ function get(path: string): Promise<Response> {
   return fetch(`${base}${path}`, { headers: { Cookie: cookie } })
 }
 
-beforeEach(async () => {
+function resetCaseState(): void {
   disk = makeDisk()
   checkedIds = []
   checkCalledIds = []
@@ -128,13 +139,27 @@ beforeEach(async () => {
     success: true,
     tokenFingerprint: 'fp00000000000001',
     region: 'us-east-1',
-    subscription: { type: 'Q_DEVELOPER_STANDALONE_PRO', title: 'KIRO PRO', currentUsage: 1, usageLimit: 50 }
+    subscription: {
+      type: 'Q_DEVELOPER_STANDALONE_PRO',
+      title: 'KIRO PRO',
+      currentUsage: 1,
+      usageLimit: 50
+    }
   })
+}
+
+beforeAll(async () => {
+  resetCaseState()
   await startServer()
 })
 
-afterEach(async () => {
-  while (servers.length > 0) await servers.pop()?.stop()
+beforeEach(async () => {
+  resetCaseState()
+  await login()
+})
+
+afterAll(async () => {
+  await server.stop()
 })
 
 describe('POST /panel/api/accounts · 手机端导入 ksk_', () => {
@@ -175,7 +200,10 @@ describe('POST /panel/api/accounts · 手机端导入 ksk_', () => {
   })
 
   it('重复粘贴同一个 key → 不产生第二条记录', async () => {
-    expect(((await (await post('/api/accounts', { apiKeys: KEY_A })).json()) as { imported: number }).imported).toBe(1)
+    expect(
+      ((await (await post('/api/accounts', { apiKeys: KEY_A })).json()) as { imported: number })
+        .imported
+    ).toBe(1)
 
     const second = (await (await post('/api/accounts', { apiKeys: KEY_A })).json()) as {
       imported: number

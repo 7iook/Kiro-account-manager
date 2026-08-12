@@ -12,13 +12,15 @@
 import { describe, it, expect, afterEach, beforeAll, afterAll, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 
 /**
  * 用真实临时目录当资源根。**不 mock fs** —— 这组用例要证明的正是
  * 「真的从盘上读到了字节、真的按 stat 算了 ETag」,mock fs 会把这些全变成空谈。
  */
+let CASE_ROOT: string
 let ASSET_ROOT: string
+let PROBE_PATH: string
 const JS_NAME = 'index-C_sieKU2.js'
 const CSS_NAME = 'index-DGSNEg0M.css'
 const HTML_MARKER = '<!doctype html><title>panel-shell</title>'
@@ -53,20 +55,41 @@ type RouteDeps = import('../../../src/main/webPanel/routes').PanelRouteDeps
 
 const ADMIN_KEY = 'test-admin-key-0123456789abcdef'
 
-beforeAll(() => {
-  ASSET_ROOT = mkdtempSync(join(tmpdir(), 'kam-panel-assets-'))
+function isStrictChildPath(root: string, candidate: string): boolean {
+  const rel = relative(resolve(root), resolve(candidate))
+  return (
+    rel !== '' &&
+    rel !== '..' &&
+    !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) &&
+    !isAbsolute(rel)
+  )
+}
+
+beforeAll(async () => {
+  CASE_ROOT = mkdtempSync(join(tmpdir(), 'kam-panel-case-'))
+  ASSET_ROOT = join(CASE_ROOT, 'assets-root')
+  PROBE_PATH = join(CASE_ROOT, 'kam-secret-probe.txt')
+
+  // 结构门禁：本文件使用的所有临时路径都必须归属于本次随机根；探针仍在资源根之外。
+  expect(isStrictChildPath(CASE_ROOT, ASSET_ROOT)).toBe(true)
+  expect(isStrictChildPath(CASE_ROOT, PROBE_PATH)).toBe(true)
+  expect(isStrictChildPath(ASSET_ROOT, PROBE_PATH)).toBe(false)
+
+  mkdirSync(ASSET_ROOT, { recursive: true })
   mkdirSync(join(ASSET_ROOT, 'assets'), { recursive: true })
   writeFileSync(join(ASSET_ROOT, 'index.html'), HTML_MARKER, 'utf-8')
   writeFileSync(join(ASSET_ROOT, 'assets', JS_NAME), JS_MARKER, 'utf-8')
   writeFileSync(join(ASSET_ROOT, 'assets', CSS_NAME), 'body{color:red}', 'utf-8')
   // 一个「根目录下的敏感文件」—— 用来证明穿越出资源根真的拿不到它
-  writeFileSync(join(ASSET_ROOT, '..', 'kam-secret-probe.txt'), 'TOP_SECRET_PROBE', 'utf-8')
+  writeFileSync(PROBE_PATH, 'TOP_SECRET_PROBE', 'utf-8')
+  await startServer()
 })
 
-afterAll(() => {
+afterAll(async () => {
+  await sharedServer?.stop().catch(() => undefined)
+  sharedServer = null
   try {
-    rmSync(ASSET_ROOT, { recursive: true, force: true })
-    rmSync(join(ASSET_ROOT, '..', 'kam-secret-probe.txt'), { force: true })
+    rmSync(CASE_ROOT, { recursive: true, force: true })
   } catch {
     /* 临时目录清理失败不该让测试红 */
   }
@@ -88,17 +111,18 @@ function stubRouteDeps(): RouteDeps {
   }
 }
 
-const servers: ServerType[] = []
+let sharedServer: ServerType | null = null
 
 async function startServer(): Promise<ServerType> {
+  if (sharedServer) return sharedServer
   const auth = new PanelAuth({ get: () => ADMIN_KEY, set: () => undefined })
   const server = new WebPanelServer({
     auth,
     routeDeps: stubRouteDeps(),
     getConfig: () => ({ enabled: true, port: 0, host: '127.0.0.1' })
   })
-  servers.push(server)
   await server.start()
+  sharedServer = server
   return server
 }
 
@@ -110,12 +134,6 @@ function base(server: ServerType): string {
 
 afterEach(async () => {
   assetsAvailable = true
-  while (servers.length) {
-    await servers
-      .pop()
-      ?.stop()
-      .catch(() => undefined)
-  }
 })
 
 describe('静态托管 · 生产路径真的接上了(治 E-052 建而未接)', () => {
@@ -214,9 +232,7 @@ describe('静态托管 · 穿越攻击在真实 HTTP 上被拒(不只是纯函�
   it('对照组:同一个探针文件确实存在且可读(否则上面全是假绿)', async () => {
     // 这条治的是「探针文件根本没写成功,所以怎么测都不泄漏」的假绿。
     const { readFileSync } = await import('node:fs')
-    expect(readFileSync(join(ASSET_ROOT, '..', 'kam-secret-probe.txt'), 'utf-8')).toContain(
-      'TOP_SECRET_PROBE'
-    )
+    expect(readFileSync(PROBE_PATH, 'utf-8')).toContain('TOP_SECRET_PROBE')
   })
 })
 
