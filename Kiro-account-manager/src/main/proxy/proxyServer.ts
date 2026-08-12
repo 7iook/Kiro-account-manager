@@ -41,7 +41,7 @@ import {
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
 import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
-import { HoldGate, realClock, type HoldGateRuntimeConfig, type HeldRequestHooks, type HoldReason, type HoldEpisode } from './holdGate'
+import { HoldGate, realClock, type HoldGateRuntimeConfig, type HeldRequestHooks, type HoldReason, type HoldEpisode, type HoldGateEvent } from './holdGate'
 import { normalizeHoldConfig } from './holdConfig'
 import { ensureProxySelfSignedCert, type ProxySelfSignedCert } from './selfSignedCert'
 
@@ -531,7 +531,11 @@ export class ProxyServer {
     this.holdGate = new HoldGate({
       clock: realClock,
       isPoolAvailable: () => this.accountPool.availableCount > 0,
-      config: this.holdRuntimeConfig
+      config: this.holdRuntimeConfig,
+      // 门闸事件 → 日志 + 诊断落盘。装配权在这一层:holdGate 是叶子模块,不认识 logger。
+      // RCA 2026-08-12:此前放行只更新内存计数,proxy-logs.json 里放行事件零条 ——
+      // 用户看到界面「累计放行 14 次」而时间线全是「0 次」,无从判断放行是否真的发生。
+      onEvent: (ev) => this.onHoldGateEvent(ev)
     })
     // 事件即时唤醒:池从全挂→出现可用号时,若开关开 + 允许自动放行,则尝试放行挂起请求。
     // 时间衰减恢复(配额到点)的兜底轮询由 task#3 接线时叠加(方案 §5 A4)。
@@ -540,6 +544,81 @@ export class ProxyServer {
         this.holdGate.tryResume()
       }
     })
+  }
+
+  /**
+   * 门闸事件 → 日志 + 诊断落盘(RCA 2026-08-12)。
+   *
+   * 为什么放行必须留痕:用户在界面看到「累计放行 14 次」,同屏时间线却每轮都写「0 次 /
+   * 尚未放行过」,而 proxy-logs.json 里放行事件**零条** —— 三个数字互相矛盾且都不可核对。
+   * 挂起侧的日志在 RCA 2026-08-04 已补过,自动放行这条后加的路径又重犯同一个错。
+   *
+   * `released=0` 也照记:「周期触发了但无事可放」与「放行了但客户端没收到字节」是
+   * 两个不同的世界,合并显示会让「放行到底有没有用」这个问题永远答不了。
+   */
+  private onHoldGateEvent(ev: HoldGateEvent): void {
+    try {
+      if (ev.kind === 'hold-entered') {
+        // 挂起进入已有 proxyLogger.warn('HoldGate', …) 在决策处记录(含 blockedAccounts),
+        // 这里只补诊断落盘,避免同一事实在 UI 日志里出现两条。
+        if (perfDiag.isEnabled()) {
+          perfDiag.write({
+            kind: 'hold',
+            ts: new Date(ev.at).toISOString(),
+            event: 'entered',
+            holdId: ev.id,
+            reason: ev.reason,
+            detail: ev.detail,
+            heldCount: ev.heldCount
+          })
+        }
+        return
+      }
+      if (ev.kind === 'release') {
+        const what = ev.released > 0
+          ? `放行 ${ev.released} 个挂起请求`
+          : '放行周期触发但无请求可放(已被超时/断开带走)'
+        const msg = `${what} · 触发=${ev.trigger} · 累计自动放行=${ev.autoReleaseCount} · 放行后仍挂起=${ev.heldCountAfter}`
+        proxyLogger.info('HoldGate', msg, {
+          trigger: ev.trigger,
+          released: ev.released,
+          autoReleaseCount: ev.autoReleaseCount,
+          heldCountAfter: ev.heldCountAfter
+        })
+        if (perfDiag.isEnabled()) {
+          perfDiag.write({
+            kind: 'hold',
+            ts: new Date(ev.at).toISOString(),
+            event: 'release',
+            trigger: ev.trigger,
+            released: ev.released,
+            autoReleaseCount: ev.autoReleaseCount,
+            heldCount: ev.heldCountAfter
+          })
+        }
+        return
+      }
+      // episode-ended:一轮挂起收尾。durationMs 是用户最关心的「这次挂了多久」。
+      const mins = (ev.durationMs / 60000).toFixed(1)
+      proxyLogger.info('HoldGate', `一轮挂起结束 · 持续 ${mins} 分钟 · 原因=${ev.reason} · 本轮放行 ${ev.releaseCount} 次`, {
+        reason: ev.reason,
+        durationMs: ev.durationMs,
+        releaseCount: ev.releaseCount,
+        startedAt: new Date(ev.startedAt).toISOString()
+      })
+      if (perfDiag.isEnabled()) {
+        perfDiag.write({
+          kind: 'hold',
+          ts: new Date(ev.at).toISOString(),
+          event: 'episode-ended',
+          reason: ev.reason,
+          durationMs: ev.durationMs,
+          releaseCount: ev.releaseCount
+        })
+      }
+    } catch {
+      /* 观测失败绝不影响放行本身 */
+    }
   }
 
   /** 手动放行所有挂起请求(前端"放行"按钮 → IPC)。@returns 实际放行数(幂等,无挂起时 0)。 */

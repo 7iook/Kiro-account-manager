@@ -72,7 +72,38 @@ export interface PerfRequestRecord {
   error?: string
 }
 
-export type PerfRecord = PerfAttemptRecord | PerfRequestRecord
+/**
+ * 挂起门闸事件(RCA 2026-08-12)。
+ *
+ * 为什么挂起也要进性能诊断:挂起期间**一次上游请求都没发出**,所以 attempt/request
+ * 两类记录都是空的 —— 这类「零上游请求」的故障在诊断日志里完全隐形。而用户实际感受到的
+ * 「卡了两小时」恰恰就是这种。没有它,事后聚合会把挂起时间算成「没有流量」。
+ */
+export interface PerfHoldRecord {
+  kind: 'hold'
+  ts: string
+  event: 'entered' | 'release' | 'episode-ended'
+  /** entered:挂起条目 id */
+  holdId?: number
+  /** entered / episode-ended:挂起原因 */
+  reason?: string
+  /** entered:原因细节(如 `acc: quotaExhausted(12376/10000)`) */
+  detail?: string[]
+  /** release:触发来源(auto / manual / poll / pool-available) */
+  trigger?: string
+  /** release:实际放行条数(0 = 周期触发但无事可放) */
+  released?: number
+  /** release:本实例累计自动放行周期数(与界面「累计放行」同源) */
+  autoReleaseCount?: number
+  /** 当前挂起集合大小 */
+  heldCount?: number
+  /** episode-ended:本轮挂起总时长 ms —— 「这次挂了多久」的权威读数 */
+  durationMs?: number
+  /** episode-ended:本轮放行次数 */
+  releaseCount?: number
+}
+
+export type PerfRecord = PerfAttemptRecord | PerfRequestRecord | PerfHoldRecord
 
 class PerfDiagLogger {
   private enabled = false

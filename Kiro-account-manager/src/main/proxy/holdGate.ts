@@ -66,7 +66,53 @@ export interface HoldGateDeps {
   /** 查询账号池当前是否有可用号(SSOT 出口,tryResume 只依赖它)。 */
   isPoolAvailable: () => boolean
   config: HoldGateRuntimeConfig
+  /**
+   * 可观测事件出口(可选)。装配层注入,把门闸内部动作转成日志/落盘。
+   *
+   * ## 为什么用回调而不在这里 import logger
+   * 门闸是叶子模块(不认识账号池、不认识 logger),保持零外部依赖才能被纯单测驱动。
+   * 装配权归 `ProxyServer`(与 `isPoolAvailable` 同形态)。
+   *
+   * ## 为什么必须有它(RCA 2026-08-12)
+   * 用户截图「累计放行 14 次」而同屏时间线全是「0 次 / 尚未放行过」,且 proxy-logs.json
+   * 里放行事件**零条** —— 放行此前只更新内存计数,外部无从判断「放行有没有发生、有没有用」。
+   * RCA 2026-08-04 已就「holdGate.ts 零日志」补过挂起侧,自动放行这条新路径又重犯。
+   * 观测失败绝不影响主流程(实现里整体 try/catch,同 I1)。
+   */
+  onEvent?: (event: HoldGateEvent) => void
 }
+
+/** 门闸对外事件(供装配层落日志/落盘)。 */
+export type HoldGateEvent =
+  | {
+      kind: 'hold-entered'
+      at: number
+      /** 挂起条目 id */
+      id: number
+      reason: HoldReason
+      detail: string[]
+      /** 本次挂起进入后集合内条目数 */
+      heldCount: number
+    }
+  | {
+      kind: 'release'
+      at: number
+      trigger: HoldRelease['trigger']
+      /** 实际被认领并 resume 的条目数;**0 表示本周期触发了但无事可放** */
+      released: number
+      /** 本实例累计自动放行周期数(与界面「累计放行」同源) */
+      autoReleaseCount: number
+      heldCountAfter: number
+    }
+  | {
+      kind: 'episode-ended'
+      at: number
+      startedAt: number
+      reason: HoldReason
+      /** 本轮内记录到的放行次数(与界面时间线同源) */
+      releaseCount: number
+      durationMs: number
+    }
 
 /** enterHold 入参。receivedAt = 请求 RECEIVED 时刻(绝对 deadline 起算点,跨多次挂起不变)。 */
 export interface EnterHoldParams {
@@ -196,6 +242,17 @@ export class HoldGate {
     this.clock = deps.clock
     this.isPoolAvailable = deps.isPoolAvailable
     this.config = deps.config
+    this.onEvent = deps.onEvent
+  }
+
+  /** 事件出口(可选)。发射失败绝不影响主流程(I1)。 */
+  private onEvent?: (event: HoldGateEvent) => void
+  private emit(event: HoldGateEvent): void {
+    try {
+      this.onEvent?.(event)
+    } catch {
+      /* I1:观测失败不影响主流程 */
+    }
   }
 
   /**
@@ -285,6 +342,14 @@ export class HoldGate {
         this.recentEpisodes.length = MAX_EPISODES
       }
       this.currentEpisode = null
+      this.emit({
+        kind: 'episode-ended',
+        at: ep.endedAt,
+        startedAt: ep.startedAt,
+        reason: ep.reason,
+        releaseCount: ep.releases.length,
+        durationMs: ep.endedAt - ep.startedAt
+      })
     } catch {
       /* I1 */
     }
@@ -293,17 +358,35 @@ export class HoldGate {
   /**
    * 记一次放行动作。**口径 = 周期动作**:一次 releaseAll 放 N 条也只记一条,
    * 与 `autoReleaseCount` 口径一致(否则界面次数会随并发请求数虚高)。
-   * 放行了 0 条时不记 —— 「什么都没放」不构成一次放行事件。
+   *
+   * ## 为什么「放行 0 条」也要记(RCA 2026-08-12 修正)
+   * 旧实现 `if (released <= 0) return` 直接丢弃,而调用方 `releaseAll('auto')` 的上游
+   * 已经 `autoReleaseCount++` 了 ⇒ 界面「累计放行 14 次」与时间线「0 次」同屏矛盾,
+   * 用户无法判断放行是否真的发生。两个数字都对外可见,口径必须统一。
+   *
+   * 而且「触发了但无事可放」本身是有信息量的事实:它说明上一次放行后请求已被别的
+   * 终态(abort/超时)带走,或集合恰好为空 —— 与「放行了但没吐字节」是不同的世界。
+   * 故照记,并用 `released` 字段区分,由消费方决定怎么显示。
    */
   private recordRelease(trigger: HoldRelease['trigger'], released: number): void {
     try {
-      if (released <= 0) return
       const ep = this.currentEpisode
-      if (!ep) return
-      ep.releases.push({ at: this.clock.now(), trigger, outcome: 'pending', outcomeAt: null })
-      if (ep.releases.length > MAX_RELEASES_PER_EPISODE) {
-        ep.releases.splice(0, ep.releases.length - MAX_RELEASES_PER_EPISODE)
+      if (ep) {
+        ep.releases.push({ at: this.clock.now(), trigger, outcome: 'pending', outcomeAt: null })
+        if (ep.releases.length > MAX_RELEASES_PER_EPISODE) {
+          ep.releases.splice(0, ep.releases.length - MAX_RELEASES_PER_EPISODE)
+        }
       }
+      // 事件出口独立于 episode 是否存在:放行动作本身发生了就该可见,
+      // 不能因为「恰好没有进行中的 episode」而在日志里也消失(那正是旧缺陷的形态)。
+      this.emit({
+        kind: 'release',
+        at: this.clock.now(),
+        trigger,
+        released,
+        autoReleaseCount: this.autoReleaseCount,
+        heldCountAfter: this.held.size
+      })
     } catch {
       /* I1 */
     }
@@ -479,6 +562,14 @@ export class HoldGate {
     this.startPollingIfNeeded()
     // 同上,自动放行调度器也在集合首次非空时起表(开关关闭时内部直接 return)。
     this.startAutoReleaseIfNeeded()
+    this.emit({
+      kind: 'hold-entered',
+      at: this.clock.now(),
+      id,
+      reason: params.reason ?? 'pool-empty',
+      detail: params.detail ?? [],
+      heldCount: this.held.size
+    })
     return id
   }
 
