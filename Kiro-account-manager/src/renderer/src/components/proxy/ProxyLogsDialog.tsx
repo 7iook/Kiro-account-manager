@@ -5,7 +5,10 @@ import { Button, Card, CardContent, CardHeader, CardTitle, Badge } from '../ui'
 interface LogEntry {
   time: string
   path: string
+  /** 实际发往上游、真正计费的 canonical modelId(已过 mapModelId 归一) */
   model?: string
+  /** 客户端原始请求名。仅当归一改变了名字时出现(如客户端传 gpt-4o → 实际 gpt-5.6-sol) */
+  requestedModel?: string
   status: number
   tokens?: number
   inputTokens?: number
@@ -146,7 +149,19 @@ export function ProxyLogsDialog({
                     <tr key={idx} className="border-b border-muted/30 hover:bg-muted/30">
                       <td className="p-2 text-muted-foreground whitespace-nowrap">{log.time}</td>
                       <td className="p-2 truncate max-w-[200px]" title={log.path}>{log.path}</td>
-                      <td className="p-2 truncate max-w-[150px] text-muted-foreground" title={log.model}>{log.model ? log.model.replace('anthropic.', '').replace('-v1:0', '') : '-'}</td>
+                      {/* 模型列显示「实际发往上游、真正被计费的那一档」。
+                          客户端传的名字若被归一改写过(如 gpt-4o / 裸名 gpt-5.6 → gpt-5.6-sol),
+                          在下方以 ← 原始名 附注,既让用户看清计费档位,又保留排障可追溯性。 */}
+                      <td className="p-2 truncate max-w-[190px] text-muted-foreground" title={log.requestedModel ? `${isEn ? 'actual' : '实际'}: ${log.model}\n${isEn ? 'requested' : '客户端请求'}: ${log.requestedModel}` : log.model}>
+                        {log.model ? (
+                          <div className="flex flex-col leading-tight">
+                            <span>{log.model.replace('anthropic.', '').replace('-v1:0', '')}</span>
+                            {log.requestedModel && (
+                              <span className="text-[10px] text-muted-foreground/60 truncate">← {log.requestedModel}</span>
+                            )}
+                          </div>
+                        ) : '-'}
+                      </td>
                       <td className="p-2 text-center relative">
                         {log.status >= 400 && log.error ? (
                           <div className="relative inline-block">

@@ -22,6 +22,7 @@ import type {
 import { AccountPool, ErrorType, classifyError, extractHttpStatusCode } from './accountPool'
 import { SmoothWeightedRoundRobin } from '../utils/smoothWeightedRoundRobin'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, createUpstreamAttemptCounter, sampleTailShape, type KiroModel } from './kiroApi'
+import { resolveLoggedModel } from './modelLogLabel'
 import { proxyLogger } from './logger'
 import { perfDiag } from './perfDiag'
 import { classifyNoAccountHold, type NoAccountHoldDecision } from './holdDecision'
@@ -75,7 +76,7 @@ export interface ProxyServerEvents {
    * - `accountId`: 归因到账号 —— 实测同区域账号 429 率落差 5.4%↔75%。
    * 全部 optional:未接线的 onResponse 调用点行为不变。
    */
-  onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string; ttft?: number; upstream429?: number; upstreamAttempts?: number; accountId?: string }) => void
+  onResponse?: (info: { path: string; model?: string; requestedModel?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string; ttft?: number; upstream429?: number; upstreamAttempts?: number; accountId?: string }) => void
   onError?: (error: Error) => void
   onConfigChanged?: (config: ProxyConfig) => void  // API Key 用量更新时触发
   onStatusChange?: (running: boolean, port: number) => void
@@ -523,7 +524,23 @@ export class ProxyServer {
       outputTokens: 0,
       startTime: 0
     }
-    this.events = events
+    // 日志模型标签统一收口:把 onResponse 包一层,把「客户端原始名」解析成
+    // 「实际发往上游的 canonical id + 原始名」。
+    //
+    // 为什么在这里包装,而不是逐个改 20 个 onResponse 调用点:那 20 处散落在
+    // chat / responses / messages 三条入口的成功与各类失败分支里,逐行改必然漏一两处
+    // (E-060 改 A 漏传播),且未来新增入口还要再记得改一次。这里包一层则是单点收口——
+    // 所有现存与未来的调用点自动获得该能力,调用点一行都不用动。
+    this.events = {
+      ...events,
+      ...(events.onResponse
+        ? {
+            onResponse: (info: Parameters<NonNullable<ProxyServerEvents['onResponse']>>[0]) =>
+              events.onResponse?.({ ...info, ...resolveLoggedModel(info.model) })
+          }
+        : {})
+    }
+
 
     // 挂起门闸实例化(基础设施):注入真实时钟 + 池可用性查询 + 归一化后的 hold 配置。
     // holdRuntimeConfig 是持久引用对象,updateConfig 时 Object.assign 原地更新其字段;
@@ -5369,10 +5386,15 @@ export class ProxyServer {
     success: boolean
     error?: string
   }): void {
+    // 与 onResponse 同一收口姿势:把客户端原始名解析成实际发往上游的 canonical id。
+    // 日志里显示「真正被计费的那一档」是本字段的全部意义(Sol 2.4x 与 Luna 0.1x 差 24 倍,
+    // 若只记客户端传的裸名 `gpt-5.6`,用户无从判断额度是怎么烧掉的)。
+    const resolvedModel = resolveLoggedModel(log.model)
     this.stats.recentRequests.push({
       timestamp: Date.now(),
       path: log.path,
-      model: log.model || 'unknown',
+      model: resolvedModel.model,
+      ...(resolvedModel.requestedModel ? { requestedModel: resolvedModel.requestedModel } : {}),
       accountId: log.accountId || 'unknown',
       inputTokens: log.inputTokens || 0,
       outputTokens: log.outputTokens || 0,

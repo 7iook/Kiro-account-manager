@@ -131,7 +131,7 @@ interface ProxyConfig {
 }
 
 // 反代请求日志：模块级持久化 + 单次订阅，避免切到其它页面 unmount 后日志清空、中间请求事件丢失
-type RecentLogEntry = { time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string; ttft?: number; upstream429?: number; upstreamAttempts?: number; accountId?: string }
+type RecentLogEntry = { time: string; path: string; model?: string; requestedModel?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string; ttft?: number; upstream429?: number; upstreamAttempts?: number; accountId?: string }
 let _proxyRecentLogs: RecentLogEntry[] = []
 let _refSetProxyRecentLogs: ((v: RecentLogEntry[]) => void) | null = null
 let _proxyResponseListenerRegistered = false
@@ -152,6 +152,7 @@ function ensureProxyResponseListenerRegistered(): void {
       time: fullTime,
       path: info.path,
       model: info.model,
+      requestedModel: info.requestedModel,
       status: info.status,
       tokens: info.tokens,
       inputTokens: info.inputTokens,

@@ -782,7 +782,10 @@ export interface ModelStats {
 export interface RequestLog {
   timestamp: number
   path: string
+  /** 实际发往上游、真正计费的 canonical modelId(已过 mapModelId 归一) */
   model: string
+  /** 客户端原始请求名。仅当归一改变了名字时出现(如客户端传 gpt-4o → 实际 gpt-5.6-sol) */
+  requestedModel?: string
   accountId: string
   inputTokens: number
   outputTokens: number
