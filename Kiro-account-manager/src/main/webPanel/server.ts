@@ -64,6 +64,13 @@ export interface WebPanelServerOptions {
   routeDeps: PanelRouteDeps
   /** 实时读配置（用户可在运行期改端口/主机，读时取最新值） */
   getConfig: () => WebPanelConfig
+  /**
+   * 业务就绪判据。服务端注入「反代正在实际监听」；桌面端未注入时保持未就绪。
+   *
+   * readiness 与面板进程的 liveness 刻意分离：面板活着只说明还能运维，
+   * 不代表数据面能接请求。
+   */
+  isReady?: () => boolean
   /** 状态变化回调（供设置页显示真实启动结果 —— 决策卡 §5 场景 S3） */
   onStatusChange?: (running: boolean, port: number) => void
   onError?: (error: Error) => void
@@ -76,6 +83,7 @@ export class WebPanelServer {
   private readonly auth: PanelAuth
   private readonly routeDeps: PanelRouteDeps
   private readonly getConfig: () => WebPanelConfig
+  private readinessProbe: () => boolean
   private readonly onStatusChange?: (running: boolean, port: number) => void
   private readonly onError?: (error: Error) => void
 
@@ -83,12 +91,23 @@ export class WebPanelServer {
     this.auth = options.auth
     this.routeDeps = options.routeDeps
     this.getConfig = options.getConfig
+    this.readinessProbe = options.isReady ?? (() => false)
     this.onStatusChange = options.onStatusChange
     this.onError = options.onError
   }
 
   isRunning(): boolean {
     return this.server !== null
+  }
+
+  /** 服务端装配完成后注入动态 readiness 判据（每次探测都读真实运行态，不缓存）。 */
+  setReadinessProbe(probe: () => boolean): void {
+    this.readinessProbe = probe
+  }
+
+  /** 当前业务面是否可服务；与面板 HTTP 监听态无关。 */
+  isReady(): boolean {
+    return this.readinessProbe()
   }
 
   /**
@@ -267,6 +286,18 @@ export class WebPanelServer {
       const path = pathOnly.slice(PANEL_PATH_PREFIX.length) || '/'
       const method = (req.method ?? 'GET').toUpperCase()
 
+      // ===== 匿名 readiness（前置反代必须能直接轮询）=====
+      //
+      // 只返回一个布尔结论，不返回端口、账号数、错误原因等业务信息。详细状态仍走
+      // 已鉴权的 `/api/proxy/status`。因此匿名探测不会给攻击者增加有用情报，
+      // 却避免给 Caddy/nginx 配置面板会话与 CSRF 这种不稳定、无意义的凭据流程。
+      if (path === '/readyz' && method === 'GET') {
+        const ready = this.isReady()
+        res.setHeader('Cache-Control', 'no-store')
+        sendJson(res, ready ? 200 : 503, { status: ready ? 'ready' : 'not_ready' })
+        return
+      }
+
       // ===== 静态资源（在鉴权闸门**之前**）=====
       // 顺序理由：登录页本身就是这个 shell。若放在闸门之后，就成了
       // 「必须先登录才能拿到登录页」—— 死锁。鉴权决策的完整论证见
@@ -332,6 +363,21 @@ export class WebPanelServer {
       // ===== 面板自身状态（供 web UI 显示） =====
       if (path === '/api/session' && method === 'GET') {
         sendJson(res, 200, { ok: true, authenticated: true })
+        return
+      }
+
+      // ===== 管理员密钥轮换（已通过会话 + CSRF 闸门）=====
+      if (path === '/api/admin-key/rotate' && method === 'POST') {
+        // rotateAdminKey 的顺序是「先持久化，成功后再失效全部会话」：
+        // 写盘失败会抛到统一 500 出口，旧密钥与旧会话继续有效，不会把运维锁在门外。
+        const next = this.auth.rotateAdminKey()
+        // 当前会话也已失效；同时清浏览器 cookie，避免客户端继续携带一个确定无效的 sid。
+        const { setCookie } = this.auth.logout(req)
+        res.setHeader('Set-Cookie', setCookie)
+        res.setHeader('Cache-Control', 'no-store')
+        // 不叫 `adminKey`：sendJson 的安全兜底会按敏感键名遮盖它。`key` 是这个
+        // 明确的一次性交付端点的受控豁免；响应体不写 console，调用方展示一次后丢弃。
+        sendJson(res, 200, { key: next })
         return
       }
 

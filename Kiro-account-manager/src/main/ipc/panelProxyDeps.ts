@@ -61,6 +61,13 @@ export interface ProxyServerRef {
   releaseHeldRequests: () => number
 }
 
+/** 反代池同步实际消费的 `accountData` 最小持久化形状。 */
+export interface StoredProxyAccountData {
+  accounts?: Record<string, unknown>
+  accountProxyBindings?: Record<string, string>
+  proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
+}
+
 export interface PanelProxyDepsImpl {
   /**
    * 取已初始化的反代实例；未初始化返回 null。
@@ -72,11 +79,7 @@ export interface PanelProxyDepsImpl {
   /** 惰性初始化并返回实例（仅启动路径用） */
   initProxyServer: () => ProxyServerRef
   /** 从盘上读 `accountData`（账号表 + 出口代理绑定） */
-  loadAccountData: () => {
-    accounts?: Record<string, unknown>
-    accountProxyBindings?: Record<string, string>
-    proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
-  } | undefined
+  loadAccountData: () => StoredProxyAccountData | undefined
   /** 把当前配置写回 store（对齐 `proxy-update-config` 的持久化行为） */
   persistProxyConfig: (config: ProxyConfig) => void
   /** 托盘菜单状态刷新（桌面端启停后会做，面板启停也要做，否则托盘显示与实际不符） */
@@ -175,18 +178,66 @@ function makeActivationHost(impl: PanelProxyDepsImpl, server: ProxyServerRef): P
 }
 
 /**
- * 同步整池：按盘上账号重建（对齐 `proxy-sync-accounts` 的语义）
+ * 同步整池的结果 —— 两个数字，因为「池是空的」有**两种**成因且处置不同。
+ *
+ * 调用方要能区分：
+ *   - `recordCount === 0` → 盘上压根没有账号（服务端首次部署的常态：先起服务、后拷数据文件）
+ *   - `recordCount > 0 && poolSize === 0` → 有账号但**全部**没通过池准入（真故障；
+ *     逐个原因已由 {@link logPoolAdmissionSkips} 点名）
+ *
+ * 只回 `poolSize` 会让这两种坍缩成一种，而它们要求的运维动作相反
+ * （「去拷数据」vs「去查这些号为什么不准入」）。
+ */
+export interface ProxyPoolSyncResult {
+  /** 盘上 `accountData.accounts` 的记录条数（准入过滤**之前**） */
+  recordCount: number
+  /** `replaceAll` 之后池内实际成员数 */
+  poolSize: number
+}
+
+/**
+ * 同步整池：按盘上账号重建。桌面面板与服务端自启动共用这一同步原语。
+ *
+ * 「同步后再启动」的调用顺序刻意分别写在 `proxyStart` 与 `server/entry.ts`：
+ * 两端的空池策略不同，面板拒启而无人值守的服务端保留懒补自愈。架构测试分别
+ * 锁住两处顺序，并用发现式门禁阻止新的启动路径未经归类就加入。
  *
  * 走 `replaceAll` 而非 `clear()` + `addAccount()`：后者清空后再逐个加，
  * 运行期状态（真实额度 / 402 耗尽标记 / 风控挂起 / 断路器计数）会在
  * 清空那一步全部消失 —— 用户点一次「同步池」就把已耗尽的号放回轮询。
+ *
+ * **两端共用的只是「同步 + 诊断读数」，不包括空池怎么处置** —— 那件事两端刻意不同：
+ * 面板前有人看着屏幕，拒启并回 `EMPTY_POOL` 让他当场改；服务端自启动发生在开机时、
+ * 无人在场，拒启只会把一个能自愈的场景（`onPoolEmpty` 懒加载补池）变成必须人工干预。
+ * 故处置留给各自的调用方，本函数只如实回报。
+ *
+ * @param loadAccountData 从盘上现读 `accountData`（每次现读 —— 不接受调用方快照）
+ * @param source 水合入口标识（`panel-sync` / `server-autostart`），进准入日志便于定位是哪条路
+ */
+export function syncProxyPoolFromStore(
+  loadAccountData: PanelProxyDepsImpl['loadAccountData'],
+  server: Pick<ProxyServerRef, 'getAccountPool'>,
+  source: string
+): ProxyPoolSyncResult {
+  const data = loadAccountData()
+  const records = data?.accounts
+  const accounts = buildProxyAccountsFromStore(records, bindingContext(data), (skipped) =>
+    logPoolAdmissionSkips(skipped, source)
+  )
+  return {
+    recordCount: records ? Object.keys(records).length : 0,
+    poolSize: server.getAccountPool().replaceAll(accounts)
+  }
+}
+
+/**
+ * 面板路径的同步整池（对齐 `proxy-sync-accounts` 的语义）。
+ *
+ * 薄封装 {@link syncProxyPoolFromStore} —— 面板只关心池大小；
+ * 「盘上有几条记录」这个诊断读数是服务端启动播报要用的。
  */
 function syncPool(impl: PanelProxyDepsImpl, server: ProxyServerRef): number {
-  const data = impl.loadAccountData()
-  const accounts = buildProxyAccountsFromStore(data?.accounts, bindingContext(data), (skipped) =>
-    logPoolAdmissionSkips(skipped, 'panel-sync')
-  )
-  return server.getAccountPool().replaceAll(accounts)
+  return syncProxyPoolFromStore(impl.loadAccountData, server, 'panel-sync').poolSize
 }
 
 /**
@@ -297,7 +348,7 @@ export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): {
       try {
         const server = impl.initProxyServer()
         // 顺序承重：**先同步池，再启动**。颠倒或漏掉同步会用空池启动 ——
-        // 反代起来了、状态显示正常、但每个外部请求都失败，且所有指示灯都是绿的。
+        // 反代起来了、状态显示正常、但没有账号可服务，且所有指示灯都是绿的。
         const poolSize = syncPool(impl, server)
         if (poolSize === 0) {
           // 空池启动是负条件。宁可拒绝启动，也不让用户面对"看起来正常但全失败"。

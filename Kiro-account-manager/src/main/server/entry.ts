@@ -23,8 +23,19 @@
  *   5. **起面板** —— 先于反代。面板是唯一的管理入口：反代起不来时运维**需要**
  *      面板还活着才能去查原因、改配置。顺序反了就成了「反代挂 → 面板也没起 →
  *      只能 SSH」，而「不用碰服务器」正是本项目的原始需求。
- *   6. **起反代**（按 `enabled && autoStart`）—— 失败**不致命**：面板已经在跑，
+ *   6. **起反代**（按 `enabled && autoStart`）—— **先同步池，再 `start()`**，顺序不可颠倒
+ *      （漏掉同步 = 空池启动：反代在监听、面板显示运行中，但没有账号可服务）。
+ *      池同步走与面板 `/start` 共用的 `syncProxyPoolFromStore` 原语；启动顺序在两端
+ *      刻意各写一次，因为空池策略不同。两条架构顺序断言和启动点发现门禁负责防漂移。
+ *      失败**不致命**：面板已经在跑，
  *      运维可以从手机上看到失败原因并重试。这是刻意的不对称。
+ *
+ *      与面板刻意不同的一点：**空池不拒绝启动**。面板前有人看着屏幕，故它回
+ *      `EMPTY_POOL` 让他当场改；服务端自启动发生在开机时、无人在场，拒启只会把
+ *      一个能自愈的场景（`onPoolEmpty` 懒加载补池，且 conf 每次 get 都现读盘 ⇒
+ *      稍后拷进来的数据文件能被读到）变成必须人工上面板点启动。取而代之：
+ *      **如实播报**，且区分「盘上还没有账号」（首启常态）与「有账号但全不准入」
+ *      （真故障）—— 两者要求的运维动作相反。
  *   7. **装信号处理器** —— 最后。装早了会在启动失败的退出路径上被自己的
  *      handler 拦住。
  *
@@ -32,9 +43,9 @@
  *
  *   - **单实例锁**：决策卡已裁决「服务器上只有一个进程 → 不需要任何锁」。
  *     且 Electron 的 `requestSingleInstanceLock` 在纯 Node 下不存在，不得照搬。
- *   - **存活探针 HTTP 端点**：决策卡 DC14 定的本轮范围是「存活 + 进程托管」，
- *     而**面板本身就是存活信号** —— systemd / Docker 可以直接探面板端口。
- *     再加一个 `/healthz` 就是第二个「进程还活着」的真源，且没有额外消费者。
+ *   - **liveness 仍是进程 / 面板端口**：systemd 以进程存活为准，容器可做 TCP 探测。
+ *     但这不再兼任 readiness：前置反代 / 容器 healthcheck 应探
+ *     `/panel/readyz`，它仅在数据面反代实际监听时返回 200；面板独活时返回 503。
  *   - **TLS**：决策卡 DC9 已定服务内不做终止，由前置反代（Caddy / nginx）负责。
  */
 import {
@@ -45,11 +56,13 @@ import {
   readServerConfig
 } from './config'
 import { assembleServer, readPanelConfig, readProxyConfig, shouldAutoStartProxy } from './assembly'
+import { syncProxyPoolFromStore } from '../ipc/panelProxyDeps'
 import { createServerAdminKeyStore } from './adminKeyStore'
 import { createServerPersistenceHooks } from './persistence'
 import { createServerAccountApi } from './accountApi'
 import type { AssembledServer } from './assembly'
 import type { AccountStorePort } from '../persistence/accountStorePort'
+import type { StoredProxyAccountData } from '../ipc/panelProxyDeps'
 
 /**
  * 启动。**不自己调 `process.exit`** —— 退出决策留给 `main()`。
@@ -100,6 +113,9 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<A
     persistence: createServerPersistenceHooks()
   })
   assembled = server
+  // readiness 必须读**反代真实句柄**，不能读 enabled/autoStart 这种期望配置。
+  // 面板先于反代启动，所以注入动态 probe：后续从面板手动启动成功后会立即转为 ready。
+  server.panel.setReadinessProbe(() => server.getProxyServer()?.isRunning() === true)
 
   // ⑤ 面板（先于反代 —— 它是唯一的管理入口，见文件头启动顺序）
   const panelConfig = readPanelConfig(server.store, config)
@@ -122,15 +138,58 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<A
   if (shouldAutoStartProxy(proxyConfig)) {
     try {
       const proxy = server.initProxyServer()
+
+      // 顺序承重：**先同步池，再启动**。两端共用同步原语，但顺序各自显式编排：
+      // 面板空池拒启，服务端空池仍启动以保留 onPoolEmpty 懒补。架构门禁分别锁住
+      // 两处顺序，并发现未经归类的新启动点。
+      const { recordCount, poolSize } = syncProxyPoolFromStore(
+        () => server.store.get('accountData') as StoredProxyAccountData | undefined,
+        proxy,
+        'server-autostart'
+      )
+
       await proxy.start()
-      console.log(`[server] 反代已启动: ${proxyConfig.host}:${proxyConfig.port}`)
+
+      // 播报**带上池大小**。只说「反代已启动」是这个缺陷最贵的部分：
+      // 运维在第一个请求到来之前无法判断池是不是空的，所有指示灯都是绿的。
+      if (poolSize > 0) {
+        console.log(
+          `[server] 反代已启动: ${proxyConfig.host}:${proxyConfig.port}（池 ${poolSize} 个账号）`
+        )
+      } else if (recordCount === 0) {
+        // 合法首启态：机主的迁移动作是「先起服务，再把 kiro-accounts.json 拷进来」。
+        // 刻意**不**拒绝启动 —— 拒启会连带关掉 `onPoolEmpty` 懒加载补池那条自愈路
+        // （`assembly.ts:buildProxyEvents` 已接，且 conf 每次 get 都现读盘），
+        // 把一个能自愈的场景变成必须人工上面板点启动。
+        console.log(`[server] 反代已启动: ${proxyConfig.host}:${proxyConfig.port}`)
+        console.warn(
+          `[server] ⚠️ 空池启动：数据文件里还没有任何账号（首次部署的常态）。\n` +
+            `[server]    把桌面端的 kiro-accounts.json 拷进 ${config.dataDir} 后，\n` +
+            `[server]    反代会在下一个请求到来时自动补池，**不需要重启**。`
+        )
+      } else {
+        // 与上一支的区别是承重的：这里盘上**有**账号，是真故障而非首启态，
+        // 运维要做的事完全不同（去查这些号为什么不准入，而不是去拷数据）。
+        // 逐个原因已由 `logPoolAdmissionSkips` 以 [PoolAdmission] 打在上一行。
+        console.log(`[server] 反代已启动: ${proxyConfig.host}:${proxyConfig.port}`)
+        console.warn(
+          `[server] 🔴 空池启动：盘上有 ${recordCount} 个账号，但全部未通过池准入 —— \n` +
+            `[server]    当前没有可服务账号；请求会按 HoldGate 配置挂起等待账号或立即失败。\n` +
+            `[server]    逐个原因见上一行 [PoolAdmission]（无凭据 / 已被上游拒绝）。\n` +
+            `[server]    常见处置：在桌面端或面板上重新测活这些账号，或补齐凭据。`
+        )
+      }
     } catch (e) {
       // 刻意不致命：面板已经在跑，运维能从手机上看到失败原因并重试。
       // 崩在这里反而会连管理入口一起带走 —— 那时他只剩 SSH，
       // 而「不用碰服务器」正是本项目要消除的东西。
       console.error(
-        `[server] ⚠️ 反代自动启动失败: ${messageOf(e)}\n` +
-          `[server]    面板仍在运行，可从面板查看原因并手动启动（常见：端口被占 / 空池）。`
+        `\n${'!'.repeat(72)}\n` +
+          `[server] 🔴 DEGRADED：反代自动启动失败，当前**仅管理面板可用**。\n` +
+          `[server]    readiness /panel/readyz 将返回 503，业务流量不得导入。\n` +
+          `[server]    原因: ${messageOf(e)}\n` +
+          `[server]    面板仍在运行，可从面板查看原因并手动启动（常见：端口被占）。\n` +
+          `${'!'.repeat(72)}\n`
       )
     }
   } else {
@@ -243,11 +302,17 @@ export async function main(): Promise<void> {
   }
 
   const address = server.panelAddress()
-  console.log(
-    `[server] 就绪。面板: http://${readPanelConfig(server.store, readServerConfig()).host}:${
-      address?.port ?? '?'
-    }/panel`
-  )
+  const panelUrl = `http://${readPanelConfig(server.store, readServerConfig()).host}:${
+    address?.port ?? '?'
+  }/panel`
+  if (server.panel.isReady()) {
+    console.log(`[server] 就绪：反代正在监听。管理面板: ${panelUrl}`)
+  } else {
+    console.warn(
+      `[server] 🔴 降级运行：仅管理面板可用，反代未监听；readiness 返回 503。\n` +
+        `[server]    管理面板: ${panelUrl}`
+    )
+  }
 
   await installShutdownHandlers(server)
   process.exit(EXIT.OK)

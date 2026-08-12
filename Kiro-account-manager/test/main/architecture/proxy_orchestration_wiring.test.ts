@@ -11,8 +11,8 @@
  * `proxy/activation.ts`。若 `webPanel/` 或面板 UI 里出现同样的三步，两处早晚
  * 分叉，而分叉的表现是「面板绿灯但反代打旧号」—— 已实证过一次的那个失效。
  */
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { readFileSync, readdirSync } from 'node:fs'
+import { resolve, join, relative } from 'node:path'
 import { describe, it, expect } from 'vitest'
 
 const REPO_ROOT = resolve(__dirname, '../../..')
@@ -24,6 +24,31 @@ function read(rel: string): string {
 /** 去掉行注释与块注释，避免「注释里提到了」被当成真实调用 */
 function stripComments(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
+/**
+ * 统计同一源码片段内由 `initProxyServer()` 取得的反代实例启动次数。
+ *
+ * 单独命名是为了让下面的受控样本能直接证伪扫描器；否则「全仓扫到 0 个」
+ * 无法区分仓库确实没有启动点，还是扫描器已经失明。
+ */
+function countProxyStartCalls(src: string): number {
+  const receivers = new Set<string>()
+  const binding =
+    /\b([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?(?:[A-Za-z_$][\w$]*\s*\.\s*)?initProxyServer\s*\(\s*\)/g
+  let match: RegExpExecArray | null
+  while ((match = binding.exec(src)) !== null) receivers.add(match[1])
+
+  let count = 0
+  for (const receiver of receivers) {
+    const escaped = receiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const call = new RegExp(
+      `\\b${escaped}\\s*(?:(?:\\?\\.|\\.)\\s*start|(?:\\?\\.)?\\s*\\[\\s*(['"])start\\1\\s*\\])\\s*\\(\\s*\\)`,
+      'g'
+    )
+    count += (src.match(call) ?? []).length
+  }
+  return count
 }
 
 describe('装配闭环: 面板反代端点在生产路径上确有调用者', () => {
@@ -120,13 +145,195 @@ describe('顺序单一真源: 三步编排不得在面板侧重现', () => {
     const stopIdx = src.indexOf('proxyStop: async', startIdx)
     expect(stopIdx, 'proxyStop 实现体不存在,无法界定 proxyStart 的范围').toBeGreaterThan(startIdx)
     const block = src.slice(startIdx, stopIdx)
-    const syncIdx = block.indexOf('syncPool(')
+    // 同步这一步允许两种写法:薄封装 `syncPool(` 或直接调导出的
+    // `syncProxyPoolFromStore(`(服务端入口用的正是后者)。只认死一个名字时,
+    // 一次纯改名重构会让本闸门给出"没有同步池"的假失败 —— 承重的判据是**顺序**,不是名字。
+    const syncCall = /\b(syncPool|syncProxyPoolFromStore)\s*\(/.exec(block)
+    // 匹配到的名字必须在本文件里真有定义或导入。否则闸门是在拿一个全仓已不存在的
+    // 名字自说自话 —— 本仓已实证过两次"匹配不到东西的闸门"(零结果与不存在不可区分)。
+    if (syncCall) {
+      const syncName = syncCall[1]
+      expect(
+        new RegExp(`(?:function|const)\\s+${syncName}\\b|import[^\\n]*\\b${syncName}\\b`).test(src),
+        `${syncName} 在 panelProxyDeps.ts 里既无定义也无导入 —— 闸门匹配的是个不存在的名字`
+      ).toBe(true)
+    }
+    const syncIdx = syncCall ? syncCall.index : -1
     const startCallIdx = block.indexOf('server.start()')
     expect(syncIdx, '启动路径没有同步池 —— 会用空池启动').toBeGreaterThan(-1)
     expect(startCallIdx, '启动路径没有真的调 start()').toBeGreaterThan(-1)
     expect(syncIdx, '同步池必须在 start() 之前').toBeLessThan(startCallIdx)
     // 空池必须拒绝启动，而不是启动成功后每个请求都失败
     expect(block).toMatch(/EMPTY_POOL/)
+  })
+
+  /**
+   * 服务端入口的同一条顺序 —— 本组是「按文件手列」这个形状漏掉的那一格
+   *
+   * 上一条 `it` 只读 `panelProxyDeps.ts`。服务端入口 `server/entry.ts` 当初写成
+   * `initProxyServer()` → `start()`（中间没有同步池）时，上一条**照样全绿** ——
+   * 闸门的作用域就是它读的那个文件，而缺陷在另一个文件里。这正是本仓反复出现的
+   * 形状：判据只覆盖了一条路，另一条路静默分叉。故这里补上服务端那一格，
+   * 并在下一个 describe 里加一条「出现新起点就红」的发现式判据，
+   * 让手列的名单不能再悄悄过期。
+   */
+  it('server/entry.ts 的自启动分支先同步池再启动（顺序颠倒 = 空池启动）', () => {
+    const src = stripComments(read('src/main/server/entry.ts'))
+    // 作用域限定在**自启动分支**内，而不是整个文件：
+    // 文件里另有 `server.panel.start()`（面板，⑤ 先于反代），从全文件切片会把它
+    // 也算进来，于是「同步在 start 之前」这句断言就变成了在比对面板启动的位置。
+    const branchIdx = src.indexOf('if (shouldAutoStartProxy(')
+    expect(branchIdx, '自启动分支不存在 —— 服务端不再按盘上配置起反代了?').toBeGreaterThan(-1)
+    // 下界锚在紧随其后的顶层函数声明上（`bootstrap` 之后的第一个 function），
+    // 不用固定字符数窗口：窗口大小会随文案增删而失效，而失效的方向是**变绿**。
+    const tail = src.slice(branchIdx)
+    const endMatch = /\n(?:export\s+)?function\s/.exec(tail)
+    expect(endMatch, '自启动分支之后找不到下一个顶层函数,无法界定分支范围').not.toBeNull()
+    const block = tail.slice(0, endMatch!.index)
+
+    const syncIdx = block.indexOf('syncProxyPoolFromStore(')
+    const startCallIdx = block.indexOf('proxy.start()')
+    expect(syncIdx, '服务端自启动没有同步池 —— 会用空池启动(反代在监听/面板显示运行中/没有账号可服务)').toBeGreaterThan(-1)
+    expect(startCallIdx, '服务端自启动没有真的调 proxy.start()').toBeGreaterThan(-1)
+    expect(syncIdx, '同步池必须在 proxy.start() 之前').toBeLessThan(startCallIdx)
+    // 同步必须走共用实现,不得在服务端重写一份顺序(第二个真源 = 两处早晚分叉)
+    expect(
+      src,
+      "server/entry.ts 未从 ipc/panelProxyDeps 导入 syncProxyPoolFromStore —— 顺序不得有第二份实现"
+    ).toMatch(/import\s*\{[^}]*syncProxyPoolFromStore[^}]*\}\s*from\s*'\.\.\/ipc\/panelProxyDeps'/)
+
+    // **刻意不要求 `EMPTY_POOL`** —— 两端在「空池怎么处置」上是刻意分叉的:
+    // 面板前有人看着屏幕,故拒启并回 EMPTY_POOL 让他当场改;服务端自启动发生在
+    // 开机时、无人在场,拒启会连带关掉 `onPoolEmpty` 懒加载补池那条自愈路
+    // (assembly.ts:701 已接),把「先起服务、后拷 kiro-accounts.json」这个合法首启
+    // 场景变成必须人工上面板点启动。
+    expect(
+      block,
+      'server/entry.ts 不应照搬面板的 EMPTY_POOL 拒启(会关掉 onPoolEmpty 自愈路)'
+    ).not.toMatch(/EMPTY_POOL/)
+
+    // 取而代之的负条件:**不得打印一条会让人以为一切正常的日志**。
+    // 缺陷最贵的部分不是空池本身,而是启动播报里没有池大小 —— 运维在第一个请求
+    // 到来之前无法判断池是不是空的,所有指示灯都是绿的。
+    expect(
+      block,
+      '启动播报未使用 poolSize —— 只说"反代已启动"就是那个全绿的假信号'
+    ).toMatch(/poolSize/)
+    // 三态必须真的分叉:池>0 / 盘上零账号 / 有账号但全不准入。
+    // 后两者要求的运维动作相反(去拷数据 vs 去查为什么不准入),合并成一条就等于没区分。
+    expect(
+      block,
+      '未区分「盘上还没有账号」与「有账号但全不准入」—— 两者要求的运维动作相反'
+    ).toMatch(/recordCount\s*===\s*0/)
+    const warnCount = (block.match(/console\.warn\s*\(/g) ?? []).length
+    expect(
+      warnCount,
+      `空池两态各需一条告警,实际 ${warnCount} 条 —— 少一条就有一态被静默`
+    ).toBeGreaterThanOrEqual(2)
+  })
+})
+
+/**
+ * 发现式判据: 出现新的「起反代」位置就红
+ *
+ * 上面两条 `it` 是**按文件手列**的。而「按文件手列」正是服务端入口当初能溜过去的
+ * 原因:闸门只读它列出的那些文件,新写的第四条启动路径不在名单里,于是全绿。
+ * 本组不再手列文件,而是扫 `src/main/**` 全量,把「起反代的位置」数出来 ——
+ * 数目一变(新增一条启动路径,或删掉一条)就红,红的信息是「去把新路径归类:
+ * 要么它必须水合池,要么在此处写明为什么豁免」。
+ *
+ * 为什么不写成「每个起点都必须水合池」那样的全自动判据:实测全仓有 5 个
+ * `server|proxy.start()` 起点,其中桌面托盘开关(`index.ts` onToggleProxy)与
+ * `proxy-start` IPC 两处**确实没有**水合 —— 它们靠 `onPoolEmpty`(index.ts:672)
+ * 懒加载补池兜底,且都是「屏幕前的人刚点了按钮」的场景。把它们判红会得到一个
+ * 长期挂红、随后被人加豁免清单绕过的闸门。故此处只锁**数目 + 归类**:
+ * 名单可以有豁免项,但名单不能悄悄过期。
+ */
+describe('发现式: 起反代的位置数目锁定(新增启动路径必须归类)', () => {
+  it('扫描器受控自检：别名、await、可选链与 bracket 调用都能发现，非调用不误报', () => {
+    for (const source of [
+      'const p = initProxyServer(); p.start()',
+      'const p = initProxyServer(); await p.start()',
+      'const p = initProxyServer(); p?.start()',
+      "const p = initProxyServer(); p['start']()"
+    ]) {
+      expect(countProxyStartCalls(source), source).toBe(1)
+    }
+
+    for (const source of [
+      'const p = initProxyServer; p.start()',
+      'const p = initProxyServer(); p.start',
+      'initProxyServer(); unrelated.start()',
+      'const p = initProxyServer(); p.restart()'
+    ]) {
+      expect(countProxyStartCalls(source), source).toBe(0)
+    }
+  })
+
+  /** 扫 src/main 下所有 .ts,返回 [相对路径, 命中数] */
+  function scanStarters(): Array<[string, number]> {
+    const base = resolve(REPO_ROOT, 'src/main')
+    const out: Array<[string, number]> = []
+    const walk = (dir: string): void => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const p = join(dir, e.name)
+        if (e.isDirectory()) walk(p)
+        else if (e.name.endsWith('.ts')) {
+          const src = stripComments(readFileSync(p, 'utf-8'))
+          const hits = countProxyStartCalls(src)
+          if (hits > 0) out.push([relative(base, p).replace(/\\/g, '/'), hits])
+        }
+      }
+    }
+    walk(base)
+    return out.sort((a, b) => a[0].localeCompare(b[0]))
+  }
+
+  /**
+   * 当前全仓「起反代」位置的完整归类。改动这张表**必须**同时说明新增那条
+   * 到底水合不水合池 —— 这就是本闸门存在的全部意义。
+   *
+   * | 位置 | 是否水合池 | 判据 |
+   * |---|---|---|
+   * | `index.ts` onToggleProxy(托盘开关) | ❌ 靠 onPoolEmpty 兜底 | 屏幕前的人刚点了按钮 |
+   * | `index.ts` 桌面自启动 | ✅ `syncAccountsToPool()` 在 start 之前 | 开机无人在场 |
+   * | `index.ts` `proxy-start` IPC | ❌ 靠 onPoolEmpty 兜底 | 渲染进程点的按钮 |
+   * | `ipc/panelProxyDeps.ts` proxyStart | ✅ `syncPool` + EMPTY_POOL 拒启 | 面板前有人看着 |
+   * | `server/entry.ts` 服务端自启动 | ✅ `syncProxyPoolFromStore` + 三态播报 | 开机无人在场 |
+   */
+  const EXPECTED: Record<string, number> = {
+    'index.ts': 3,
+    'ipc/panelProxyDeps.ts': 1,
+    'server/entry.ts': 1
+  }
+
+  it('起反代的文件与位置数目与归类表一致(不一致 = 有未归类的新启动路径)', () => {
+    const found = scanStarters()
+    const actual = Object.fromEntries(found)
+    expect(
+      actual,
+      '起反代的位置发生了变化。这不是让你改这张表就完事 —— 先回答新增/变动的那条:\n' +
+        '  它在 start() 之前水合池了吗?若没有,它靠什么兜底(onPoolEmpty?),' +
+        '且它是「有人在屏幕前」还是「开机无人在场」?\n' +
+        '  无人在场的那种**必须**水合(server/entry.ts 当初漏掉它 = 空池启动/指示灯全绿/没有账号可服务),' +
+        '然后把结论写进本 describe 的归类表。'
+    ).toEqual(EXPECTED)
+  })
+
+  it('归类表里标了「水合」的三处,水合调用确实在 start() 之前', () => {
+    // 桌面自启动:同步函数调用点必须早于 start()。
+    // 这一处的 initProxyServer() 与 start() 相隔近百行(中间是重试逻辑),
+    // 任何固定字符窗口的判据都会漏掉它 —— 故按「自启动块」的显式锚点切片。
+    const main = stripComments(read('src/main/index.ts'))
+    const autoIdx = main.indexOf("store.get('proxyConfig')")
+    expect(autoIdx, '桌面自启动块的锚点消失了').toBeGreaterThan(-1)
+    const autoBlock = main.slice(autoIdx)
+    const syncIdx = autoBlock.indexOf('syncAccountsToPool()')
+    const startIdx = autoBlock.indexOf('server.start()')
+    expect(syncIdx, '桌面自启动没有同步账号到池').toBeGreaterThan(-1)
+    expect(startIdx, '桌面自启动没有调 server.start()').toBeGreaterThan(-1)
+    expect(syncIdx, '桌面自启动必须先同步池再 start()').toBeLessThan(startIdx)
+    // 另外两处(面板 / 服务端)各由上面两条专门的 it 逐字断言,不在此重复。
   })
 })
 
