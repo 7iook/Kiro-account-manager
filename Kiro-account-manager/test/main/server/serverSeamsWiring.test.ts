@@ -36,7 +36,11 @@ import {
 } from '@main/server/persistence'
 import { KIRO_SOCIAL_PROFILE_ARN } from '@main/kiroAuthSync'
 import { bootstrap } from '@main/server/entry'
-import { setLastSavedDataSetter, setBroadcaster } from '@main/accountService/state'
+import {
+  applyAccountDataMutation,
+  setLastSavedDataSetter,
+  setBroadcaster
+} from '@main/accountService/state'
 import type { AccountStorePort } from '@main/persistence/accountStorePort'
 import type { AdminKeyStore } from '@main/webPanel/auth'
 
@@ -74,6 +78,13 @@ function initialBlob(): Record<string, unknown> {
 type ProxyEvents = {
   onAccountUpdate?: (account: Record<string, unknown>) => void
   onAccountSuspended?: (info: Record<string, unknown>) => void
+  onCreditsUpdate?: (totalCredits: number) => void
+  onTokensUpdate?: (inputTokens: number, outputTokens: number) => void
+  onRequestStatsUpdate?: (
+    totalRequests: number,
+    successRequests: number,
+    failedRequests: number
+  ) => void
 }
 
 /**
@@ -169,6 +180,116 @@ describe('W-D 反代刷出的新 token 必须落盘（治「刷了但重启用�
     // 未涉及的字段不得被抹掉（字段级补丁，不是整条覆盖）
     expect(cred.clientId).toBe('cid')
     expect(cred.region).toBe('us-east-1')
+  })
+
+  it('token 刷新事件后立即 shutdown，返回前必须把轮换后的 refreshToken 落盘', async () => {
+    server = assemble({ withPersistence: true })
+    const events = eventsOf(server.initProxyServer())
+
+    // 占住 accountData 的既有串行写锁，让 token 补丁可重复地停在队列里。
+    // setImmediate 才释放：旧 shutdown 不等队列，会先返回并读到 refresh-v1；
+    // 正确 shutdown 会等 drain，在释放后写完 refresh-v2 才返回。
+    let releaseWrite!: () => void
+    let markBlockerStarted!: () => void
+    const writeReleased = new Promise<void>((resolve) => {
+      releaseWrite = resolve
+    })
+    const blockerStarted = new Promise<void>((resolve) => {
+      markBlockerStarted = resolve
+    })
+    const blocker = applyAccountDataMutation(async (prev) => {
+      markBlockerStarted()
+      await writeReleased
+      return prev
+    })
+    await blockerStarted
+
+    events.onAccountUpdate?.({
+      id: 'acc1',
+      accessToken: 'access-v2',
+      refreshToken: 'refresh-v2',
+      expiresAt: 99_000
+    })
+
+    const releaseScheduled = new Promise<void>((resolve) => {
+      setImmediate(() => {
+        releaseWrite()
+        resolve()
+      })
+    })
+    await server.shutdown()
+    const tokenWhenShutdownReturned = credentialsOf(server.store, 'acc1').refreshToken
+
+    // 无论断言成败都先收干净人为占住的全局写锁，避免污染本文件后续用例。
+    await releaseScheduled
+    await blocker
+    expect(tokenWhenShutdownReturned).toBe('refresh-v2')
+  })
+
+  it('shutdown 会立即 flush 尚在防抖窗口内的额度、token 与请求统计', async () => {
+    vi.useFakeTimers()
+    try {
+      server = assemble({ withPersistence: true })
+      const events = eventsOf(server.initProxyServer())
+
+      events.onCreditsUpdate?.(321)
+      events.onTokensUpdate?.(654, 987)
+      events.onRequestStatsUpdate?.(12, 10, 2)
+
+      // 不推进 2 秒 timer：只有 shutdown 主动 flush 才能让这些值落盘。
+      await server.shutdown()
+      expect(server.store.get('proxyTotalCredits')).toBe(321)
+      expect(server.store.get('proxyInputTokens')).toBe(654)
+      expect(server.store.get('proxyOutputTokens')).toBe(987)
+      expect(server.store.get('proxyTotalRequests')).toBe(12)
+      expect(server.store.get('proxySuccessRequests')).toBe(10)
+      expect(server.store.get('proxyFailedRequests')).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('drain 超过上限会返回，并明确记录哪条 token 写入尚未确认落盘', async () => {
+    server = assemble({ withPersistence: false })
+    const hooks = createServerPersistenceHooks({ drainTimeoutMs: 0 })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    let releaseWrite!: () => void
+    let markBlockerStarted!: () => void
+    const writeReleased = new Promise<void>((resolve) => {
+      releaseWrite = resolve
+    })
+    const blockerStarted = new Promise<void>((resolve) => {
+      markBlockerStarted = resolve
+    })
+    const blocker = applyAccountDataMutation(async (prev) => {
+      markBlockerStarted()
+      await writeReleased
+      return prev
+    })
+    await blockerStarted
+
+    try {
+      hooks.onProxyAccountUpdate?.({
+        id: 'acc1',
+        accessToken: 'access-v2',
+        refreshToken: 'refresh-v2'
+      })
+      await hooks.drain()
+
+      const log = error.mock.calls.map((args) => args.join(' ')).join('\n')
+      expect(log).toContain('反代账号更新（id=acc1）')
+      expect(log).toContain('尚未确认落盘')
+      expect(log).toContain('refreshToken')
+    } finally {
+      releaseWrite()
+      await blocker
+      await waitFor(
+        () => credentialsOf(server!.store, 'acc1').refreshToken === 'refresh-v2',
+        '超时测试释放写锁后清空持久化队列'
+      )
+      error.mockRestore()
+    }
   })
 
   it('反向对照：不注入 persistence 时新 token 确实不落盘（证明上一条断言有判别力）', async () => {

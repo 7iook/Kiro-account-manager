@@ -71,6 +71,13 @@ export interface ProxyAccountSuspendedInfo {
   suspendedAt: number
 }
 
+/** 停机默认最多等 10 秒；超时后由调用方继续退出，但日志会明确列出未确认落盘的写入。 */
+const DEFAULT_DRAIN_TIMEOUT_MS = 10_000
+
+export interface ServerPersistenceOptions {
+  drainTimeoutMs?: number
+}
+
 /**
  * 把一次反代账号更新合并进一条账号记录（纯函数，便于单测逐字段固定）。
  *
@@ -149,56 +156,102 @@ export function patchAccountWithSuspension(
  * `{persisted:false, reason:'account-not-found'}` 并**零副作用中止**（不重建那条记录）。
  * 这里按 info 级别记一行，让日志能自证「不是写失败，是账号没了」。
  */
-export function createServerPersistenceHooks(): ServerPersistenceHooks {
+export function createServerPersistenceHooks(
+  options: ServerPersistenceOptions = {}
+): ServerPersistenceHooks {
+  const pendingWrites = new Map<Promise<void>, string>()
+  const drainTimeoutMs = options.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS
+
+  const track = (description: string, task: Promise<void>): void => {
+    const tracked = task.finally(() => {
+      pendingWrites.delete(tracked)
+    })
+    pendingWrites.set(tracked, description)
+  }
+
+  const drain = async (): Promise<void> => {
+    const deadline = Date.now() + drainTimeoutMs
+    while (pendingWrites.size > 0) {
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) break
+
+      let timeout: NodeJS.Timeout | undefined
+      const completed = await Promise.race([
+        Promise.allSettled([...pendingWrites.keys()]).then(() => true),
+        new Promise<false>((resolve) => {
+          timeout = setTimeout(() => resolve(false), remainingMs)
+        })
+      ])
+      if (timeout) clearTimeout(timeout)
+      if (!completed) break
+    }
+
+    if (pendingWrites.size > 0) {
+      const pending = [...pendingWrites.values()].join('；')
+      console.error(
+        `[server] ❌ 停机持久化等待超过 ${drainTimeoutMs}ms，` +
+          `以下写入尚未确认落盘：${pending}。` +
+          '若其中包含 refreshToken，进程退出后盘上可能仍是已被上游吊销的旧 token。'
+      )
+    }
+  }
+
   return {
     onProxyAccountUpdate: (patch) => {
-      void persistAccountPatch(
-        patch.id,
-        (current) => patchAccountWithProxyUpdate(current, patch),
-        'server/onProxyAccountUpdate'
-      )
-        .then((outcome) => {
-          if (outcome.persisted) return
-          if (outcome.reason === 'account-not-found') {
-            console.log(
-              `[server] 反代账号更新未落盘：账号 ${patch.id} 已不在盘上（另一端刚删了它），跳过`
+      track(
+        `反代账号更新（id=${patch.id}）`,
+        persistAccountPatch(
+          patch.id,
+          (current) => patchAccountWithProxyUpdate(current, patch),
+          'server/onProxyAccountUpdate'
+        )
+          .then((outcome) => {
+            if (outcome.persisted) return
+            if (outcome.reason === 'account-not-found') {
+              console.log(
+                `[server] 反代账号更新未落盘：账号 ${patch.id} 已不在盘上（另一端刚删了它），跳过`
+              )
+              return
+            }
+            console.warn(`[server] 反代账号更新未落盘：${outcome.reason}（id=${patch.id}）`)
+          })
+          .catch((e) => {
+            // 落盘失败必须留痕：这条日志是「反代刷了 token 但重启后用回旧的」唯一线索。
+            console.error(
+              `[server] ⚠️ 反代刷出的新凭据落盘失败（id=${patch.id}）—— ` +
+                `进程重启后该账号会用回盘上的旧 token，若上游已轮换 refreshToken 则会 401：`,
+              e
             )
-            return
-          }
-          console.warn(`[server] 反代账号更新未落盘：${outcome.reason}（id=${patch.id}）`)
-        })
-        .catch((e) => {
-          // 落盘失败必须留痕：这条日志是「反代刷了 token 但重启后用回旧的」唯一线索。
-          console.error(
-            `[server] ⚠️ 反代刷出的新凭据落盘失败（id=${patch.id}）—— ` +
-              `进程重启后该账号会用回盘上的旧 token，若上游已轮换 refreshToken 则会 401：`,
-            e
-          )
-        })
+          })
+      )
     },
     onProxyAccountSuspended: (info) => {
-      void persistAccountPatch(
-        info.id,
-        (current) => patchAccountWithSuspension(current, info),
-        'server/onProxyAccountSuspended'
-      )
-        .then((outcome) => {
-          if (outcome.persisted) return
-          if (outcome.reason === 'account-not-found') {
-            console.log(
-              `[server] 封禁状态未落盘：账号 ${info.id} 已不在盘上（另一端刚删了它），跳过`
+      track(
+        `账号封禁状态（id=${info.id}）`,
+        persistAccountPatch(
+          info.id,
+          (current) => patchAccountWithSuspension(current, info),
+          'server/onProxyAccountSuspended'
+        )
+          .then((outcome) => {
+            if (outcome.persisted) return
+            if (outcome.reason === 'account-not-found') {
+              console.log(
+                `[server] 封禁状态未落盘：账号 ${info.id} 已不在盘上（另一端刚删了它），跳过`
+              )
+              return
+            }
+            console.warn(`[server] 封禁状态未落盘：${outcome.reason}（id=${info.id}）`)
+          })
+          .catch((e) => {
+            console.error(
+              `[server] ⚠️ 账号封禁状态落盘失败（id=${info.id}）—— ` +
+                `重启后面板上看不到这个号被封禁的原因：`,
+              e
             )
-            return
-          }
-          console.warn(`[server] 封禁状态未落盘：${outcome.reason}（id=${info.id}）`)
-        })
-        .catch((e) => {
-          console.error(
-            `[server] ⚠️ 账号封禁状态落盘失败（id=${info.id}）—— ` +
-              `重启后面板上看不到这个号被封禁的原因：`,
-            e
-          )
-        })
-    }
+          })
+      )
+    },
+    drain
   }
 }

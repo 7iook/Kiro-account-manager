@@ -236,6 +236,8 @@ export interface ServerPersistenceHooks {
     message: string
     suspendedAt: number
   }) => void
+  /** 停机时等待所有已接收的账号写入；实现必须有界并在超时时明确记日志 */
+  drain: () => Promise<void>
 }
 
 /** 组装结果。`entry.ts` 只跟这个对象打交道 */
@@ -249,7 +251,7 @@ export interface AssembledServer {
   initProxyServer: () => ProxyServer
   /** 面板实际监听地址（`port:0` 时才与配置不同） */
   panelAddress: () => { host: string; port: number } | null
-  /** 有序停机：反代 → 面板 → 会话归档。幂等 */
+  /** 有序停机：停止控制面与数据面 → drain/flush 持久化 → 会话归档。幂等 */
   shutdown: () => Promise<void>
 }
 
@@ -353,12 +355,13 @@ export function assembleServer(options: AssembleOptions): AssembledServer {
   // 反代一启动，`onSessionTick` 每 60s 就会覆盖那个键，上次的统计就永久丢了。
   restoreOrphanProxySession(store)
 
+  const debouncedStoreSet = makeDebouncedStoreSet(store)
   let proxyServer: ProxyServer | null = null
   const initProxyServer = (): ProxyServer => {
     if (proxyServer) return proxyServer
     proxyServer = new ProxyServer(
       readProxyConfig(store),
-      buildProxyEvents(store, accountApi, options.persistence, () => proxyServer),
+      buildProxyEvents(store, accountApi, options.persistence, debouncedStoreSet, () => proxyServer),
       // 自签证书落盘目录（K-2）：装配层注入，内核不自己 require('electron')
       config.dataDir
     )
@@ -394,17 +397,23 @@ export function assembleServer(options: AssembleOptions): AssembledServer {
     initProxyServer,
     panelAddress: () => panel.getListeningAddress(),
     shutdown: async () => {
-      // 顺序承重：先停反代（它有在途请求与会话统计），再停面板。
-      // 反过来的话，面板已关而反代还在收新请求，运维看到「面板挂了」却仍在被计费。
+      // 先关控制面，防止 drain 期间面板又把反代拉起；再停数据面，等待在途请求收尾。
+      // 两个入口都停止后 pending 集合才有固定点，随后才能安全 drain / flush。
+      await panel.stop().catch((e) => {
+        console.error('[server] 停止面板失败:', e)
+      })
       if (proxyServer) {
-        archiveProxySession(store, proxyServer)
         await proxyServer.stop().catch((e) => {
           console.error('[server] 停止反代失败:', e)
         })
       }
-      await panel.stop().catch((e) => {
-        console.error('[server] 停止面板失败:', e)
+
+      await options.persistence?.drain().catch((e) => {
+        console.error('[server] 等待账号持久化队列失败，部分凭据可能尚未落盘:', e)
       })
+      debouncedStoreSet.flush()
+      if (proxyServer) archiveProxySession(store, proxyServer)
+
       // `panel.stop()` 内部已停会话清扫；再显式停一次覆盖「面板从未启动但 sweeper 已起」
       auth.sessionStore.stopSweeping()
     }
@@ -598,9 +607,9 @@ function buildProxyEvents(
   store: AccountStorePort,
   api: ServerAccountApi,
   persistence: ServerPersistenceHooks | undefined,
+  debouncedSet: DebouncedStoreSet,
   getProxyServer: () => ProxyServer | null
 ): ConstructorParameters<typeof ProxyServer>[1] {
-  const debouncedSet = makeDebouncedStoreSet(store)
   let warnedNoPersistence = false
   const warnOnce = (what: string): void => {
     if (warnedNoPersistence) return
@@ -678,16 +687,16 @@ function buildProxyEvents(
       })
     },
     onCreditsUpdate: (totalCredits) => {
-      debouncedSet('proxyTotalCredits', totalCredits)
+      debouncedSet.set('proxyTotalCredits', totalCredits)
     },
     onTokensUpdate: (inputTokens, outputTokens) => {
-      debouncedSet('proxyInputTokens', inputTokens)
-      debouncedSet('proxyOutputTokens', outputTokens)
+      debouncedSet.set('proxyInputTokens', inputTokens)
+      debouncedSet.set('proxyOutputTokens', outputTokens)
     },
     onRequestStatsUpdate: (totalRequests, successRequests, failedRequests) => {
-      debouncedSet('proxyTotalRequests', totalRequests)
-      debouncedSet('proxySuccessRequests', successRequests)
-      debouncedSet('proxyFailedRequests', failedRequests)
+      debouncedSet.set('proxyTotalRequests', totalRequests)
+      debouncedSet.set('proxySuccessRequests', successRequests)
+      debouncedSet.set('proxyFailedRequests', failedRequests)
     },
     onSessionTick: (rec) => {
       try {
@@ -734,27 +743,41 @@ function buildProxyEvents(
  * 让进程要等到 timer 烧完才退 —— 而 systemd 的 `TimeoutStopSec` 到点会 SIGKILL，
  * 于是最后那批统计反而丢了。unref + 停机时显式 flush 才两头都保住。
  */
+interface DebouncedStoreSet {
+  set: (key: string, value: unknown) => void
+  flush: () => void
+}
+
 function makeDebouncedStoreSet(
   store: Pick<AccountStorePort, 'set'>,
   delayMs = 2000
-): (key: string, value: unknown) => void {
+): DebouncedStoreSet {
   const pendingValues = new Map<string, unknown>()
   let timer: NodeJS.Timeout | null = null
-  return (key: string, value: unknown) => {
-    pendingValues.set(key, value)
-    if (timer) return
-    timer = setTimeout(() => {
+
+  const flush = (): void => {
+    if (timer) {
+      clearTimeout(timer)
       timer = null
-      for (const [k, v] of pendingValues) {
-        try {
-          store.set(k, v)
-        } catch (e) {
-          console.warn(`[server] 写 ${k} 失败:`, e)
-        }
+    }
+    for (const [k, v] of pendingValues) {
+      try {
+        store.set(k, v)
+      } catch (e) {
+        console.warn(`[server] 写 ${k} 失败:`, e)
       }
-      pendingValues.clear()
-    }, delayMs)
-    timer.unref?.()
+    }
+    pendingValues.clear()
+  }
+
+  return {
+    set: (key: string, value: unknown) => {
+      pendingValues.set(key, value)
+      if (timer) return
+      timer = setTimeout(flush, delayMs)
+      timer.unref?.()
+    },
+    flush
   }
 }
 
