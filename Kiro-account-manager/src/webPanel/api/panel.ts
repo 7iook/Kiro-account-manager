@@ -248,6 +248,10 @@ export interface PanelHoldEpisode {
   detail: string[]
   startedAt: number
   endedAt: number | null
+  /** 本轮全部放行动作数；不会随 releases 展示明细的 50 条上限截断。 */
+  totalReleaseCount: number
+  /** 本轮由定时器触发的放行动作数。 */
+  totalAutoReleaseCount: number
   releases: PanelHoldRelease[]
 }
 

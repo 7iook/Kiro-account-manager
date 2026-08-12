@@ -237,6 +237,8 @@ type HoldEpisodeView = {
   detail: string[]
   startedAt: number
   endedAt: number | null
+  totalReleaseCount: number
+  totalAutoReleaseCount: number
   releases: HoldReleaseView[]
 }
 
@@ -263,7 +265,7 @@ function humanDuration(ms: number, isEn: boolean): string {
  * - `re-held` 放行后仍无号,请求又挂回去了 → 客户端只收到心跳 → 看守计时**没被重置**
  * 后者连续出现时,「放行了 N 次」这个数字并不代表请求能一直活着 —— 这一列就是用来看穿它的。
  */
-function HoldTimeline({
+export function HoldTimeline({
   current,
   recent,
   isEn
@@ -344,12 +346,20 @@ function HoldTimeline({
         </div>
       )
     }
+    const omittedCount = Math.max(0, ep.totalReleaseCount - ep.releases.length)
     // 最新在前:长时间挂起时用户最关心刚刚那几次。
     return (
       <div className="pl-4 space-y-0.5">
+        {omittedCount > 0 && (
+          <div className="text-xs text-muted-foreground">
+            {isEn
+              ? `Showing the latest ${ep.releases.length}; ${omittedCount} earlier releases omitted`
+              : `仅显示最近 ${ep.releases.length} 条，前 ${omittedCount} 条已省略`}
+          </div>
+        )}
         {[...ep.releases].reverse().map((r, i) => (
           <div key={`${ep.id}-${r.at}-${i}`} className="text-xs flex items-center gap-2 tabular-nums">
-            <span className="text-muted-foreground">#{ep.releases.length - i}</span>
+            <span className="text-muted-foreground">#{ep.totalReleaseCount - i}</span>
             <span>{clockTime(r.at)}</span>
             <span className="text-muted-foreground">{triggerText(r.trigger)}</span>
             <span>→</span>
@@ -394,7 +404,7 @@ function HoldTimeline({
               ({humanDuration(Date.now() - current.startedAt, isEn)})
             </span>
             <span className="text-muted-foreground">
-              {isEn ? `· released ${current.releases.length}x` : `· 已放行 ${current.releases.length} 次`}
+              {isEn ? `· released ${current.totalReleaseCount}x` : `· 已放行 ${current.totalReleaseCount} 次`}
             </span>
           </div>
           {current.detail.length > 0 && (
@@ -427,7 +437,7 @@ function HoldTimeline({
                     </>
                   )}
                   <span className="text-muted-foreground">
-                    {isEn ? `${ep.releases.length}x` : `${ep.releases.length} 次`}
+                    {isEn ? `${ep.totalReleaseCount}x` : `${ep.totalReleaseCount} 次`}
                   </span>
                 </div>
                 {renderReleases(ep)}

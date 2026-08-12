@@ -567,8 +567,14 @@ function HoldReleaseList({ ep }: { ep: PanelHoldEpisode }): React.JSX.Element {
   if (ep.releases.length === 0) {
     return <p className="mt-0.5 pl-3 text-xs text-slate-400">尚未放行过</p>
   }
+  const omittedCount = Math.max(0, ep.totalReleaseCount - ep.releases.length)
   return (
     <div className="mt-0.5 space-y-0.5 pl-3">
+      {omittedCount > 0 && (
+        <p className="text-xs text-slate-400">
+          仅显示最近 {ep.releases.length} 条，前 {omittedCount} 条已省略
+        </p>
+      )}
       {[...ep.releases].reverse().map((r, i) => {
         const style = HOLD_OUTCOME_STYLE[r.outcome]
         return (
@@ -576,7 +582,7 @@ function HoldReleaseList({ ep }: { ep: PanelHoldEpisode }): React.JSX.Element {
             key={`${ep.id}-${r.at}-${i}`}
             className="flex items-baseline gap-1.5 text-xs tabular-nums text-slate-600 dark:text-slate-300"
           >
-            <span className="text-slate-400">#{ep.releases.length - i}</span>
+            <span className="text-slate-400">#{ep.totalReleaseCount - i}</span>
             <span>{holdClockTime(r.at)}</span>
             <span className="text-slate-400">{HOLD_TRIGGER_TEXT[r.trigger]}</span>
             <span className="text-slate-400">→</span>
@@ -630,7 +636,7 @@ function HoldTimelineBlock({
               （{holdDuration(now - current.startedAt)}）
             </span>
             <span className="text-xs text-slate-500 dark:text-slate-400">
-              已放行 {current.releases.length} 次
+              已放行 {current.totalReleaseCount} 次
             </span>
           </p>
           {current.detail.length > 0 && (
@@ -667,7 +673,7 @@ function HoldTimelineBlock({
                         </span>
                       </>
                     )}
-                    <span className="text-slate-400">{ep.releases.length} 次</span>
+                    <span className="text-slate-400">{ep.totalReleaseCount} 次</span>
                   </p>
                   <HoldReleaseList ep={ep} />
                 </div>

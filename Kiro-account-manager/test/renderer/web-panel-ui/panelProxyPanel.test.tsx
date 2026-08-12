@@ -13,6 +13,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ProxyPanel } from '../../../src/webPanel/ui/ProxyPanel'
+import type { PanelHoldEpisode } from '../../../src/webPanel/api/panel'
 import type { AccountListItem } from '../../../src/main/webPanel/dto'
 
 function accounts(): AccountListItem[] {
@@ -62,6 +63,8 @@ interface StatusShape {
   autoReleaseEnabled?: boolean
   nextAutoReleaseAt?: number | null
   autoReleaseCount?: number
+  currentEpisode?: PanelHoldEpisode | null
+  recentEpisodes?: PanelHoldEpisode[]
 }
 
 /** 可编程的假服务端。`statusQueue` 让每次 GET /status 返回不同读数 */
@@ -102,7 +105,9 @@ function stubServer(opts: {
         autoReleaseEnabled: s.autoReleaseEnabled ?? false,
         // null = 没有下一次。刻意不用 ?? 0 —— 0 是合法 epoch，会渲染成巨大负倒计时
         nextAutoReleaseAt: s.nextAutoReleaseAt ?? null,
-        autoReleaseCount: s.autoReleaseCount ?? 0
+        autoReleaseCount: s.autoReleaseCount ?? 0,
+        currentEpisode: s.currentEpisode ?? null,
+        recentEpisodes: s.recentEpisodes ?? []
       })
     }
     if (url.endsWith('/proxy/start')) {
@@ -339,6 +344,36 @@ describe('反代面板 · 自动放行读数与手动放行（决策卡 §3 手�
     await waitFor(() => expect(screen.getByText('2:05')).toBeTruthy())
     // 累计次数是「本次启动以来的周期次数」，不是条目数
     await waitFor(() => expect(screen.getByText('6')).toBeTruthy())
+  })
+
+  it('时间线使用服务端总数，截断后披露缺失行且保留真实序号', async () => {
+    const releases = Array.from({ length: 50 }, (_, i) => ({
+      at: 1_800_000_000_000 + i * 1000,
+      trigger: 'auto' as const,
+      outcome: 're-held' as const,
+      outcomeAt: 1_800_000_000_500 + i * 1000
+    }))
+    const episode: PanelHoldEpisode = {
+      id: 7,
+      reason: 'pool-empty',
+      detail: [],
+      startedAt: releases[0].at,
+      endedAt: null,
+      totalReleaseCount: 60,
+      totalAutoReleaseCount: 60,
+      releases
+    }
+    const { fetchMock } = stubServer({
+      status: { running: true, currentEpisode: episode }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPanel()
+
+    await waitFor(() => expect(screen.getByText('已放行 60 次')).toBeTruthy())
+    expect(screen.getByText('仅显示最近 50 条，前 10 条已省略')).toBeTruthy()
+    expect(screen.getByText('#60')).toBeTruthy()
+    expect(screen.getByText('#11')).toBeTruthy()
+    expect(screen.queryByText('#10')).toBeNull()
   })
 
   it('倒计时本地自减，不靠轮询服务端拿数值', async () => {
