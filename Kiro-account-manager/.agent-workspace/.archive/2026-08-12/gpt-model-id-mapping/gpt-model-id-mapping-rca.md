@@ -231,7 +231,11 @@ mapModelId → payload → 上游 → 出流」整条链。默认 `describe.skip
 - **D1 · 模型目录缺 SSOT**(评审判定 ARCHITECTURE_DEFECT):模型事实仍散落 4 处(`MODEL_ID_MAP` /
   `tokenCounter` 兜底表 / `proxyServer` 静态清单 / `DiagnosePage` 测活清单),本轮只做数据对齐,
   未建单一真源。参考项目 `model_catalog.rs` 的 `static CATALOG` 是可借鉴范式。**下次改模型相关代码时必然再次漂移。**
-- **D2 · 归一结果对用户不可见**:响应体不回传实际用档。需改响应装配契约,超出本次范围。
+- **D2 · 归一结果对用户不可见** → ✅(2026-08-12 已解决 · commit 25c6938):用户看到日志显示
+  `gpt-5.6` 后明确要求做掉。新增 `modelLogLabel.ts:resolveLoggedModel`,在 `this.events.onResponse`
+  包装层与 `recordRequest` 两个收口点把客户端原始名解析为实际档;UI 显示实际档 + `← 原始名` 附注。
+  仍未做:单次响应体的 `model` 字段仍回传客户端原始名(改它要动响应装配契约,且部分客户端会校验
+  请求/响应 model 一致性,有兼容风险)——日志侧已可见,故降级为低优先。
 - **D3 · 倍率硬编码会陈旧**:静态清单里的 rateMultiplier 是快照。应考虑只在动态拉取失败时展示"倍率未知"而非旧值。
 
 ## Update Log
@@ -252,3 +256,17 @@ mapModelId → payload → 上游 → 出流」整条链。默认 `describe.skip
   - 注:本轮全量测试有 15 例失败,全部在 `test/main/server/adminKeyStore.test.ts` —— 该文件对应
     他人正在飞的 `adminKeyStore.ts` 重写(678 增/469 删),与本交付零引用(已 grep 核实),非本轮引入。
 
+- 2026-08-12:用户看到日志「模型」列显示 `gpt-5.6`(Kiro 上不存在的 id),要求显示实际档 →
+  **D2 债兑现** · commit 25c6938。新增 `src/main/proxy/modelLogLabel.ts`(`resolveLoggedModel`):
+  由 `mapModelId` 派生实际档,不复制映射规则;只在归一真的改了名字时才带 `requestedModel`,
+  大小写差异不算改变(避免噪音);空 model 保持 `unknown` 且不编造归一结果。
+  **接线选两个收口点而非逐改 20 个调用点**:构造时包装 `this.events.onResponse`(一处覆盖
+  chat/responses/messages 三条入口的全部成功与失败分支)+ `recordRequest`(UI 日志数据源)。
+  这样未来新增入口自动获得该能力,规避 E-060 改 A 漏传播。契约逐层传播已改完:
+  `RequestLog` · `ProxyServerEvents.onResponse` · preload 内外两层 + `.d.ts` ·
+  renderer `RecentLogEntry` + 事件落库 · `ProxyLogsDialog` `LogEntry` + 渲染;
+  webPanel 已核实不渲染请求日志。UI:显示实际档,归一过的以 `← 原始名` 附注 + tooltip 两行。
+  验证:`modelLogLabel.test.ts` 8 例(纯函数)+ `modelLogWiring.test.ts` 4 例(**直接打生产
+  通道验真接线**,防 E-052「造好了没接」);全量**连续两次** 151 files 全绿;typecheck 双端零错。
+  注:期间全量曾出现 1-2 个 failed 文件抖动,定位为他人在飞的 `adminKeyStore.test.ts`
+  (涉临时目录/权限,时序敏感);连续两次复跑均 0 failed,且该文件与本交付零引用。
