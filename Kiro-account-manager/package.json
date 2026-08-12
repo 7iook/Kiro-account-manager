@@ -26,6 +26,7 @@
     "test:e2e:only": "node test/e2e-fullsuite/run.mjs --only",
     "build:webpanel": "vite build --config vite.webPanel.config.ts",
     "build:server": "npm run typecheck:node && vite build --config vite.server.config.ts && npm run build:webpanel",
+    "release:server": "npm run build:server && node scripts/package-server-release.mjs",
     "start:server": "node --enable-source-maps out/server/index.js"
   },
   "engines": {

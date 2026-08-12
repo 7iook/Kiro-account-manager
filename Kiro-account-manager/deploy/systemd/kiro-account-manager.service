@@ -1,0 +1,54 @@
+[Unit]
+Description=Kiro Account Manager headless server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=kiro
+Group=kiro
+WorkingDirectory=/opt/kiro-account-manager/current
+EnvironmentFile=/etc/kiro-account-manager/server.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# /usr/bin/env execs node without a shell, so Node's classified exit status reaches systemd unchanged.
+ExecStart=/usr/bin/env node --enable-source-maps out/server/index.js
+
+# LIVENESS CONTRACT — DO NOT replace this with /panel/readyz.
+# systemd supervises process liveness. A 503 readiness response means the management panel is
+# deliberately still alive while the proxy is unavailable (for example, its port is occupied).
+# Restarting on readiness would destroy the only phone-accessible control plane and create a loop.
+Restart=on-failure
+RestartSec=10s
+
+# Permanent operator/configuration errors from src/main/server/config.ts should remain failed for
+# diagnosis. Exit 69 (UNAVAILABLE) is intentionally restartable: uncaught runtime faults also use it.
+#
+# Exit 69 is also emitted when another instance already holds the data directory lock. Retrying is
+# correct there (the holder may be mid-shutdown), and StartLimitBurst above stops it after 5 attempts
+# in 300s rather than looping forever. If the unit lands in failed state, read the journal: a lock
+# conflict names the directory and the holding PID, and needs no lock file to be deleted by hand.
+RestartPreventExitStatus=64 65 73 78
+
+KillSignal=SIGTERM
+# Credential persistence may use its full bounded 10-second drain before the remaining shutdown
+# work completes. Keep this comfortably above 10 seconds; a shorter value can resurrect old tokens.
+TimeoutStopSec=30s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kiro-account-manager
+
+StateDirectory=kiro-account-manager
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kiro-account-manager
+
+[Install]
+WantedBy=multi-user.target

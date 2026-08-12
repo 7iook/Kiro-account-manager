@@ -2,6 +2,11 @@ import { defineConfig } from 'vitest/config'
 import { resolve } from 'node:path'
 import react from '@vitejs/plugin-react'
 
+// 收录判据是「**占用真实操作系统资源**」,不是「绑端口」。三类都算:
+//   ① 真实 listen / TLS 证书生成  ② 完整 bootstrap  ③ **spawn 真实子进程**
+// ③ 是 2026-08-13 补进来的:`upstreamApiWithoutElectron.runtime` 与 `postinstall_conditional`
+// 不绑任何端口,却在全套并行下被 CPU 饥饿撑过默认 5s(隔离跑最长单测仅 442ms)。
+// 只按「绑端口」筛会漏掉它们,而漏掉的表现是随机红、每次换一条 —— 与真实回归同形。
 const REAL_IO_TESTS = [
   'test/main/proxy/proxyServerDataPathInjection.test.ts',
   'test/main/proxy/holdGateSessionLifecycle.test.ts',
@@ -14,7 +19,10 @@ const REAL_IO_TESTS = [
   'test/main/accountService/checkPersistence.test.ts',
   'test/main/accountService/refreshPersistence.test.ts',
   'test/main/server/serverAutostartPoolSync.test.ts',
-  'test/main/architecture/server_bundle_esm_interop.test.ts'
+  'test/main/server/dataDirectoryLock.test.ts',
+  'test/main/architecture/server_bundle_esm_interop.test.ts',
+  'test/main/upstreamApi/upstreamApiWithoutElectron.runtime.test.ts',
+  'test/main/architecture/postinstall_conditional.test.ts'
 ]
 
 // 单元测试:三个 project 共存

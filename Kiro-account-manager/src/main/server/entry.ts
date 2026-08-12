@@ -1,8 +1,9 @@
 /**
  * 服务端进程入口 —— 这是整个服务器化工作里第一个真正有 `main()` 的东西。
  *
- * 职责边界（刻意很薄）：读环境变量 → 前置校验数据 → 装配（`assembly.ts`）→
- * 起面板 → 按配置起反代 → 装信号处理器。**没有一行业务逻辑**，也没有装配细节。
+ * 职责边界（刻意很薄）：读环境变量 → 锁定数据目录 → 前置校验数据 →
+ * 装配（`assembly.ts`）→ 起面板 → 按配置起反代 → 装信号处理器。
+ * **没有一行业务逻辑**，也没有装配细节。
  *
  * ## 为什么入口与装配分成两个文件
  *
@@ -14,16 +15,18 @@
  * ## 启动顺序（每一步的位置都是承重的）
  *
  *   1. **读环境变量** —— 最便宜的失败。缺 `KIRO_DATA_DIR` 就没必要往下走。
- *   2. **数据前置校验** —— 四态 + 版本 + 写权限，带分类退出码（见 `config.ts`）。
+ *   2. **锁定规范数据目录** —— 在任何写入前由内核原子裁决；同时把相对路径、
+ *      symlink / junction、尾斜杠和 Windows 大小写拼法收敛到同一个 key。
+ *   3. **数据前置校验** —— 四态 + 版本 + 写权限，带分类退出码（见 `config.ts`）。
  *      必须在装配**之前**：装配会构造 store 而构造会创建目录，
  *      而一次「拒绝启动」不该留下副作用。
- *   3. **adminKey 引导** —— 必须在面板启动之前。面板绑外网且无 adminKey 会拒启
+ *   4. **adminKey 引导** —— 必须在面板启动之前。面板绑外网且无 adminKey 会拒启
  *      （`webPanel/server.ts:117` 的既有红线），而首启的密钥要打印给运维抄走。
- *   4. **装配** —— 建 store、注入写入收口、装 deps、建面板与反代工厂。
- *   5. **起面板** —— 先于反代。面板是唯一的管理入口：反代起不来时运维**需要**
+ *   5. **装配** —— 建 store、注入写入收口、装 deps、建面板与反代工厂。
+ *   6. **起面板** —— 先于反代。面板是唯一的管理入口：反代起不来时运维**需要**
  *      面板还活着才能去查原因、改配置。顺序反了就成了「反代挂 → 面板也没起 →
  *      只能 SSH」，而「不用碰服务器」正是本项目的原始需求。
- *   6. **起反代**（按 `enabled && autoStart`）—— **先同步池，再 `start()`**，顺序不可颠倒
+ *   7. **起反代**（按 `enabled && autoStart`）—— **先同步池，再 `start()`**，顺序不可颠倒
  *      （漏掉同步 = 空池启动：反代在监听、面板显示运行中，但没有账号可服务）。
  *      池同步走与面板 `/start` 共用的 `syncProxyPoolFromStore` 原语；启动顺序在两端
  *      刻意各写一次，因为空池策略不同。两条架构顺序断言和启动点发现门禁负责防漂移。
@@ -36,13 +39,11 @@
  *      稍后拷进来的数据文件能被读到）变成必须人工上面板点启动。取而代之：
  *      **如实播报**，且区分「盘上还没有账号」（首启常态）与「有账号但全不准入」
  *      （真故障）—— 两者要求的运维动作相反。
- *   7. **装信号处理器** —— 最后。装早了会在启动失败的退出路径上被自己的
+ *   8. **装信号处理器** —— 最后。装早了会在启动失败的退出路径上被自己的
  *      handler 拦住。
  *
  * ## 未做的（有意的空缺，不是遗漏）
  *
- *   - **单实例锁**：决策卡已裁决「服务器上只有一个进程 → 不需要任何锁」。
- *     且 Electron 的 `requestSingleInstanceLock` 在纯 Node 下不存在，不得照搬。
  *   - **liveness 仍是进程 / 面板端口**：systemd 以进程存活为准，容器可做 TCP 探测。
  *     但这不再兼任 readiness：前置反代 / 容器 healthcheck 应探
  *     `/panel/readyz`，它仅在数据面反代实际监听时返回 200；面板独活时返回 503。
@@ -60,6 +61,12 @@ import { syncProxyPoolFromStore } from '../ipc/panelProxyDeps'
 import { createServerAdminKeyStore } from './adminKeyStore'
 import { createServerPersistenceHooks } from './persistence'
 import { createServerAccountApi } from './accountApi'
+import {
+  acquireDataDirectoryLock,
+  attachDataDirectoryLock,
+  DataDirectoryLockedError,
+  type DataDirectoryLock
+} from './dataDirectoryLock'
 import type { AssembledServer } from './assembly'
 import type { AccountStorePort } from '../persistence/accountStorePort'
 import type { StoredProxyAccountData } from '../ipc/panelProxyDeps'
@@ -73,133 +80,155 @@ import type { StoredProxyAccountData } from '../ipc/panelProxyDeps'
 export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<AssembledServer> {
   // ① 环境变量
   const config = readServerConfig(env)
+
+  // ② 数据目录进程锁。锁本身不写数据目录；内核原子 bind 既裁决并发，也随崩溃自动释放。
+  let dataDirectoryLock: DataDirectoryLock
+  try {
+    dataDirectoryLock = await acquireDataDirectoryLock(config.dataDir)
+  } catch (e) {
+    if (e instanceof DataDirectoryLockedError) {
+      throw new ServerConfigError(e.message, EXIT.UNAVAILABLE)
+    }
+    throw e
+  }
+  // 后续所有读写都走同一条规范路径，不能只拿规范路径算锁 key、却继续按原拼法写盘。
+  config.dataDir = dataDirectoryLock.dataDir
   console.log(`[server] 数据目录: ${config.dataDir}`)
 
-  // ② 数据前置校验（在装配之前 —— 拒启不该留副作用）
-  preflightForServerWithExitCode(config.dataDir)
-
-  // ③ adminKey 引导（在面板启动之前）
-  //
-  // `legacyDesktopKeyPresent` 回答运维最可能的困惑：「我拷了数据文件，
-  // 为什么桌面上那个密钥登不进去」。服务端刻意不继承桌面密钥（它有未知暴露史：
-  // 设置页展示过、随数据文件跨机搬运过），故打印里要明说旧钥匙不生效。
-  const adminKeyStore = createServerAdminKeyStore({
-    dataDir: config.dataDir,
-    env,
-    legacyDesktopKeyPresent: hasLegacyDesktopAdminKey(config.dataDir)
-  })
-
-  // ④ 装配
-  //
-  // `accountApi` 必须传：不传时 `assembly.ts` 退回 `defaultAccountApi()`，那里三个上游
-  // HTTP 方法（refreshTokenByMethod / getUsageAndLimits / getUserInfo）**调用即抛** ——
-  // 后果是池中账号的 accessToken 过期后刷不出新的，「关机后反代仍在服务」
-  // 只在当前 token 有效期内成立。实现是与桌面**同一份** `src/main/upstreamApi`
-  // （零 electron 共享模块），服务端绝不复制第二份 token 刷新逻辑。
-  //
-  // store 用**惰性** getter 而非值：store 是 `assembleServer()` 内部建的（它同时负责
-  // `setStoreRef` 写入收口），而 accountApi 要作为参数先传进去 —— 构造时它还不存在。
-  // getter 在被调用时才求值，那时装配早已完成。
-  //
-  // `persistence` 必须传：不传时 `assembly.ts:buildProxyEvents` 的 `onAccountUpdate`
-  // 是「告警一次后丢弃」—— 反代刷出的新 token 只进内存池，进程重启后用回盘上的旧的。
-  // 而 IdP 轮换 refreshToken 时旧的一签发新的就当场作废 ⇒ 重启后刷新 401。
-  // 这比「压根不刷新」更糟：token 有效期内它看起来完全正常。
-  let assembled: AssembledServer | null = null
-  const server = assembleServer({
-    config,
-    adminKeyStore,
-    accountApi: createServerAccountApi((): AccountStorePort | null => assembled?.store ?? null),
-    persistence: createServerPersistenceHooks()
-  })
-  assembled = server
-  // readiness 必须读**反代真实句柄**，不能读 enabled/autoStart 这种期望配置。
-  // 面板先于反代启动，所以注入动态 probe：后续从面板手动启动成功后会立即转为 ready。
-  server.panel.setReadinessProbe(() => server.getProxyServer()?.isRunning() === true)
-
-  // ⑤ 面板（先于反代 —— 它是唯一的管理入口，见文件头启动顺序）
-  const panelConfig = readPanelConfig(server.store, config)
+  let startupCompleted = false
   try {
-    await server.panel.start()
-  } catch (e) {
-    // 面板起不来是**致命**的：没有管理入口的服务端等于一个黑盒。
-    // 与反代的不对称是刻意的（见 ⑥）。
-    throw new ServerConfigError(
-      `面板启动失败（${messageOf(e)}）。\n` +
-        `面板是服务端唯一的管理入口，起不来则整个服务无法运维，故拒绝继续。\n` +
-        `常见原因：端口 ${panelConfig.port} 被占用（用 ${ENV.PANEL_PORT} 换一个）；` +
-        `或绑定到了外网地址而 adminKey 不可用。`,
-      EXIT.UNAVAILABLE
-    )
-  }
+    // ③ 数据前置校验（在装配之前 —— 拒启不该留副作用）
+    preflightForServerWithExitCode(config.dataDir)
 
-  // ⑥ 反代（按盘上配置；失败不致命）
-  const proxyConfig = readProxyConfig(server.store)
-  if (shouldAutoStartProxy(proxyConfig)) {
+    // ④ adminKey 引导（在面板启动之前）
+    //
+    // `legacyDesktopKeyPresent` 回答运维最可能的困惑：「我拷了数据文件，
+    // 为什么桌面上那个密钥登不进去」。服务端刻意不继承桌面密钥（它有未知暴露史：
+    // 设置页展示过、随数据文件跨机搬运过），故打印里要明说旧钥匙不生效。
+    const adminKeyStore = createServerAdminKeyStore({
+      dataDir: config.dataDir,
+      env,
+      legacyDesktopKeyPresent: hasLegacyDesktopAdminKey(config.dataDir)
+    })
+
+    // ⑤ 装配
+    //
+    // `accountApi` 必须传：不传时 `assembly.ts` 退回 `defaultAccountApi()`，那里三个上游
+    // HTTP 方法（refreshTokenByMethod / getUsageAndLimits / getUserInfo）**调用即抛** ——
+    // 后果是池中账号的 accessToken 过期后刷不出新的，「关机后反代仍在服务」
+    // 只在当前 token 有效期内成立。实现是与桌面**同一份** `src/main/upstreamApi`
+    // （零 electron 共享模块），服务端绝不复制第二份 token 刷新逻辑。
+    //
+    // store 用**惰性** getter 而非值：store 是 `assembleServer()` 内部建的（它同时负责
+    // `setStoreRef` 写入收口），而 accountApi 要作为参数先传进去 —— 构造时它还不存在。
+    // getter 在被调用时才求值，那时装配早已完成。
+    //
+    // `persistence` 必须传：不传时 `assembly.ts:buildProxyEvents` 的 `onAccountUpdate`
+    // 是「告警一次后丢弃」—— 反代刷出的新 token 只进内存池，进程重启后用回盘上的旧的。
+    // 而 IdP 轮换 refreshToken 时旧的一签发新的就当场作废 ⇒ 重启后刷新 401。
+    // 这比「压根不刷新」更糟：token 有效期内它看起来完全正常。
+    let assembled: AssembledServer | null = null
+    const server = assembleServer({
+      config,
+      adminKeyStore,
+      accountApi: createServerAccountApi((): AccountStorePort | null => assembled?.store ?? null),
+      persistence: createServerPersistenceHooks()
+    })
+    assembled = server
+    // readiness 必须读**反代真实句柄**，不能读 enabled/autoStart 这种期望配置。
+    // 面板先于反代启动，所以注入动态 probe：后续从面板手动启动成功后会立即转为 ready。
+    server.panel.setReadinessProbe(() => server.getProxyServer()?.isRunning() === true)
+
+    // ⑥ 面板（先于反代 —— 它是唯一的管理入口，见文件头启动顺序）
+    const panelConfig = readPanelConfig(server.store, config)
     try {
-      const proxy = server.initProxyServer()
-
-      // 顺序承重：**先同步池，再启动**。两端共用同步原语，但顺序各自显式编排：
-      // 面板空池拒启，服务端空池仍启动以保留 onPoolEmpty 懒补。架构门禁分别锁住
-      // 两处顺序，并发现未经归类的新启动点。
-      const { recordCount, poolSize } = syncProxyPoolFromStore(
-        () => server.store.get('accountData') as StoredProxyAccountData | undefined,
-        proxy,
-        'server-autostart'
-      )
-
-      await proxy.start()
-
-      // 播报**带上池大小**。只说「反代已启动」是这个缺陷最贵的部分：
-      // 运维在第一个请求到来之前无法判断池是不是空的，所有指示灯都是绿的。
-      if (poolSize > 0) {
-        console.log(
-          `[server] 反代已启动: ${proxyConfig.host}:${proxyConfig.port}（池 ${poolSize} 个账号）`
-        )
-      } else if (recordCount === 0) {
-        // 合法首启态：机主的迁移动作是「先起服务，再把 kiro-accounts.json 拷进来」。
-        // 刻意**不**拒绝启动 —— 拒启会连带关掉 `onPoolEmpty` 懒加载补池那条自愈路
-        // （`assembly.ts:buildProxyEvents` 已接，且 conf 每次 get 都现读盘），
-        // 把一个能自愈的场景变成必须人工上面板点启动。
-        console.log(`[server] 反代已启动: ${proxyConfig.host}:${proxyConfig.port}`)
-        console.warn(
-          `[server] ⚠️ 空池启动：数据文件里还没有任何账号（首次部署的常态）。\n` +
-            `[server]    把桌面端的 kiro-accounts.json 拷进 ${config.dataDir} 后，\n` +
-            `[server]    反代会在下一个请求到来时自动补池，**不需要重启**。`
-        )
-      } else {
-        // 与上一支的区别是承重的：这里盘上**有**账号，是真故障而非首启态，
-        // 运维要做的事完全不同（去查这些号为什么不准入，而不是去拷数据）。
-        // 逐个原因已由 `logPoolAdmissionSkips` 以 [PoolAdmission] 打在上一行。
-        console.log(`[server] 反代已启动: ${proxyConfig.host}:${proxyConfig.port}`)
-        console.warn(
-          `[server] 🔴 空池启动：盘上有 ${recordCount} 个账号，但全部未通过池准入 —— \n` +
-            `[server]    当前没有可服务账号；请求会按 HoldGate 配置挂起等待账号或立即失败。\n` +
-            `[server]    逐个原因见上一行 [PoolAdmission]（无凭据 / 已被上游拒绝）。\n` +
-            `[server]    常见处置：在桌面端或面板上重新测活这些账号，或补齐凭据。`
-        )
-      }
+      await server.panel.start()
     } catch (e) {
-      // 刻意不致命：面板已经在跑，运维能从手机上看到失败原因并重试。
-      // 崩在这里反而会连管理入口一起带走 —— 那时他只剩 SSH，
-      // 而「不用碰服务器」正是本项目要消除的东西。
-      console.error(
-        `\n${'!'.repeat(72)}\n` +
-          `[server] 🔴 DEGRADED：反代自动启动失败，当前**仅管理面板可用**。\n` +
-          `[server]    readiness /panel/readyz 将返回 503，业务流量不得导入。\n` +
-          `[server]    原因: ${messageOf(e)}\n` +
-          `[server]    面板仍在运行，可从面板查看原因并手动启动（常见：端口被占）。\n` +
-          `${'!'.repeat(72)}\n`
+      // 面板起不来是**致命**的：没有管理入口的服务端等于一个黑盒。
+      // 与反代的不对称是刻意的（见 ⑥）。
+      throw new ServerConfigError(
+        `面板启动失败（${messageOf(e)}）。\n` +
+          `面板是服务端唯一的管理入口，起不来则整个服务无法运维，故拒绝继续。\n` +
+          `常见原因：端口 ${panelConfig.port} 被占用（用 ${ENV.PANEL_PORT} 换一个）；` +
+          `或绑定到了外网地址而 adminKey 不可用。`,
+        EXIT.UNAVAILABLE
       )
     }
-  } else {
-    console.log(
-      `[server] 反代未自动启动（盘上 proxyConfig.enabled=${proxyConfig.enabled} ` +
-        `autoStart=${proxyConfig.autoStart ?? false}）。可从面板手动启动。`
-    )
-  }
 
-  return server
+    // ⑦ 反代（按盘上配置；失败不致命）
+    const proxyConfig = readProxyConfig(server.store)
+    if (shouldAutoStartProxy(proxyConfig)) {
+      try {
+        const proxy = server.initProxyServer()
+
+        // 顺序承重：**先同步池，再启动**。两端共用同步原语，但顺序各自显式编排：
+        // 面板空池拒启，服务端空池仍启动以保留 onPoolEmpty 懒补。架构门禁分别锁住
+        // 两处顺序，并发现未经归类的新启动点。
+        const { recordCount, poolSize } = syncProxyPoolFromStore(
+          () => server.store.get('accountData') as StoredProxyAccountData | undefined,
+          proxy,
+          'server-autostart'
+        )
+
+        await proxy.start()
+
+        // 播报**带上池大小**。只说「反代已启动」是这个缺陷最贵的部分：
+        // 运维在第一个请求到来之前无法判断池是不是空的，所有指示灯都是绿的。
+        if (poolSize > 0) {
+          console.log(
+            `[server] 反代已启动: ${proxyConfig.host}:${proxyConfig.port}（池 ${poolSize} 个账号）`
+          )
+        } else if (recordCount === 0) {
+          // 合法首启态：机主的迁移动作是「先起服务，再把 kiro-accounts.json 拷进来」。
+          // 刻意**不**拒绝启动 —— 拒启会连带关掉 `onPoolEmpty` 懒加载补池那条自愈路
+          // （`assembly.ts:buildProxyEvents` 已接，且 conf 每次 get 都现读盘），
+          // 把一个能自愈的场景变成必须人工上面板点启动。
+          console.log(`[server] 反代已启动: ${proxyConfig.host}:${proxyConfig.port}`)
+          console.warn(
+            `[server] ⚠️ 空池启动：数据文件里还没有任何账号（首次部署的常态）。\n` +
+              `[server]    把桌面端的 kiro-accounts.json 拷进 ${config.dataDir} 后，\n` +
+              `[server]    反代会在下一个请求到来时自动补池，**不需要重启**。`
+          )
+        } else {
+          // 与上一支的区别是承重的：这里盘上**有**账号，是真故障而非首启态，
+          // 运维要做的事完全不同（去查这些号为什么不准入，而不是去拷数据）。
+          // 逐个原因已由 `logPoolAdmissionSkips` 以 [PoolAdmission] 打在上一行。
+          console.log(`[server] 反代已启动: ${proxyConfig.host}:${proxyConfig.port}`)
+          console.warn(
+            `[server] 🔴 空池启动：盘上有 ${recordCount} 个账号，但全部未通过池准入 —— \n` +
+              `[server]    当前没有可服务账号；请求会按 HoldGate 配置挂起等待账号或立即失败。\n` +
+              `[server]    逐个原因见上一行 [PoolAdmission]（无凭据 / 已被上游拒绝）。\n` +
+              `[server]    常见处置：在桌面端或面板上重新测活这些账号，或补齐凭据。`
+          )
+        }
+      } catch (e) {
+        // 刻意不致命：面板已经在跑，运维能从手机上看到失败原因并重试。
+        // 崩在这里反而会连管理入口一起带走 —— 那时他只剩 SSH，
+        // 而「不用碰服务器」正是本项目要消除的东西。
+        console.error(
+          `\n${'!'.repeat(72)}\n` +
+            `[server] 🔴 DEGRADED：反代自动启动失败，当前**仅管理面板可用**。\n` +
+            `[server]    readiness /panel/readyz 将返回 503，业务流量不得导入。\n` +
+            `[server]    原因: ${messageOf(e)}\n` +
+            `[server]    面板仍在运行，可从面板查看原因并手动启动（常见：端口被占）。\n` +
+            `${'!'.repeat(72)}\n`
+        )
+      }
+    } else {
+      console.log(
+        `[server] 反代未自动启动（盘上 proxyConfig.enabled=${proxyConfig.enabled} ` +
+          `autoStart=${proxyConfig.autoStart ?? false}）。可从面板手动启动。`
+      )
+    }
+
+    // shutdown 内的 drain / flush / archive 全部完成后才释放锁。
+    attachDataDirectoryLock(server, dataDirectoryLock)
+    startupCompleted = true
+    return server
+  } finally {
+    // 启动中途失败时 main 会退出；测试直接调用 bootstrap 时也不能把锁泄漏到测试进程。
+    if (!startupCompleted) await dataDirectoryLock.release()
+  }
 }
 
 /**
