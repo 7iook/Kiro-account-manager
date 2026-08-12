@@ -23,31 +23,31 @@
  * `ipc/panelProxyDeps.ts` 相反 —— 实测它**不** import electron（它叫 `ipc/` 只是历史
  * 归位），故 `buildPanelProxyDeps` 原样复用，反代六个面板端点不重写。
  *
- * ## ⚠️ 已知缺口：**三个**上游 HTTP 函数尚未抽出（本文件用可注入缝位占位，**不复制实现**）
+ * ## 上游 HTTP 函数：已抽成零 electron 共享模块，由装配层注入（本文件不复制实现）
  *
- * 派单假设「K-1..K-3 已把服务端需要的端口全部抽出」。实测**有一层没抽**：
- * `AccountRuntimeDeps.api` 的七个成员里，**四个已直接接上**（见 `wiredFreeMethods`），
- * 剩下三个全是 `src/main/index.ts` 的**模块私有函数**，且各自缠着 index.ts 侧的模块级状态：
+ * `AccountRuntimeDeps.api` 的七个成员：四个本就在 index.ts 之外（见 `wiredFreeMethods`）；
+ * 剩下三个曾是 `src/main/index.ts` 的**模块私有函数**，各自缠着 index.ts 侧的模块级状态。
+ * `af94451` 把它们整层抽进 `src/main/upstreamApi/`（工厂 `createUpstreamApi(deps)`，
+ * 三个可变状态改为注入 getter），随后桌面端与服务端各自装配一个实例：
  *
- *   | 需要的 | 实际位置 | 状态 |
+ *   | 需要的 | 实现位置 | 服务端注入处 |
  *   |---|---|---|
- *   | `refreshTokenByMethod` | `index.ts:1170`（未 export） | ⛔ 内部走 `fetchWithAppProxy`(:342) → `getNetworkAgent()`；social 分支还要 `getCurrentMachineId()`(:1230) |
- *   | `getUsageAndLimits` | `index.ts:1748`（未 export） | ⛔ 闭包读模块级 `currentUsageApiType`(:292)，内部走 `getUsageLimitsRest`(:1610) |
- *   | `getUserInfo` | `index.ts:1902`（未 export） | ⛔ 委托 `kiroApiRequest`(:1421) |
- *   | `fetchEnterpriseProfileArn` | `proxy/kiroApi.ts`（已 export、已在内核闭包内） | ✅ 已接线 |
- *   | `readKiroAuthTokenFile` / `writeKiroAuthTokenFile` / `resolveProfileArnForWrite` | `kiroAuthSync.ts`（已 export、零 electron） | ✅ 已接线 |
+ *   | `refreshTokenByMethod` | `upstreamApi/refresh.ts`（single-flight 在工厂闭包内） | ✅ `server/accountApi.ts` |
+ *   | `getUsageAndLimits` | `upstreamApi/usage.ts`（`getUsageApiType` 注入 getter） | ✅ 同上 |
+ *   | `getUserInfo` | `upstreamApi/usage.ts` → `kiroApiRequest` | ✅ 同上 |
+ *   | `fetchEnterpriseProfileArn` | `proxy/kiroApi.ts`（已在内核闭包内） | ✅ `wiredFreeMethods` |
+ *   | `readKiroAuthTokenFile` / `writeKiroAuthTokenFile` / `resolveProfileArnForWrite` | `kiroAuthSync.ts`（零 electron） | ✅ 同上 |
  *
- * 处置：定义 `ServerAccountApi` 缝位 + 一个**显式失败**的默认实现（只覆盖那三个），
- * **绝不在这里重写一份 token 刷新**。重写会造出决策卡不变量 I5 禁止的「分叉的第二实现」——
- * 而 token 刷新恰好是最不能有两份的东西（两份对同一 refreshToken 的理解一旦分歧，
- * 结果是账号被上游踢下线，且只在生产上才看得见）。抽取那一层是独立工作包，
- * 它落地后把实现传进 `assembleServer({ accountApi })` 即可，本文件一行不用改。
+ * 本文件保留 `accountApi?` 为**可注入缝位** + 一个显式失败的默认实现，而不是在这里硬接 ——
+ * 理由与 `persistence` 同款：测试要能验「未注入时告警不静默」这条语义（那正是这个缺口
+ * 曾经的形态）。**绝不在这里重写一份 token 刷新**：那会造出决策卡不变量 I5 禁止的
+ * 「分叉的第二实现」—— 而 token 刷新恰好是最不能有两份的东西（两份对同一 refreshToken
+ * 的理解一旦分歧，结果是账号被上游踢下线，且只在生产上才看得见）。
  *
- * **对用户可见的后果（诚实标注，别让它看起来是「已达标」）**：缝位未填时，
- * 反代**跑得起来但不能自动刷 token** —— 池里账号的 accessToken 过期后
- * `ProxyServer.refreshToken()` 拿不到回调，只会 `console.warn` 然后判该号刷新失败。
- * 即「关掉电脑后反代仍在服务」这条成功状态在 token 有效期内成立、之后不成立。
- * 故本文件在缺缝位时**启动即告警**（见 `warnMissingAccountApi`），不静默。
+ * **未注入时对用户可见的后果（诚实标注）**：反代**跑得起来但不能自动刷 token** ——
+ * 池里账号的 accessToken 过期后 `ProxyServer.refreshToken()` 拿不到回调，
+ * 只会 `console.warn` 然后判该号刷新失败。故本文件在缺缝位时**启动即告警**
+ * （见 `warnMissingAccountApi`），不静默。生产入口 `server/entry.ts` 已注入真实现。
  */
 import { createConfAccountStore } from '../persistence/accountStore.conf'
 import type { AccountStorePort } from '../persistence/accountStorePort'
@@ -169,10 +169,9 @@ export function defaultAccountApi(): ServerAccountApi {
   const missing = (name: string) => (): never => {
     throw new Error(
       `[server] 账号上游 API 未接线：${name}。\n` +
-        `原因：该函数今天是 src/main/index.ts 的模块私有函数（refreshTokenByMethod:1170 / ` +
-        `getUsageAndLimits:1748 / getUserInfo:1902），未导出，且内部` +
-        `闭包引用 index.ts 的模块级状态（fetchWithAppProxy:342 / currentUsageApiType:292）。\n` +
-        `处置：把那一层抽成独立的零 electron 模块，再 assembleServer({ accountApi }) 传进来。` +
+        `原因：装配时没有传 \`accountApi\`。实现已在 \`src/main/upstreamApi\`（零 electron 共享模块，` +
+        `与桌面同一份），服务端的装配在 \`server/accountApi.ts:createServerAccountApi\`。\n` +
+        `处置：assembleServer({ accountApi: createServerAccountApi(getStore) })。` +
         `绝不在服务端复制一份实现 —— token 刷新有两份实现的后果是账号被上游踢下线。`
     )
   }
@@ -184,7 +183,20 @@ export function defaultAccountApi(): ServerAccountApi {
   } as unknown as ServerAccountApi
 }
 
-/** 未接线的方法名。`warnMissingAccountApi` 与测试共用这一份，防两处措辞漂移 */
+/**
+ * 未注入时仍会抛错的方法名。`warnMissingAccountApi` 与测试共用这一份，防两处措辞漂移。
+ *
+ * **为何抽取已落地、生产入口已注入之后仍保留这份清单（而不是改成空数组或删掉）**：
+ * 它描述的不是「今天还没抽出来的三个函数」，而是「`accountApi` 缺席时，
+ * `defaultAccountApi()` 会让哪三个方法抛错」—— 那个默认实现仍存在（它是 `accountApi?`
+ * 可选缝位的必然配套），且仍有真实消费者：测试里大量
+ * `assembleServer({ config, adminKeyStore })` 不传 accountApi。
+ * 改成空数组会让告警文案变成「缺的是 」（空白），删掉则让文案与测试各自手抄
+ * 一份方法名 —— 那才是它当初被建立要防的漂移。
+ *
+ * 它不再意味着「存在一个未完成的工作包」：抽取已完成（`af94451`），
+ * 生产入口 `server/entry.ts` 已注入真实现，故启动告警在生产路径上不会出现。
+ */
 export const UNWIRED_ACCOUNT_API_METHODS = [
   'getUsageAndLimits',
   'getUserInfo',
@@ -399,16 +411,19 @@ export function assembleServer(options: AssembleOptions): AssembledServer {
   }
 }
 
-/** 上游 API 未接线时的启动告警。**不静默** —— 见 assembly 文件头「已知缺口」 */
+/** 上游 API 未注入时的启动告警。**不静默** —— 见 assembly 文件头「已知缺口」 */
 function warnMissingAccountApi(): void {
   console.warn(
     '[server] ⚠️ 账号上游 API 未接线：反代可以启动并转发，但**无法自动刷新 token**。\n' +
       '[server]    池中账号的 accessToken 过期后，刷新会失败（ProxyServer 拿不到 onTokenRefresh 结果）。\n' +
       '[server]    即「关机后反代仍在服务」在 token 有效期内成立、之后不成立。\n' +
-      `[server]    缺的是 src/main/index.ts 里未导出的 ${UNWIRED_ACCOUNT_API_METHODS.join(' / ')}，\n` +
-      '[server]    需先抽成零 electron 模块再注入。（fetchEnterpriseProfileArn /\n' +
+      `[server]    缺的是 ${UNWIRED_ACCOUNT_API_METHODS.join(' / ')}，\n` +
+      '[server]    实现已在 src/main/upstreamApi（零 electron 共享模块，与桌面同一份）。\n' +
+      '[server]    改法：assembleServer({ accountApi: createServerAccountApi(getStore) })\n' +
+      '[server]    —— 生产入口 server/entry.ts 已经这么传，故这条告警只会出现在\n' +
+      '[server]    「有人新写了一个装配点却忘了传」的时候。（fetchEnterpriseProfileArn /\n' +
       '[server]    readKiroAuthTokenFile / writeKiroAuthTokenFile / resolveProfileArnForWrite\n' +
-      '[server]    已从 proxy/kiroApi 与 kiroAuthSync 直接接上，不在缺口内。）'
+      '[server]    由 defaultAccountApi 直接接上，从来不在缺口内。）'
   )
 }
 

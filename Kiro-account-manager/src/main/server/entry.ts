@@ -47,7 +47,9 @@ import {
 import { assembleServer, readPanelConfig, readProxyConfig, shouldAutoStartProxy } from './assembly'
 import { createServerAdminKeyStore } from './adminKeyStore'
 import { createServerPersistenceHooks } from './persistence'
+import { createServerAccountApi } from './accountApi'
 import type { AssembledServer } from './assembly'
+import type { AccountStorePort } from '../persistence/accountStorePort'
 
 /**
  * 启动。**不自己调 `process.exit`** —— 退出决策留给 `main()`。
@@ -76,15 +78,28 @@ export async function bootstrap(env: NodeJS.ProcessEnv = process.env): Promise<A
 
   // ④ 装配
   //
+  // `accountApi` 必须传：不传时 `assembly.ts` 退回 `defaultAccountApi()`，那里三个上游
+  // HTTP 方法（refreshTokenByMethod / getUsageAndLimits / getUserInfo）**调用即抛** ——
+  // 后果是池中账号的 accessToken 过期后刷不出新的，「关机后反代仍在服务」
+  // 只在当前 token 有效期内成立。实现是与桌面**同一份** `src/main/upstreamApi`
+  // （零 electron 共享模块），服务端绝不复制第二份 token 刷新逻辑。
+  //
+  // store 用**惰性** getter 而非值：store 是 `assembleServer()` 内部建的（它同时负责
+  // `setStoreRef` 写入收口），而 accountApi 要作为参数先传进去 —— 构造时它还不存在。
+  // getter 在被调用时才求值，那时装配早已完成。
+  //
   // `persistence` 必须传：不传时 `assembly.ts:buildProxyEvents` 的 `onAccountUpdate`
   // 是「告警一次后丢弃」—— 反代刷出的新 token 只进内存池，进程重启后用回盘上的旧的。
   // 而 IdP 轮换 refreshToken 时旧的一签发新的就当场作废 ⇒ 重启后刷新 401。
   // 这比「压根不刷新」更糟：token 有效期内它看起来完全正常。
+  let assembled: AssembledServer | null = null
   const server = assembleServer({
     config,
     adminKeyStore,
+    accountApi: createServerAccountApi((): AccountStorePort | null => assembled?.store ?? null),
     persistence: createServerPersistenceHooks()
   })
+  assembled = server
 
   // ⑤ 面板（先于反代 —— 它是唯一的管理入口，见文件头启动顺序）
   const panelConfig = readPanelConfig(server.store, config)
