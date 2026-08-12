@@ -181,6 +181,10 @@ export interface HoldEpisode {
   startedAt: number
   /** null = 仍在挂起中。 */
   endedAt: number | null
+  /** 本轮发生过的全部放行动作总数；不随下方展示明细截断。 */
+  totalReleaseCount: number
+  /** 本轮自动定时放行动作总数；用于派生会话级 autoReleaseCount。 */
+  totalAutoReleaseCount: number
   releases: HoldRelease[]
 }
 
@@ -224,18 +228,14 @@ export class HoldGate {
   private autoReleaseHandle: unknown = null
   /** 下次自动放行的绝对 epoch ms。null = **没有下一次**(关闭 / 无挂起条目);禁用 0 表达"无"(0 是合法 epoch)。 */
   private autoReleaseNextAt: number | null = null
-  // 口径:一次 timer 触发 = +1,与该次实际放行了几个条目无关(0 个也计数,代表"调度器确实在跑");
-  // 手动 releaseAll() 不计入(计数器只在 timer 回调里自增,不在 releaseAll 内部)。
-  // 生命周期 = 一次服务会话(启动服务 → 停止服务),由 ProxyServer 在两个会话边界调
-  // resetSessionState() 归零。**注意本实例不随 stop/start 重建**(门闸在 ProxyServer 构造函数里
-  // 建一次),故归零必须显式做 —— 早期注释误写作"反代 stop/start 即新实例",那正是本缺陷的来源。
-  private autoReleaseCount = 0
   // ===== 可观测性时间线(决策卡 hold-gate-observability)=====
   // I1 旁路:所有写入点都包 try-catch,时间线坏了不得影响放行本身。
   /** 当前进行中的一轮挂起;null = 集合为空。 */
   private currentEpisode: HoldEpisode | null = null
   /** 已结束的 episode,最新在前,上限 MAX_EPISODES。 */
   private recentEpisodes: HoldEpisode[] = []
+  /** 已因 episode 上限被淘汰的自动放行总数；值只从被淘汰 episode 的总数归约而来。 */
+  private discardedEpisodeAutoReleaseCount = 0
   private episodeSeq = 0
 
   constructor(deps: HoldGateDeps) {
@@ -311,6 +311,8 @@ export class HoldGate {
         detail: params.detail ? [...params.detail] : [],
         startedAt: this.clock.now(),
         endedAt: null,
+        totalReleaseCount: 0,
+        totalAutoReleaseCount: 0,
         releases: []
       }
     } catch {
@@ -339,7 +341,11 @@ export class HoldGate {
       ep.endedAt = this.clock.now()
       this.recentEpisodes.unshift(ep)
       if (this.recentEpisodes.length > MAX_EPISODES) {
-        this.recentEpisodes.length = MAX_EPISODES
+        const discarded = this.recentEpisodes.splice(MAX_EPISODES)
+        this.discardedEpisodeAutoReleaseCount += discarded.reduce(
+          (sum, episode) => sum + episode.totalAutoReleaseCount,
+          0
+        )
       }
       this.currentEpisode = null
       this.emit({
@@ -347,7 +353,7 @@ export class HoldGate {
         at: ep.endedAt,
         startedAt: ep.startedAt,
         reason: ep.reason,
-        releaseCount: ep.releases.length,
+        releaseCount: ep.totalReleaseCount,
         durationMs: ep.endedAt - ep.startedAt
       })
     } catch {
@@ -372,6 +378,8 @@ export class HoldGate {
     try {
       const ep = this.currentEpisode
       if (ep) {
+        ep.totalReleaseCount++
+        if (trigger === 'auto') ep.totalAutoReleaseCount++
         ep.releases.push({ at: this.clock.now(), trigger, outcome: 'pending', outcomeAt: null })
         if (ep.releases.length > MAX_RELEASES_PER_EPISODE) {
           ep.releases.splice(0, ep.releases.length - MAX_RELEASES_PER_EPISODE)
@@ -384,7 +392,7 @@ export class HoldGate {
         at: this.clock.now(),
         trigger,
         released,
-        autoReleaseCount: this.autoReleaseCount,
+        autoReleaseCount: this.getAutoReleaseCount(),
         heldCountAfter: this.held.size
       })
     } catch {
@@ -430,7 +438,6 @@ export class HoldGate {
       // 池仍无可用号时才是最需要放行的场景:放行让上游重跑,产生客户端可见的流活动,
       // 客户端 idle watchdog 的 ~10min 计时随之重置(用户 2026-08-09 实测确立)。
       // 若这里加了池可用性判断,恰好在"账号一直受限"这个目标场景下永不触发 = 功能等于没做。
-      this.autoReleaseCount++
       // 已认领条目(超时/abort/已放行)在 releaseAll 内部走 claim() 的一次性 CAS,自然 no-op(Invariant 2)。
       this.releaseAll('auto')
       if (this.held.size === 0) {
@@ -510,10 +517,10 @@ export class HoldGate {
     // 集合已空 → 兜底轮询与自动放行调度器都必须停表,否则会留下一个对着「已停的服务」空转的 interval。
     this.stopPollingIfIdle()
     this.stopAutoRelease()
-    this.autoReleaseCount = 0
     // 时间线与计数同生命周期(决策卡 I2):会话复位则整体归零,不留上一会话的 episode。
     this.currentEpisode = null
     this.recentEpisodes = []
+    this.discardedEpisodeAutoReleaseCount = 0
   }
 
   /** 下次自动放行的绝对 epoch ms;null = 没有下一次(关闭 / 无挂起条目)。前端本地自减渲染倒计时。 */
@@ -523,7 +530,9 @@ export class HoldGate {
 
   /** 本实例(= 本次反代启动)以来自动放行的**周期次数**,非条目数;手动放行不计入。 */
   getAutoReleaseCount(): number {
-    return this.autoReleaseCount
+    const current = this.currentEpisode?.totalAutoReleaseCount ?? 0
+    const recent = this.recentEpisodes.reduce((sum, episode) => sum + episode.totalAutoReleaseCount, 0)
+    return this.discardedEpisodeAutoReleaseCount + current + recent
   }
 
   /**

@@ -118,10 +118,10 @@ describe('放行可观测性 · 计数口径一致 + 有日志出口', () => {
     expect(gate.getAutoReleaseCount(), '集合空后不得继续累加').toBe(countAfterFirst)
 
     const tl = gate.getTimeline()
-    const totalReleases = (tl.current?.releases.length ?? 0)
-      + tl.recent.reduce((s, e) => s + e.releases.length, 0)
-    // 核心判据:对外可见的两个数字必须能对上
-    expect(totalReleases, 'timeline releases 应与 autoReleaseCount 同口径').toBe(countAfterFirst)
+    const totalAutoReleases = (tl.current?.totalAutoReleaseCount ?? 0)
+      + tl.recent.reduce((s, e) => s + e.totalAutoReleaseCount, 0)
+    // 核心判据:累计值必须来自 episode 的不可截断总数,不能再从展示明细长度推断。
+    expect(totalAutoReleases, 'episode auto total 应与 autoReleaseCount 同口径').toBe(countAfterFirst)
   })
 
   it('挂起进入/放行/归档三个节点都有事件出口(供落盘与事后聚合)', () => {

@@ -168,6 +168,7 @@ describe('HoldGate 时间线 · 放行记录与结局回填', () => {
 
     const rel = gate.getTimeline().current!.releases
     expect(rel).toHaveLength(1)
+    expect(gate.getTimeline().current!.totalReleaseCount).toBe(1)
     expect(rel[0].trigger).toBe('auto')
     expect(rel[0].at).toBe(60000)
     expect(rel[0].outcome).toBe('pending')
@@ -229,6 +230,7 @@ describe('HoldGate 时间线 · 放行记录与结局回填', () => {
 
     const ep = gate.getTimeline().recent[0]
     expect(ep.releases).toHaveLength(1)
+    expect(ep.totalReleaseCount).toBe(1)
     expect(ep.releases[0].trigger).toBe('manual')
     expect(ep.releases[0].at).toBe(1000)
     expect(gate.getAutoReleaseCount()).toBe(0)
@@ -244,6 +246,17 @@ describe('HoldGate 时间线 · 放行记录与结局回填', () => {
 
     // 池恢复放行同样由主循环回填结局,故此刻记录在 current。
     expect(gate.getTimeline().current!.releases[0].trigger).toBe('pool-available')
+    expect(gate.getTimeline().current!.totalReleaseCount).toBe(1)
+  })
+
+  it('兜底轮询放行与其他入口共用同一总数记录点', () => {
+    const gate = mkGate(clock, {}, () => true)
+    gate.enterHold({ receivedAt: 0, hooks: makeHooks(), reason: 'account-blocked' })
+    gate.tryResume('poll')
+
+    const episode = gate.getTimeline().current!
+    expect(episode.releases[0].trigger).toBe('poll')
+    expect(episode.totalReleaseCount).toBe(1)
   })
 
   it('超时收尾为终态_outcome回填为ended', () => {
@@ -293,7 +306,19 @@ describe('HoldGate 时间线 · 上限与生命周期', () => {
     expect(tl.recent[0].startedAt).toBeGreaterThan(tl.recent[19].startedAt)
   })
 
-  it('单个episode的release超过50条_丢最旧', () => {
+  it('episode超过展示上限后_会话自动放行累计数仍由episode总数归约', () => {
+    const gate = mkGate(clock, { autoReleaseIntervalMs: 1000 })
+    for (let i = 0; i < 25; i++) {
+      gate.enterHold({ receivedAt: clock.now(), hooks: makeHooks(), reason: 'account-blocked' })
+      clock.advance(1000)
+      gate.settleLastRelease('resumed-and-served')
+    }
+
+    expect(gate.getTimeline().recent).toHaveLength(20)
+    expect(gate.getAutoReleaseCount()).toBe(25)
+  })
+
+  it('单个episode的release超过50条_展示丢最旧但总数保持准确', () => {
     const gate = mkGate(clock, { autoReleaseIntervalMs: 1000 })
     const hooks = makeHooks()
     gate.enterHold({ receivedAt: 0, hooks, reason: 'account-blocked' })
@@ -303,7 +328,9 @@ describe('HoldGate 时间线 · 上限与生命周期', () => {
       gate.settleLastRelease('re-held')
       gate.enterHold({ receivedAt: 0, hooks, reason: 'account-blocked' })
     }
-    expect(gate.getTimeline().current!.releases).toHaveLength(50)
+    const episode = gate.getTimeline().current!
+    expect(episode.releases).toHaveLength(50)
+    expect(episode.totalReleaseCount).toBe(60)
   })
 
   it('resetSessionState清空时间线_与autoReleaseCount同步归零', () => {
@@ -317,6 +344,9 @@ describe('HoldGate 时间线 · 上限与生命周期', () => {
     expect(tl.current).toBeNull()
     expect(tl.recent).toEqual([])
     expect(gate.getAutoReleaseCount()).toBe(0)
+
+    gate.enterHold({ receivedAt: clock.now(), hooks: makeHooks(), reason: 'account-blocked' })
+    expect(gate.getTimeline().current!.totalReleaseCount).toBe(0)
   })
 
   it('时间线写入抛异常时放行仍正常完成', () => {
