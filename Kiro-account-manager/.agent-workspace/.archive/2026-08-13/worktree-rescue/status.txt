@@ -1,0 +1,35 @@
+ M Kiro-account-manager/src/main/index.ts
+ M Kiro-account-manager/src/main/proxy/kiroApi.ts
+ M Kiro-account-manager/src/main/proxy/proxyServer.ts
+ M Kiro-account-manager/src/main/proxy/types.ts
+ M Kiro-account-manager/src/renderer/src/components/proxy/ProxyPanel.tsx
+ M Kiro-account-manager/test/main/proxy/contextTrimGuard.test.ts
+?? Kiro-account-manager/node_modules.empty/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json
+?? Kiro-account-manager/src/main/proxy/rtk/applyFilter.ts
+?? Kiro-account-manager/src/main/proxy/rtk/autodetect.ts
+?? Kiro-account-manager/src/main/proxy/rtk/constants.ts
+?? Kiro-account-manager/src/main/proxy/rtk/filters/gitDiff.ts
+?? Kiro-account-manager/src/main/proxy/rtk/filters/grep.ts
+?? Kiro-account-manager/src/main/proxy/rtk/filters/readNumbered.ts
+?? Kiro-account-manager/src/main/proxy/rtk/filters/smartTruncate.ts
+?? Kiro-account-manager/src/main/proxy/rtk/index.ts
+?? Kiro-account-manager/src/main/proxy/streamWatchdog.ts
+?? Kiro-account-manager/test/main/proxy/reviewAdminRuntime.tmp.test.ts
+?? Kiro-account-manager/test/main/proxy/reviewOverflowSignal.tmp.test.ts
+?? Kiro-account-manager/test/main/proxy/rtk/applyFilter.test.ts
+?? Kiro-account-manager/test/main/proxy/rtk/gitDiff.test.ts
+?? Kiro-account-manager/test/main/proxy/rtk/grep.test.ts
+?? Kiro-account-manager/test/main/proxy/rtk/readNumbered.test.ts
+?? Kiro-account-manager/test/main/proxy/rtk/rtk.test.ts
+?? Kiro-account-manager/test/main/proxy/rtk/smartTruncate.test.ts
+?? Kiro-account-manager/test/main/proxy/safetyNetWiring.test.ts
+?? Kiro-account-manager/test/main/proxy/streamWatchdog.test.ts
+?? src/main/index.ts
+?? src/main/proxy/kiroApi.ts
+?? src/main/proxy/proxyServer.ts
+?? src/main/proxy/streamWatchdog.ts
+?? src/main/proxy/types.ts
+?? src/renderer/src/components/proxy/ProxyPanel.tsx
+?? test/main/proxy/contextTrimGuard.test.ts
+?? test/main/proxy/safetyNetWiring.test.ts
+?? test/main/proxy/streamWatchdog.test.ts
