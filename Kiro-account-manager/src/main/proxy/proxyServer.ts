@@ -21,10 +21,11 @@ import type {
 } from './types'
 import { AccountPool, ErrorType, classifyError, extractHttpStatusCode } from './accountPool'
 import { SmoothWeightedRoundRobin } from '../utils/smoothWeightedRoundRobin'
-import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, createUpstreamAttemptCounter, type KiroModel } from './kiroApi'
+import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, createUpstreamAttemptCounter, sampleTailShape, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
 import { perfDiag } from './perfDiag'
 import { classifyNoAccountHold, type NoAccountHoldDecision } from './holdDecision'
+import { detectGptHalt, isGptModel, GPT_HALT_NUDGE } from './gptHalt'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
   openaiToKiro,
@@ -4832,6 +4833,79 @@ export class ProxyServer {
           }
           // 发送 message_delta（包含完整 usage 信息）
           const hasToolCalls = pendingToolCalls.size > 0
+
+          // ===== GPT 半途收工:观测 + 无害介入(RCA 2026-08-12)=====
+          // 生产日志模型对照:gpt-5.6-sol 的 35 次流 100% 以 END_TURN 结束、TOOL_USE 为 0,
+          // 而 opus-4.7 是 163:17。且 GPT 那批全是 clean_eof + residual=0 ⇒ 上游流正常结束,
+          // 不是限流/掐断 —— GPT 把「我还要继续」表达成了普通 END_TURN,客户端据此收工。
+          // 判据与措辞见 gptHalt.ts;只在 GPT + END_TURN + 无工具 + 尾部话没说完时命中。
+          const haltTail = sampleTailShape(collectedContent)
+          const haltVerdict = detectGptHalt({
+            model,
+            upstreamStopReason: usage.terminal?.upstreamStopReason,
+            toolCallCount: pendingToolCalls.size,
+            outputChars: collectedContent.length,
+            tailEndsSentence: haltTail.endsSentence,
+            tailClass: haltTail.tailClass
+          })
+          if (haltVerdict.suspected) {
+            const haltMsg = `[GPT-HALT] 疑似半途收工 · model=${model}`
+              + ` stopReason=${usage.terminal?.upstreamStopReason ?? 'ABSENT'}`
+              + ` outChars=${collectedContent.length} tailClass=${haltTail.tailClass}`
+              + ` tools=${pendingToolCalls.size} → 已注入继续/汇报提示`
+            proxyLogger.warn('ProxyServer', haltMsg, {
+              path: '/v1/messages', model,
+              upstreamStopReason: usage.terminal?.upstreamStopReason ?? null,
+              outputChars: collectedContent.length,
+              tailClass: haltTail.tailClass,
+              account: (account as { email?: string }).email || account.id?.slice(0, 8) || '?'
+            })
+            if (perfDiag.isEnabled()) {
+              perfDiag.write({
+                kind: 'gpt-halt',
+                ts: new Date().toISOString(),
+                model,
+                upstreamStopReason: usage.terminal?.upstreamStopReason ?? null,
+                outputChars: collectedContent.length,
+                tailClass: haltTail.tailClass,
+                toolCallCount: pendingToolCalls.size,
+                injected: true
+              })
+            }
+            // 介入:把提示作为正文追加到当前文本块。
+            // 为什么不改 stop_reason:本项目 clientDrivenToolExecution=true,工具由客户端执行,
+            // 服务端没有多轮循环 —— 改成 tool_use 会让客户端去找不存在的工具调用(协议撕裂)。
+            // 追加正文则是协议内的合法输出,模型下一轮能看到它并自行决定继续还是汇报。
+            if (!this.isResponseClosed(res)) {
+              if (!hasStartedTextBlock) {
+                const blockStart = createClaudeStreamEvent('content_block_start', {
+                  index: currentBlockIndex,
+                  content_block: { type: 'text', text: '' }
+                })
+                res.write(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`)
+                hasStartedTextBlock = true
+              }
+              const nudge = createClaudeStreamEvent('content_block_delta', {
+                index: currentBlockIndex,
+                delta: { type: 'text_delta', text: GPT_HALT_NUDGE }
+              })
+              res.write(`event: content_block_delta\ndata: ${JSON.stringify(nudge)}\n\n`)
+            }
+          } else if (isGptModel(model) && perfDiag.isEnabled()) {
+            // A(观测):GPT 未命中也落盘,用于事后核对判据是否过紧 —— 只有分母才能算命中率。
+            perfDiag.write({
+              kind: 'gpt-halt',
+              ts: new Date().toISOString(),
+              model,
+              upstreamStopReason: usage.terminal?.upstreamStopReason ?? null,
+              outputChars: collectedContent.length,
+              tailClass: haltTail.tailClass,
+              toolCallCount: pendingToolCalls.size,
+              injected: false,
+              passedBy: haltVerdict.passedBy
+            })
+          }
+
           // 上游真实 stopReason 优先(length = 命中输出上限,需如实告知客户端);无则回退本地推断
           const stopReason = usage.terminal?.disposition === 'length'
             ? 'max_tokens'

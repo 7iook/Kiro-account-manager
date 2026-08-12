@@ -103,7 +103,29 @@ export interface PerfHoldRecord {
   releaseCount?: number
 }
 
-export type PerfRecord = PerfAttemptRecord | PerfRequestRecord | PerfHoldRecord
+/**
+ * GPT 半途收工的判定结果(RCA 2026-08-12)。
+ *
+ * 命中与未命中**都记**:只有分母才能算命中率。判据(见 gptHalt.ts)是基于 38 条
+ * 生产样本定的,需要真实数据核对它是否过紧(漏判 → 用户继续遇到半途断)或过松
+ * (误判 → 给讲完的对话强行追加提示)。`passedBy` 说明是哪条判据放行的。
+ */
+export interface PerfGptHaltRecord {
+  kind: 'gpt-halt'
+  ts: string
+  model: string
+  upstreamStopReason: string | null
+  outputChars: number
+  /** sampleTailShape 的末字符类别:sentence_end / comma / han / latin / markup … */
+  tailClass: string
+  toolCallCount: number
+  /** 是否注入了「继续或汇报」提示 */
+  injected: boolean
+  /** 未注入时,是哪条判据放行的(not-gpt / has-tool-calls / sentence-complete …) */
+  passedBy?: string
+}
+
+export type PerfRecord = PerfAttemptRecord | PerfRequestRecord | PerfHoldRecord | PerfGptHaltRecord
 
 class PerfDiagLogger {
   private enabled = false
