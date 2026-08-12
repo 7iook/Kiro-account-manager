@@ -1,0 +1,11 @@
+sample                                        OLD          NEW
+------------------------------------------------------------------------
+genuine seam (must stay SEAM in both)         SEAM         SEAM   ✓
+TAMPERED prefix — review repro                SEAM         UNEXPECTED   ✓
+TAMPERED — accountMachineId fallback dropped  SEAM         UNEXPECTED   ✓
+TAMPERED — arbitrary call injected before     SEAM         UNEXPECTED   ✓
+
+badSemanticChangeStillClassifiedSeam(old)=true
+badSemanticChangeStillClassifiedSeam(new)=false
+REGRESSIONS=0
+NEGCTL_EXIT=0

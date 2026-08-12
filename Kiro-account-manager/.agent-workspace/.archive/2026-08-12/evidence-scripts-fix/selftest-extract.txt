@@ -1,0 +1,11 @@
+PASS  CONTROL clean move ⇒ no issues + 2 pairs equal
+PASS  OMITTED function ⇒ DELETED_BUT_NOT_IN_NEW_MODULES
+PASS  EXTRA function ⇒ IN_NEW_BUT_ABSENT_FROM_OLD
+PASS  NO TRUNCATION at same-indent inner } ⇒ body reaches return
+PASS  SEMANTIC change ⇒ pair not byte-equal
+PASS  TRAILING WS ⇒ ignored, still equal
+PASS  STALE DI whitelist (name not in old) ⇒ DI_WHITELIST_STALE_NOT_IN_OLD
+PASS  DI-whitelisted name resurfacing in new modules ⇒ DI_WHITELIST_RESURFACED_IN_NEW
+
+SELFTEST TOTAL=8 PASSED=8 FAILED=0
+SELFTEST_EXIT=0

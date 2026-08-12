@@ -1,0 +1,26 @@
+
+> kiro-account-manager@1.7.6 build:server
+> npm run typecheck:node && vite build --config vite.server.config.ts && npm run build:webpanel
+
+
+> kiro-account-manager@1.7.6 typecheck:node
+> tsc --noEmit -p tsconfig.node.json --composite false
+
+[36mvite v7.2.6 [32mbuilding ssr environment for production...[36m[39m
+transforming...
+[32m✓[39m 69 modules transformed.
+rendering chunks...
+[2mout/server/[22m[36mindex.js  [39m[1m[33m682.45 kB[39m[22m[2m │ map: 1,740.30 kB[22m
+[32m✓ built in 703ms[39m
+
+> kiro-account-manager@1.7.6 build:webpanel
+> vite build --config vite.webPanel.config.ts
+
+[36mvite v7.2.6 [32mbuilding client environment for production...[36m[39m
+transforming...
+[32m✓[39m 36 modules transformed.
+rendering chunks...
+[2m../../out/webPanel/[22m[32mindex.html                 [39m[1m[2m  0.79 kB[22m[1m[22m
+[2m../../out/webPanel/[22m[35massets/index-D-5Yw_XB.css  [39m[1m[2m 33.34 kB[22m[1m[22m
+[2m../../out/webPanel/[22m[36massets/index-CUhIepbV.js   [39m[1m[2m449.82 kB[22m[1m[22m
+[32m✓ built in 950ms[39m

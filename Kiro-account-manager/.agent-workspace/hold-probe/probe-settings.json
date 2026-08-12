@@ -1,0 +1,16 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8788",
+    "ANTHROPIC_API_KEY": "probe-dummy-key",
+    "API_TIMEOUT_MS": "3600000",
+    "CLAUDE_CODE_MAX_RETRIES": "0",
+    "DISABLE_AUTOUPDATER": "1",
+    "DISABLE_TELEMETRY": "1",
+    "NO_PROXY": "127.0.0.1,localhost",
+    "HTTP_PROXY": "",
+    "HTTPS_PROXY": ""
+  },
+  "permissions": { "defaultMode": "bypassPermissions" },
+  "model": "claude-opus-4-8[1m]",
+  "availableModels": ["claude-opus-4-8[1m]"]
+}

@@ -1,0 +1,7 @@
+--- A top-level: truncated=true
+    heuristic captured 4 of 6 lines
+    lost tail: ["  return cfg.a + \"\"","}"]
+--- B inside factory: truncated=true
+    heuristic captured 4 of 7 lines
+    lost tail: ["    )","    return t.length","  }"]
+MECH_EXIT=0

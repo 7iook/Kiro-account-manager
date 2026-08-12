@@ -1,0 +1,24 @@
+function                        oldAST  oldHeur  newAST  newHeur
+getRestApiBase                  6       6        6       6
+getFallbackRestApiBase          5       5        5       5
+getNetworkAgent                 15      15       15      15
+fetchWithAppProxy               18      18       18      18
+kiroApiRequest                  73      73       73      73
+generateInvocationId            7       7        7       7
+getKiroUserAgent                4       4        4       4
+getKiroAmzUserAgent             4       4        4       4
+refreshOidcToken                29      29       29      29
+refreshSocialToken              39      39       39      39
+validateMicrosoftTokenEndpoint  15      15       15      15
+refreshExternalIdpToken         60      60       60      60
+refreshTokenByMethod            16      16       16      16
+refreshTokenByMethodInner       21      21       21      21
+ssoDeviceAuth                   172     172      172     172
+normalizeResetDate              8       8        8       8
+fetchRestApi                    33      33       33      33
+getUsageLimitsRest              82      82       82      82
+getUsageAndLimits               144     144      144     144
+getUserInfo                     3       3        3       3
+
+TRUNCATED_OLD_SIDE=0  TRUNCATED_NEW_SIDE=0  (0/0 = 本仓真实数据未被截断)
+TRUNC_EXIT=0

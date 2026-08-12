@@ -1,0 +1,12 @@
+PASS  CONTROL genuine device-id seam ⇒ SEAM
+PASS  CONTROL genuine useKProxy seam ⇒ SEAM
+PASS  CONTROL export-only ⇒ EXPORT
+PASS  TAMPERED prefix (attackerControlled) ⇒ UNEXPECTED
+PASS  DROPPED accountMachineId fallback ⇒ UNEXPECTED
+PASS  NEGATED condition ⇒ UNEXPECTED
+PASS  RENAMED assignment target ⇒ UNEXPECTED
+PASS  CHANGED compared literal ⇒ UNEXPECTED
+PASS  TRAILING WS ⇒ no row at all
+
+SELFTEST TOTAL=9 PASSED=9 FAILED=0
+SELFTEST_EXIT=0

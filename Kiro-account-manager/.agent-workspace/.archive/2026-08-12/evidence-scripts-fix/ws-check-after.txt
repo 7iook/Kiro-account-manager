@@ -1,0 +1,5 @@
+warning: in the working copy of 'Kiro-account-manager/src/main/upstreamApi/refresh.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'Kiro-account-manager/src/main/upstreamApi/sso.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'Kiro-account-manager/src/main/upstreamApi/transport.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'Kiro-account-manager/src/main/upstreamApi/usage.ts', LF will be replaced by CRLF the next time Git touches it
+WSCHECK_WORKTREE_EXIT=0

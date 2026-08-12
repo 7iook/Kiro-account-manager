@@ -1,0 +1,6 @@
+[TAMPER] dropped ssoDeviceAuth from src/main/upstreamApi/sso.ts (in memory only)
+PAIRS=19  ISSUES=1
+  {"kind":"DELETED_BUT_NOT_IN_NEW_MODULES","name":"ssoDeviceAuth"}
+
+CAUGHT_OMISSION=true
+NEW_EXIT=0

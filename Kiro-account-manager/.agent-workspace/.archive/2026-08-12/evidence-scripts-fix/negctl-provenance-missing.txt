@@ -1,0 +1,5 @@
+!! MISSING PROVENANCE.json — bodies/ 不是由当前版 extract-bodies.cjs 产出。
+   先跑: node extract-bodies.cjs --new-rev <rev>
+
+TOTAL CHANGED LINES=0  UNEXPECTED=0  STALE_RULES=0  PROVENANCE=MISSING
+EXIT=2

@@ -1,0 +1,5 @@
+
+> kiro-account-manager@1.7.6 typecheck:node
+> tsc --noEmit -p tsconfig.node.json --composite false
+
+TYPECHECK_EXIT=0

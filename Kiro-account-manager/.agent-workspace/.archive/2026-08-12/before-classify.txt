@@ -1,0 +1,33 @@
+SEAM        fetchRestApi                   L8    - const agent = getKProxyAgent()
+                                                 + const agent = getNetworkAgent()
+EXPORT      generateInvocationId           L1    - function generateInvocationId(): string {
+                                                 + export function generateInvocationId(): string {
+EXPORT      getFallbackRestApiBase         L1    - function getFallbackRestApiBase(ssoRegion?: string): string {
+                                                 + export function getFallbackRestApiBase(ssoRegion?: string): string {
+EXPORT      getKiroAmzUserAgent            L1    - function getKiroAmzUserAgent(machineId?: string): string {
+                                                 + export function getKiroAmzUserAgent(machineId?: string): string {
+EXPORT      getKiroUserAgent               L1    - function getKiroUserAgent(machineId?: string): string {
+                                                 + export function getKiroUserAgent(machineId?: string): string {
+SEAM        getNetworkAgent                L2    - if (useKProxyForApi) {
+                                                 + if (deps.useKProxy()) {
+SEAM        getNetworkAgent                L3    - const kproxyService = getKProxyService()
+                                                 + const kproxyService = deps.getKProxyService()
+EXPORT      getRestApiBase                 L1    - function getRestApiBase(ssoRegion?: string): string {
+                                                 + export function getRestApiBase(ssoRegion?: string): string {
+SEAM        getUsageAndLimits              L27   - if (currentUsageApiType === 'rest') {
+                                                 + if (getUsageApiType() === 'rest') {
+SEAM        getUsageLimitsRest             L10   - const machineId = accountMachineId || getCurrentMachineId()
+                                                 + const machineId = accountMachineId || transport.getDeviceIdForUa()
+SEAM        kiroApiRequest                 L10   - const machineId = accountMachineId || getCurrentMachineId()
+                                                 + const machineId = accountMachineId || deps.getDeviceIdForUa()
+SEAM        kiroApiRequest                 L13   - const agent = getKProxyAgent()
+                                                 + const agent = getNetworkAgent()
+EXPORT      normalizeResetDate             L1    - function normalizeResetDate(value: number | string | undefined): string | undefined {
+                                                 + export function normalizeResetDate(value: number | string | undefined): string | undefined {
+SEAM        refreshSocialToken             L8    - const machineId = getCurrentMachineId()
+                                                 + const machineId = transport.getDeviceIdForUa()
+EXPORT      validateMicrosoftTokenEndpoint L1    - function validateMicrosoftTokenEndpoint(rawEndpoint?: string): string {
+                                                 + export function validateMicrosoftTokenEndpoint(rawEndpoint?: string): string {
+
+TOTAL CHANGED LINES=15  UNEXPECTED=0
+CLASSIFY_EXIT=0

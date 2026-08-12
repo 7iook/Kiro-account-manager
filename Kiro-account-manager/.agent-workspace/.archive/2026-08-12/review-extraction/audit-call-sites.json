@@ -1,0 +1,492 @@
+{
+  "oldCount": 19,
+  "newCount": 19,
+  "onlyOld": [],
+  "onlyNew": [],
+  "oldCalls": [
+    {
+      "callee": "refreshTokenByMethod",
+      "owner": "<module>",
+      "line": 638,
+      "arity": 7,
+      "args": [
+        "account.refreshToken || ''",
+        "account.clientId || ''",
+        "account.clientSecret || ''",
+        "account.region || 'us-east-1'",
+        "account.authMethod",
+        "account.proxyUrl",
+        "{ tokenEndpoint: account.tokenEndpoint, scopes: account.scopes }"
+      ],
+      "text": "refreshTokenByMethod(\n            account.refreshToken || '',\n            account.clientId || '',\n            account.clientSecret || '',\n            account.region || 'us-east-1',\n            account.authMethod,\n            account.proxyUrl,  // 账号绑定的代理（如有）\n            { tokenEndpoint: account.tokenEndpoint, scopes: account.scopes }\n          )"
+    },
+    {
+      "callee": "refreshTokenByMethod",
+      "owner": "<module>",
+      "line": 824,
+      "arity": 7,
+      "args": [
+        "account.refreshToken",
+        "account.clientId || ''",
+        "account.clientSecret || ''",
+        "account.region || 'us-east-1'",
+        "account.authMethod",
+        "account.proxyUrl",
+        "{ tokenEndpoint: account.tokenEndpoint, scopes: account.scopes }"
+      ],
+      "text": "refreshTokenByMethod(\n        account.refreshToken,\n        account.clientId || '',\n        account.clientSecret || '',\n        account.region || 'us-east-1',\n        account.authMethod,\n        account.proxyUrl,\n        { tokenEndpoint: account.tokenEndpoint, scopes: account.scopes }\n      )"
+    },
+    {
+      "callee": "ssoDeviceAuth",
+      "owner": "<module>",
+      "line": 1958,
+      "arity": 2,
+      "args": [
+        "bearerToken",
+        "region"
+      ],
+      "text": "ssoDeviceAuth(bearerToken, region)"
+    },
+    {
+      "callee": "getUserInfo",
+      "owner": "<module>",
+      "line": 1960,
+      "arity": 4,
+      "args": [
+        "accessToken",
+        "idp",
+        "accountMachineId",
+        "email"
+      ],
+      "text": "getUserInfo(accessToken, idp, accountMachineId, email)"
+    },
+    {
+      "callee": "getUsageAndLimits",
+      "owner": "<module>",
+      "line": 1962,
+      "arity": 7,
+      "args": [
+        "accessToken",
+        "idp",
+        "profileArn",
+        "accountMachineId",
+        "ssoRegion",
+        "email",
+        "authMethod"
+      ],
+      "text": "getUsageAndLimits(accessToken, idp, profileArn, accountMachineId, ssoRegion, email, authMethod)"
+    },
+    {
+      "callee": "refreshTokenByMethod",
+      "owner": "<module>",
+      "line": 1964,
+      "arity": 7,
+      "args": [
+        "token",
+        "clientId",
+        "clientSecret",
+        "region",
+        "authMethod",
+        "proxyUrl",
+        "externalIdp"
+      ],
+      "text": "refreshTokenByMethod(token, clientId, clientSecret, region, authMethod, proxyUrl, externalIdp)"
+    },
+    {
+      "callee": "refreshTokenByMethod",
+      "owner": "runProactiveRenewal",
+      "line": 2339,
+      "arity": 7,
+      "args": [
+        "creds.refreshToken",
+        "creds.clientId || ''",
+        "creds.clientSecret || ''",
+        "creds.region || 'us-east-1'",
+        "creds.authMethod",
+        "account.proxyUrl",
+        "{ tokenEndpoint: creds.tokenEndpoint, scopes: creds.scopes }"
+      ],
+      "text": "refreshTokenByMethod(\n      creds.refreshToken,\n      creds.clientId || '',\n      creds.clientSecret || '',\n      creds.region || 'us-east-1',\n      creds.authMethod,\n      account.proxyUrl,\n      { tokenEndpoint: creds.tokenEndpoint, scopes: creds.scopes }\n    )"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 3400,
+      "arity": 2,
+      "args": [
+        "GITHUB_API_URL",
+        "{\n        headers: {\n          'Accept': 'application/vnd.github.v3+json',\n          'User-Agent': 'Kiro-Account-Manager'\n        }\n      }"
+      ],
+      "text": "fetchWithAppProxy(GITHUB_API_URL, {\n        headers: {\n          'Accept': 'application/vnd.github.v3+json',\n          'User-Agent': 'Kiro-Account-Manager'\n        }\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 3699,
+      "arity": 2,
+      "args": [
+        "url",
+        "{\n        method,\n        signal: controller.signal,\n        headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }\n      }"
+      ],
+      "text": "fetchWithAppProxy(url, {\n        method,\n        signal: controller.signal,\n        headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }\n      })"
+    },
+    {
+      "callee": "refreshTokenByMethod",
+      "owner": "<module>",
+      "line": 3760,
+      "arity": 7,
+      "args": [
+        "acc.refreshToken",
+        "acc.clientId || ''",
+        "acc.clientSecret || ''",
+        "acc.region || 'us-east-1'",
+        "acc.authMethod",
+        "acc.proxyUrl",
+        "{ tokenEndpoint: acc.tokenEndpoint, scopes: acc.scopes }"
+      ],
+      "text": "refreshTokenByMethod(\n            acc.refreshToken,\n            acc.clientId || '',\n            acc.clientSecret || '',\n            acc.region || 'us-east-1',\n            acc.authMethod,\n            acc.proxyUrl,\n            { tokenEndpoint: acc.tokenEndpoint, scopes: acc.scopes }\n          )"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 4281,
+      "arity": 2,
+      "args": [
+        "`${oidcBase}/client/register`",
+        "{\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientName: 'Kiro Account Manager',\n          clientType: 'public',\n          scopes,\n          grantTypes: ['urn:ietf:params:oauth:grant-type:device_code', 'refresh_token'],\n          issuerUrl: startUrl\n        })\n      }"
+      ],
+      "text": "fetchWithAppProxy(`${oidcBase}/client/register`, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientName: 'Kiro Account Manager',\n          clientType: 'public',\n          scopes,\n          grantTypes: ['urn:ietf:params:oauth:grant-type:device_code', 'refresh_token'],\n          issuerUrl: startUrl\n        })\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 4305,
+      "arity": 2,
+      "args": [
+        "`${oidcBase}/device_authorization`",
+        "{\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ clientId, clientSecret, startUrl })\n      }"
+      ],
+      "text": "fetchWithAppProxy(`${oidcBase}/device_authorization`, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ clientId, clientSecret, startUrl })\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 4362,
+      "arity": 2,
+      "args": [
+        "`${oidcBase}/token`",
+        "{\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientId,\n          clientSecret,\n          grantType: 'urn:ietf:params:oauth:grant-type:device_code',\n          deviceCode\n        })\n      }"
+      ],
+      "text": "fetchWithAppProxy(`${oidcBase}/token`, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientId,\n          clientSecret,\n          grantType: 'urn:ietf:params:oauth:grant-type:device_code',\n          deviceCode\n        })\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 4480,
+      "arity": 2,
+      "args": [
+        "`${oidcBase}/client/register`",
+        "{\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientName: 'Kiro Account Manager',\n          clientType: 'public',\n          scopes,\n          grantTypes: ['authorization_code', 'refresh_token'],\n          redirectUris: ['http://127.0.0.1/oauth/callback'],\n          issuerUrl: startUrl\n        })\n      }"
+      ],
+      "text": "fetchWithAppProxy(`${oidcBase}/client/register`, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientName: 'Kiro Account Manager',\n          clientType: 'public',\n          scopes,\n          grantTypes: ['authorization_code', 'refresh_token'],\n          redirectUris: ['http://127.0.0.1/oauth/callback'],\n          issuerUrl: startUrl\n        })\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 4609,
+      "arity": 2,
+      "args": [
+        "`${oidcBase}/token`",
+        "{\n                method: 'POST',\n                headers: { 'Content-Type': 'application/json' },\n                body: JSON.stringify({\n                  clientId,\n                  clientSecret,\n                  grantType: 'authorization_code',\n                  redirectUri,\n                  code,\n                  codeVerifier\n                })\n              }"
+      ],
+      "text": "fetchWithAppProxy(`${oidcBase}/token`, {\n                method: 'POST',\n                headers: { 'Content-Type': 'application/json' },\n                body: JSON.stringify({\n                  clientId,\n                  clientSecret,\n                  grantType: 'authorization_code',\n                  redirectUri,\n                  code,\n                  codeVerifier\n                })\n              })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "getLoginMetadata",
+      "line": 4787,
+      "arity": 2,
+      "args": [
+        "'https://app.kiro.dev/service/KiroWebPortalService/operation/GetLoginMetadata'",
+        "{\n        method: 'POST',\n        headers: {\n          'Content-Type': 'application/cbor',\n          Accept: 'application/cbor',\n          'smithy-protocol': 'rpc-v2-cbor'\n        },\n        body: reqBody\n      }"
+      ],
+      "text": "fetchWithAppProxy(\n      'https://app.kiro.dev/service/KiroWebPortalService/operation/GetLoginMetadata',\n      {\n        method: 'POST',\n        headers: {\n          'Content-Type': 'application/cbor',\n          Accept: 'application/cbor',\n          'smithy-protocol': 'rpc-v2-cbor'\n        },\n        body: reqBody\n      }\n    )"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 4847,
+      "arity": 2,
+      "args": [
+        "discoveryUrl",
+        "{\n        method: 'GET',\n        headers: { Accept: 'application/json' }\n      }"
+      ],
+      "text": "fetchWithAppProxy(discoveryUrl, {\n        method: 'GET',\n        headers: { Accept: 'application/json' }\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 4947,
+      "arity": 2,
+      "args": [
+        "saved.tokenEndpoint",
+        "{\n        method: 'POST',\n        headers: {\n          'Content-Type': 'application/x-www-form-urlencoded',\n          Accept: 'application/json'\n        },\n        body: body.toString()\n      }"
+      ],
+      "text": "fetchWithAppProxy(saved.tokenEndpoint, {\n        method: 'POST',\n        headers: {\n          'Content-Type': 'application/x-www-form-urlencoded',\n          Accept: 'application/json'\n        },\n        body: body.toString()\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 5078,
+      "arity": 2,
+      "args": [
+        "`${KIRO_AUTH_ENDPOINT}/oauth/token`",
+        "{\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          code,\n          code_verifier: codeVerifier,\n          redirect_uri: redirectUri\n        })\n      }"
+      ],
+      "text": "fetchWithAppProxy(`${KIRO_AUTH_ENDPOINT}/oauth/token`, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          code,\n          code_verifier: codeVerifier,\n          redirect_uri: redirectUri\n        })\n      })"
+    }
+  ],
+  "newCalls": [
+    {
+      "callee": "refreshTokenByMethod",
+      "owner": "<module>",
+      "line": 581,
+      "arity": 7,
+      "args": [
+        "account.refreshToken || ''",
+        "account.clientId || ''",
+        "account.clientSecret || ''",
+        "account.region || 'us-east-1'",
+        "account.authMethod",
+        "account.proxyUrl",
+        "{ tokenEndpoint: account.tokenEndpoint, scopes: account.scopes }"
+      ],
+      "text": "refreshTokenByMethod(\n            account.refreshToken || '',\n            account.clientId || '',\n            account.clientSecret || '',\n            account.region || 'us-east-1',\n            account.authMethod,\n            account.proxyUrl,  // 账号绑定的代理（如有）\n            { tokenEndpoint: account.tokenEndpoint, scopes: account.scopes }\n          )"
+    },
+    {
+      "callee": "refreshTokenByMethod",
+      "owner": "<module>",
+      "line": 767,
+      "arity": 7,
+      "args": [
+        "account.refreshToken",
+        "account.clientId || ''",
+        "account.clientSecret || ''",
+        "account.region || 'us-east-1'",
+        "account.authMethod",
+        "account.proxyUrl",
+        "{ tokenEndpoint: account.tokenEndpoint, scopes: account.scopes }"
+      ],
+      "text": "refreshTokenByMethod(\n        account.refreshToken,\n        account.clientId || '',\n        account.clientSecret || '',\n        account.region || 'us-east-1',\n        account.authMethod,\n        account.proxyUrl,\n        { tokenEndpoint: account.tokenEndpoint, scopes: account.scopes }\n      )"
+    },
+    {
+      "callee": "ssoDeviceAuth",
+      "owner": "<module>",
+      "line": 1002,
+      "arity": 2,
+      "args": [
+        "bearerToken",
+        "region"
+      ],
+      "text": "ssoDeviceAuth(bearerToken, region)"
+    },
+    {
+      "callee": "getUserInfo",
+      "owner": "<module>",
+      "line": 1004,
+      "arity": 4,
+      "args": [
+        "accessToken",
+        "idp",
+        "accountMachineId",
+        "email"
+      ],
+      "text": "getUserInfo(accessToken, idp, accountMachineId, email)"
+    },
+    {
+      "callee": "getUsageAndLimits",
+      "owner": "<module>",
+      "line": 1006,
+      "arity": 7,
+      "args": [
+        "accessToken",
+        "idp",
+        "profileArn",
+        "accountMachineId",
+        "ssoRegion",
+        "email",
+        "authMethod"
+      ],
+      "text": "getUsageAndLimits(accessToken, idp, profileArn, accountMachineId, ssoRegion, email, authMethod)"
+    },
+    {
+      "callee": "refreshTokenByMethod",
+      "owner": "<module>",
+      "line": 1008,
+      "arity": 7,
+      "args": [
+        "token",
+        "clientId",
+        "clientSecret",
+        "region",
+        "authMethod",
+        "proxyUrl",
+        "externalIdp"
+      ],
+      "text": "refreshTokenByMethod(token, clientId, clientSecret, region, authMethod, proxyUrl, externalIdp)"
+    },
+    {
+      "callee": "refreshTokenByMethod",
+      "owner": "runProactiveRenewal",
+      "line": 1383,
+      "arity": 7,
+      "args": [
+        "creds.refreshToken",
+        "creds.clientId || ''",
+        "creds.clientSecret || ''",
+        "creds.region || 'us-east-1'",
+        "creds.authMethod",
+        "account.proxyUrl",
+        "{ tokenEndpoint: creds.tokenEndpoint, scopes: creds.scopes }"
+      ],
+      "text": "refreshTokenByMethod(\n      creds.refreshToken,\n      creds.clientId || '',\n      creds.clientSecret || '',\n      creds.region || 'us-east-1',\n      creds.authMethod,\n      account.proxyUrl,\n      { tokenEndpoint: creds.tokenEndpoint, scopes: creds.scopes }\n    )"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 2444,
+      "arity": 2,
+      "args": [
+        "GITHUB_API_URL",
+        "{\n        headers: {\n          'Accept': 'application/vnd.github.v3+json',\n          'User-Agent': 'Kiro-Account-Manager'\n        }\n      }"
+      ],
+      "text": "fetchWithAppProxy(GITHUB_API_URL, {\n        headers: {\n          'Accept': 'application/vnd.github.v3+json',\n          'User-Agent': 'Kiro-Account-Manager'\n        }\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 2743,
+      "arity": 2,
+      "args": [
+        "url",
+        "{\n        method,\n        signal: controller.signal,\n        headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }\n      }"
+      ],
+      "text": "fetchWithAppProxy(url, {\n        method,\n        signal: controller.signal,\n        headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }\n      })"
+    },
+    {
+      "callee": "refreshTokenByMethod",
+      "owner": "<module>",
+      "line": 2804,
+      "arity": 7,
+      "args": [
+        "acc.refreshToken",
+        "acc.clientId || ''",
+        "acc.clientSecret || ''",
+        "acc.region || 'us-east-1'",
+        "acc.authMethod",
+        "acc.proxyUrl",
+        "{ tokenEndpoint: acc.tokenEndpoint, scopes: acc.scopes }"
+      ],
+      "text": "refreshTokenByMethod(\n            acc.refreshToken,\n            acc.clientId || '',\n            acc.clientSecret || '',\n            acc.region || 'us-east-1',\n            acc.authMethod,\n            acc.proxyUrl,\n            { tokenEndpoint: acc.tokenEndpoint, scopes: acc.scopes }\n          )"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 3325,
+      "arity": 2,
+      "args": [
+        "`${oidcBase}/client/register`",
+        "{\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientName: 'Kiro Account Manager',\n          clientType: 'public',\n          scopes,\n          grantTypes: ['urn:ietf:params:oauth:grant-type:device_code', 'refresh_token'],\n          issuerUrl: startUrl\n        })\n      }"
+      ],
+      "text": "fetchWithAppProxy(`${oidcBase}/client/register`, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientName: 'Kiro Account Manager',\n          clientType: 'public',\n          scopes,\n          grantTypes: ['urn:ietf:params:oauth:grant-type:device_code', 'refresh_token'],\n          issuerUrl: startUrl\n        })\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 3349,
+      "arity": 2,
+      "args": [
+        "`${oidcBase}/device_authorization`",
+        "{\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ clientId, clientSecret, startUrl })\n      }"
+      ],
+      "text": "fetchWithAppProxy(`${oidcBase}/device_authorization`, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ clientId, clientSecret, startUrl })\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 3406,
+      "arity": 2,
+      "args": [
+        "`${oidcBase}/token`",
+        "{\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientId,\n          clientSecret,\n          grantType: 'urn:ietf:params:oauth:grant-type:device_code',\n          deviceCode\n        })\n      }"
+      ],
+      "text": "fetchWithAppProxy(`${oidcBase}/token`, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientId,\n          clientSecret,\n          grantType: 'urn:ietf:params:oauth:grant-type:device_code',\n          deviceCode\n        })\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 3524,
+      "arity": 2,
+      "args": [
+        "`${oidcBase}/client/register`",
+        "{\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientName: 'Kiro Account Manager',\n          clientType: 'public',\n          scopes,\n          grantTypes: ['authorization_code', 'refresh_token'],\n          redirectUris: ['http://127.0.0.1/oauth/callback'],\n          issuerUrl: startUrl\n        })\n      }"
+      ],
+      "text": "fetchWithAppProxy(`${oidcBase}/client/register`, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          clientName: 'Kiro Account Manager',\n          clientType: 'public',\n          scopes,\n          grantTypes: ['authorization_code', 'refresh_token'],\n          redirectUris: ['http://127.0.0.1/oauth/callback'],\n          issuerUrl: startUrl\n        })\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 3653,
+      "arity": 2,
+      "args": [
+        "`${oidcBase}/token`",
+        "{\n                method: 'POST',\n                headers: { 'Content-Type': 'application/json' },\n                body: JSON.stringify({\n                  clientId,\n                  clientSecret,\n                  grantType: 'authorization_code',\n                  redirectUri,\n                  code,\n                  codeVerifier\n                })\n              }"
+      ],
+      "text": "fetchWithAppProxy(`${oidcBase}/token`, {\n                method: 'POST',\n                headers: { 'Content-Type': 'application/json' },\n                body: JSON.stringify({\n                  clientId,\n                  clientSecret,\n                  grantType: 'authorization_code',\n                  redirectUri,\n                  code,\n                  codeVerifier\n                })\n              })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "getLoginMetadata",
+      "line": 3831,
+      "arity": 2,
+      "args": [
+        "'https://app.kiro.dev/service/KiroWebPortalService/operation/GetLoginMetadata'",
+        "{\n        method: 'POST',\n        headers: {\n          'Content-Type': 'application/cbor',\n          Accept: 'application/cbor',\n          'smithy-protocol': 'rpc-v2-cbor'\n        },\n        body: reqBody\n      }"
+      ],
+      "text": "fetchWithAppProxy(\n      'https://app.kiro.dev/service/KiroWebPortalService/operation/GetLoginMetadata',\n      {\n        method: 'POST',\n        headers: {\n          'Content-Type': 'application/cbor',\n          Accept: 'application/cbor',\n          'smithy-protocol': 'rpc-v2-cbor'\n        },\n        body: reqBody\n      }\n    )"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 3891,
+      "arity": 2,
+      "args": [
+        "discoveryUrl",
+        "{\n        method: 'GET',\n        headers: { Accept: 'application/json' }\n      }"
+      ],
+      "text": "fetchWithAppProxy(discoveryUrl, {\n        method: 'GET',\n        headers: { Accept: 'application/json' }\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 3991,
+      "arity": 2,
+      "args": [
+        "saved.tokenEndpoint",
+        "{\n        method: 'POST',\n        headers: {\n          'Content-Type': 'application/x-www-form-urlencoded',\n          Accept: 'application/json'\n        },\n        body: body.toString()\n      }"
+      ],
+      "text": "fetchWithAppProxy(saved.tokenEndpoint, {\n        method: 'POST',\n        headers: {\n          'Content-Type': 'application/x-www-form-urlencoded',\n          Accept: 'application/json'\n        },\n        body: body.toString()\n      })"
+    },
+    {
+      "callee": "fetchWithAppProxy",
+      "owner": "<module>",
+      "line": 4122,
+      "arity": 2,
+      "args": [
+        "`${KIRO_AUTH_ENDPOINT}/oauth/token`",
+        "{\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          code,\n          code_verifier: codeVerifier,\n          redirect_uri: redirectUri\n        })\n      }"
+      ],
+      "text": "fetchWithAppProxy(`${KIRO_AUTH_ENDPOINT}/oauth/token`, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          code,\n          code_verifier: codeVerifier,\n          redirect_uri: redirectUri\n        })\n      })"
+    }
+  ]
+}

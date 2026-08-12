@@ -1,0 +1,7 @@
+OLD_REV=af94451^ (66 fns)  NEW=8c42227 (index.ts now 44 fns)
+DELETED_FROM_OLD=22  MOVED_IN_NEW_MODULES=20  PAIRS=20
+TOTAL=20 IDENTICAL=7 DIFFERING=13
+DIFFERING: fetchRestApi, generateInvocationId, getFallbackRestApiBase, getKiroAmzUserAgent, getKiroUserAgent, getNetworkAgent, getRestApiBase, getUsageAndLimits, getUsageLimitsRest, kiroApiRequest, normalizeResetDate, refreshSocialToken, validateMicrosoftTokenEndpoint
+
+ISSUES=0
+EXTRACT_EXIT=0

@@ -1,0 +1,10 @@
+=== OLD extractor (hand-written CASES, ssoDeviceAuth omitted) ===
+TOTAL=19 IDENTICAL=6 DIFFERING=13
+ssoDeviceAuth compared? false
+=> 输出里没有任何字样表明少比了一个函数；exit code 恒 0（原版全文无 process.exitCode）
+OLD_SILENTLY_ACCEPTS_OMISSION=true
+
+=== truncation check on ssoDeviceAuth (new module side) ===
+AST node lines=172  old-heuristic lines=172  match=true
+old index side lines=172
+OLD_EXIT=0

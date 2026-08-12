@@ -1,0 +1,104 @@
+// 回归测试:429 退避的 full jitter —— 并发调用者必须被真正解相关
+//
+// 背景 RCA:.agent-workspace/.archive/2026-08-11/429-latency-throughput/
+// 实证(2026-08-10 真实生产日志 + 本轮亲跑):
+//   - 旧实现 'fast' 策略 = 固定 baseMs + ±25% jitter。baseMs 实测生效 50ms
+//     ⇒ 抖动幅度仅 ±12ms,而单次 429 往返(上传 0.77MB + 被拒)实测 1880-2476ms。
+//     ±12ms 相对 1.9s 请求时长毫无解相关作用:N 个并发请求几乎同时重试,
+//     重新同步成 thundering herd,持续把共享容量推远。
+//   - 危险率实测随已流逝时间单调下降(0-0.5s:29.5% → 4-6s:4.8%),说明重试
+//     在加深拥塞,不是在"等随机窗口打开"。
+//   - 上游从不给 Retry-After(860/860 空;对比项目 Quorinex 独立实测 474/474 空)。
+//
+// 业界依据:AWS Builders' Library "Timeouts, retries, and backoff with jitter"
+// (Marc Brooker)—— full jitter(从 [0,window) 均匀取样)才能解相关;
+// "window + 窄带 jitter" 会让共享同一凭据的并发调用者重新同步。
+//
+// 本文件锁三件事:
+//   1. full jitter 的取值散布在整个窗口内,不是聚在 base 附近的窄带
+//   2. Retry-After 存在时优先(并 clamp),不被 jitter 覆盖
+//   3. 退避有下限(不 busy-poll)与上限(不无界等待)
+import { describe, it, expect } from 'vitest'
+import { computeRateLimitBackoffMs } from '@main/proxy/kiroApi'
+
+/** 采样同一 attempt 的退避值,量它的散布 */
+function sample(n: number, fn: () => number): { min: number; max: number; uniq: number; spread: number } {
+  const vals = Array.from({ length: n }, fn)
+  const min = Math.min(...vals)
+  const max = Math.max(...vals)
+  return { min, max, uniq: new Set(vals).size, spread: max - min }
+}
+
+describe('429 退避 · full jitter 解相关', () => {
+  it('fast 策略的取值必须散布在整个窗口,而非聚在 base 附近的 ±25% 窄带', () => {
+    // 旧行为:base=50 → 取值恒落在 [37,62],spread ≈ 25ms
+    // 新行为(full jitter):窗口随 attempt 几何增长,取值散布覆盖窗口大部分
+    const s = sample(400, () => computeRateLimitBackoffMs({
+      strategy: 'fast', baseMs: 400, attempt: 2, retryAfterSec: NaN
+    }))
+    // 窗口 = base * 2^attempt = 1600ms;full jitter 应该能取到远低于窗口上限的值,
+    // 也能取到接近上限的值 —— 散布必须远大于旧实现的 25ms 窄带
+    expect(s.spread).toBeGreaterThan(500)
+    expect(s.uniq).toBeGreaterThan(50)
+    // 关键:必须有相当比例的样本落在窗口下半区(旧实现永远做不到)
+    const lows = Array.from({ length: 400 }, () => computeRateLimitBackoffMs({
+      strategy: 'fast', baseMs: 400, attempt: 2, retryAfterSec: NaN
+    })).filter(v => v < 800).length
+    expect(lows).toBeGreaterThan(40)
+  })
+
+  it('窗口随 attempt 增长,但有上限(不无界等待)', () => {
+    const early = sample(200, () => computeRateLimitBackoffMs({
+      strategy: 'fast', baseMs: 400, attempt: 0, retryAfterSec: NaN
+    }))
+    const late = sample(200, () => computeRateLimitBackoffMs({
+      strategy: 'fast', baseMs: 400, attempt: 8, retryAfterSec: NaN
+    }))
+    expect(late.max).toBeGreaterThan(early.max)
+    // 上限:单次等待绝不超过 20s(对比项目 Quorinex 同口径,保证限流恢复时能及时探到)
+    for (let a = 0; a < 30; a++) {
+      expect(computeRateLimitBackoffMs({
+        strategy: 'fast', baseMs: 400, attempt: a, retryAfterSec: NaN
+      })).toBeLessThanOrEqual(20_000)
+    }
+  })
+
+  it('退避有下限,绝不 busy-poll 已限流的上游', () => {
+    for (let a = 0; a < 12; a++) {
+      for (let i = 0; i < 30; i++) {
+        expect(computeRateLimitBackoffMs({
+          strategy: 'fast', baseMs: 50, attempt: a, retryAfterSec: NaN
+        })).toBeGreaterThanOrEqual(250)
+      }
+    }
+  })
+
+  it('Retry-After 存在时优先且被 clamp(恶意/荒谬值不能挂住请求)', () => {
+    expect(computeRateLimitBackoffMs({
+      strategy: 'fast', baseMs: 400, attempt: 0, retryAfterSec: 3
+    })).toBe(3000)
+    // clamp:超大值收到上限
+    expect(computeRateLimitBackoffMs({
+      strategy: 'fast', baseMs: 400, attempt: 0, retryAfterSec: 9999
+    })).toBeLessThanOrEqual(20_000)
+  })
+
+  it('linear / exponential 策略保持原语义(不被本次改动破坏)', () => {
+    expect(computeRateLimitBackoffMs({
+      strategy: 'linear', baseMs: 400, attempt: 0, retryAfterSec: NaN
+    })).toBe(400)
+    expect(computeRateLimitBackoffMs({
+      strategy: 'linear', baseMs: 400, attempt: 2, retryAfterSec: NaN
+    })).toBe(1200)
+    expect(computeRateLimitBackoffMs({
+      strategy: 'exponential', baseMs: 400, attempt: 3, retryAfterSec: NaN
+    })).toBe(3200)
+    // 各自的封顶仍在
+    expect(computeRateLimitBackoffMs({
+      strategy: 'linear', baseMs: 4000, attempt: 20, retryAfterSec: NaN
+    })).toBeLessThanOrEqual(5000)
+    expect(computeRateLimitBackoffMs({
+      strategy: 'exponential', baseMs: 4000, attempt: 20, retryAfterSec: NaN
+    })).toBeLessThanOrEqual(15_000)
+  })
+})

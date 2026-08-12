@@ -1,0 +1,20 @@
+diff --git a/Kiro-account-manager/package.json b/Kiro-account-manager/package.json
+index 4326c7d..7bd8fe8 100644
+--- a/Kiro-account-manager/package.json
++++ b/Kiro-account-manager/package.json
+@@ -17,3 +17,3 @@
+     "build": "npm run typecheck && electron-vite build && npm run build:webpanel",
+-    "postinstall": "electron-builder install-app-deps",
++    "postinstall": "node scripts/postinstall.mjs",
+     "build:unpack": "npm run build && electron-builder --dir",
+@@ -34,4 +34,2 @@
+   "dependencies": {
+-    "@electron-toolkit/preload": "^3.0.2",
+-    "@electron-toolkit/utils": "^4.0.0",
+     "@tailwindcss/vite": "^4.1.17",
+@@ -60,3 +58,5 @@
+     "@electron-toolkit/eslint-config-ts": "^3.1.0",
++    "@electron-toolkit/preload": "^3.0.2",
+     "@electron-toolkit/tsconfig": "^2.0.0",
++    "@electron-toolkit/utils": "^4.0.0",
+     "@testing-library/jest-dom": "^6.9.1",

@@ -1,0 +1,613 @@
+{
+  "oldRevisionFileSha256": "f9fafe18b090d884857ee71174f54d2e693189b703b02372622eac64c73af915",
+  "movedCount": 20,
+  "deletedOldFunctionNames": [
+    "fetchRestApi",
+    "fetchWithAppProxy",
+    "generateInvocationId",
+    "getCurrentMachineId",
+    "getFallbackRestApiBase",
+    "getKProxyAgent",
+    "getKiroAmzUserAgent",
+    "getKiroUserAgent",
+    "getNetworkAgent",
+    "getRestApiBase",
+    "getUsageAndLimits",
+    "getUsageLimitsRest",
+    "getUserInfo",
+    "kiroApiRequest",
+    "normalizeResetDate",
+    "refreshExternalIdpToken",
+    "refreshOidcToken",
+    "refreshSocialToken",
+    "refreshTokenByMethod",
+    "refreshTokenByMethodInner",
+    "ssoDeviceAuth",
+    "validateMicrosoftTokenEndpoint"
+  ],
+  "deletedOldNotCompared": [
+    "getCurrentMachineId",
+    "getKProxyAgent"
+  ],
+  "comparedNotDeleted": [],
+  "movedNames": [
+    "fetchRestApi",
+    "fetchWithAppProxy",
+    "generateInvocationId",
+    "getFallbackRestApiBase",
+    "getKiroAmzUserAgent",
+    "getKiroUserAgent",
+    "getNetworkAgent",
+    "getRestApiBase",
+    "getUsageAndLimits",
+    "getUsageLimitsRest",
+    "getUserInfo",
+    "kiroApiRequest",
+    "normalizeResetDate",
+    "refreshExternalIdpToken",
+    "refreshOidcToken",
+    "refreshSocialToken",
+    "refreshTokenByMethod",
+    "refreshTokenByMethodInner",
+    "ssoDeviceAuth",
+    "validateMicrosoftTokenEndpoint"
+  ],
+  "oldMissingMovedNames": [],
+  "evidenceOldNames": [
+    "fetchRestApi",
+    "fetchWithAppProxy",
+    "generateInvocationId",
+    "getFallbackRestApiBase",
+    "getKiroAmzUserAgent",
+    "getKiroUserAgent",
+    "getNetworkAgent",
+    "getRestApiBase",
+    "getUsageAndLimits",
+    "getUsageLimitsRest",
+    "getUserInfo",
+    "kiroApiRequest",
+    "normalizeResetDate",
+    "refreshExternalIdpToken",
+    "refreshOidcToken",
+    "refreshSocialToken",
+    "refreshTokenByMethod",
+    "refreshTokenByMethodInner",
+    "ssoDeviceAuth",
+    "validateMicrosoftTokenEndpoint"
+  ],
+  "evidenceNewNames": [
+    "fetchRestApi",
+    "fetchWithAppProxy",
+    "generateInvocationId",
+    "getFallbackRestApiBase",
+    "getKiroAmzUserAgent",
+    "getKiroUserAgent",
+    "getNetworkAgent",
+    "getRestApiBase",
+    "getUsageAndLimits",
+    "getUsageLimitsRest",
+    "getUserInfo",
+    "kiroApiRequest",
+    "normalizeResetDate",
+    "refreshExternalIdpToken",
+    "refreshOidcToken",
+    "refreshSocialToken",
+    "refreshTokenByMethod",
+    "refreshTokenByMethodInner",
+    "ssoDeviceAuth",
+    "validateMicrosoftTokenEndpoint"
+  ],
+  "evidenceOldExtra": [],
+  "evidenceOldMissing": [],
+  "evidenceNewExtra": [],
+  "evidenceNewMissing": [],
+  "duplicateNewNames": [],
+  "cacheChecks": [
+    {
+      "name": "fetchRestApi",
+      "oldExists": true,
+      "newFile": "usage",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1576,
+        1608
+      ],
+      "newLines": [
+        64,
+        96
+      ],
+      "oldSha256": "474f9ad5ada77fa822ece59675d3b901411fccad6b895cede847052a5a9dbfa8",
+      "oldAstSha256": "474f9ad5ada77fa822ece59675d3b901411fccad6b895cede847052a5a9dbfa8"
+    },
+    {
+      "name": "fetchWithAppProxy",
+      "oldExists": true,
+      "newFile": "transport",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        342,
+        359
+      ],
+      "newLines": [
+        162,
+        179
+      ],
+      "oldSha256": "2ca4a2eae9b5957aa3d9a6088a589423f879487895c7c0e0bf20ef4450e1c3d2",
+      "oldAstSha256": "2ca4a2eae9b5957aa3d9a6088a589423f879487895c7c0e0bf20ef4450e1c3d2"
+    },
+    {
+      "name": "generateInvocationId",
+      "oldExists": true,
+      "newFile": "transport",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1209,
+        1215
+      ],
+      "newLines": [
+        82,
+        88
+      ],
+      "oldSha256": "50dda8cbb9fd1d8eb5ba2ae1b66d3517a56324074fa3da5028232d9c2b95f361",
+      "oldAstSha256": "50dda8cbb9fd1d8eb5ba2ae1b66d3517a56324074fa3da5028232d9c2b95f361"
+    },
+    {
+      "name": "getFallbackRestApiBase",
+      "oldExists": true,
+      "newFile": "transport",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        284,
+        288
+      ],
+      "newLines": [
+        60,
+        64
+      ],
+      "oldSha256": "351d830b8ea7271bad3aba5ae17b916aee03d543b48d079b45941ae1faf9ec14",
+      "oldAstSha256": "351d830b8ea7271bad3aba5ae17b916aee03d543b48d079b45941ae1faf9ec14"
+    },
+    {
+      "name": "getKiroAmzUserAgent",
+      "oldExists": true,
+      "newFile": "transport",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1225,
+        1228
+      ],
+      "newLines": [
+        77,
+        80
+      ],
+      "oldSha256": "971c45f2762b696c3f5629aa7c84c0669f827bcbc19952fb22c6366ee2c12eb7",
+      "oldAstSha256": "971c45f2762b696c3f5629aa7c84c0669f827bcbc19952fb22c6366ee2c12eb7"
+    },
+    {
+      "name": "getKiroUserAgent",
+      "oldExists": true,
+      "newFile": "transport",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1220,
+        1223
+      ],
+      "newLines": [
+        72,
+        75
+      ],
+      "oldSha256": "54a25ba79114d29522194652ac53fa849ae9a95ecc103f527e459b31c052c613",
+      "oldAstSha256": "54a25ba79114d29522194652ac53fa849ae9a95ecc103f527e459b31c052c613"
+    },
+    {
+      "name": "getNetworkAgent",
+      "oldExists": true,
+      "newFile": "transport",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        318,
+        332
+      ],
+      "newLines": [
+        138,
+        152
+      ],
+      "oldSha256": "2ee05803614a1ac5812dd007619ebc10f700aa13b99768c81a8a2fd915ed6b53",
+      "oldAstSha256": "2ee05803614a1ac5812dd007619ebc10f700aa13b99768c81a8a2fd915ed6b53"
+    },
+    {
+      "name": "getRestApiBase",
+      "oldExists": true,
+      "newFile": "transport",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        276,
+        281
+      ],
+      "newLines": [
+        52,
+        57
+      ],
+      "oldSha256": "454a1036bcc279cc9995d9b9fc860ce7bcd881c7a0ae04ea5bc8c7e32dd40cb4",
+      "oldAstSha256": "454a1036bcc279cc9995d9b9fc860ce7bcd881c7a0ae04ea5bc8c7e32dd40cb4"
+    },
+    {
+      "name": "getUsageAndLimits",
+      "oldExists": true,
+      "newFile": "usage",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1748,
+        1891
+      ],
+      "newLines": [
+        181,
+        324
+      ],
+      "oldSha256": "1e0bd7d5b2fb46036747a1c95e636e62adb1d0db8502dc6257586e94dd47fc47",
+      "oldAstSha256": "1e0bd7d5b2fb46036747a1c95e636e62adb1d0db8502dc6257586e94dd47fc47"
+    },
+    {
+      "name": "getUsageLimitsRest",
+      "oldExists": true,
+      "newFile": "usage",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1610,
+        1691
+      ],
+      "newLines": [
+        98,
+        179
+      ],
+      "oldSha256": "3cf50843b0c5438f882b3aa9fb822bdf517d0531f275c1dd7317601daa9b3d1c",
+      "oldAstSha256": "3cf50843b0c5438f882b3aa9fb822bdf517d0531f275c1dd7317601daa9b3d1c"
+    },
+    {
+      "name": "getUserInfo",
+      "oldExists": true,
+      "newFile": "usage",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1902,
+        1904
+      ],
+      "newLines": [
+        327,
+        329
+      ],
+      "oldSha256": "83141d1fd2e9e493c343688885c834dbc3419d9d94d007c36fc4e735c9290ef9",
+      "oldAstSha256": "83141d1fd2e9e493c343688885c834dbc3419d9d94d007c36fc4e735c9290ef9"
+    },
+    {
+      "name": "kiroApiRequest",
+      "oldExists": true,
+      "newFile": "transport",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1421,
+        1493
+      ],
+      "newLines": [
+        181,
+        253
+      ],
+      "oldSha256": "00d58395cd8f96b2a14b3e69a16134af7db756eb96374c79bc106e761606e6cf",
+      "oldAstSha256": "00d58395cd8f96b2a14b3e69a16134af7db756eb96374c79bc106e761606e6cf"
+    },
+    {
+      "name": "normalizeResetDate",
+      "oldExists": true,
+      "newFile": "usage",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1567,
+        1574
+      ],
+      "newLines": [
+        23,
+        30
+      ],
+      "oldSha256": "2cb06387dc4f23f2b4e7ef123812946503067373d9f1147306c432b698dc1c16",
+      "oldAstSha256": "2cb06387dc4f23f2b4e7ef123812946503067373d9f1147306c432b698dc1c16"
+    },
+    {
+      "name": "refreshExternalIdpToken",
+      "oldExists": true,
+      "newFile": "refresh",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1099,
+        1158
+      ],
+      "newLines": [
+        129,
+        188
+      ],
+      "oldSha256": "401c18cb24293e681292c9012fa5cc2c2999ef34abeae689ac19015a6478ebe7",
+      "oldAstSha256": "401c18cb24293e681292c9012fa5cc2c2999ef34abeae689ac19015a6478ebe7"
+    },
+    {
+      "name": "refreshOidcToken",
+      "oldExists": true,
+      "newFile": "refresh",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1001,
+        1029
+      ],
+      "newLines": [
+        57,
+        85
+      ],
+      "oldSha256": "d563ace122b103cb647516a1345b57a5a171a63dfc61faeae2e5d81360a7ac5f",
+      "oldAstSha256": "d563ace122b103cb647516a1345b57a5a171a63dfc61faeae2e5d81360a7ac5f"
+    },
+    {
+      "name": "refreshSocialToken",
+      "oldExists": true,
+      "newFile": "refresh",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1032,
+        1070
+      ],
+      "newLines": [
+        88,
+        126
+      ],
+      "oldSha256": "172dd59231990e57886b05d59d73d501cb070174b95a2441534eaa898e455e6b",
+      "oldAstSha256": "172dd59231990e57886b05d59d73d501cb070174b95a2441534eaa898e455e6b"
+    },
+    {
+      "name": "refreshTokenByMethod",
+      "oldExists": true,
+      "newFile": "refresh",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1170,
+        1185
+      ],
+      "newLines": [
+        200,
+        215
+      ],
+      "oldSha256": "42079a0693ee29459fe6bda89ec99968a3e3504e14914ef80c13b21e8057e1da",
+      "oldAstSha256": "42079a0693ee29459fe6bda89ec99968a3e3504e14914ef80c13b21e8057e1da"
+    },
+    {
+      "name": "refreshTokenByMethodInner",
+      "oldExists": true,
+      "newFile": "refresh",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1187,
+        1207
+      ],
+      "newLines": [
+        217,
+        237
+      ],
+      "oldSha256": "e12f89009cda726f17bca4d2a5606619efb991851e3ebe2b32ca6e75c5274c0c",
+      "oldAstSha256": "e12f89009cda726f17bca4d2a5606619efb991851e3ebe2b32ca6e75c5274c0c"
+    },
+    {
+      "name": "ssoDeviceAuth",
+      "oldExists": true,
+      "newFile": "sso",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1248,
+        1419
+      ],
+      "newLines": [
+        16,
+        187
+      ],
+      "oldSha256": "e50d2f7c17468612bbee7036c2e1372fa0788d3e58e25b7750703d6f714cd7f6",
+      "oldAstSha256": "e50d2f7c17468612bbee7036c2e1372fa0788d3e58e25b7750703d6f714cd7f6"
+    },
+    {
+      "name": "validateMicrosoftTokenEndpoint",
+      "oldExists": true,
+      "newFile": "refresh",
+      "oldCacheExactAstNode": true,
+      "newCacheExactAstNode": true,
+      "oldFirstDiff": null,
+      "newFirstDiff": null,
+      "oldLines": [
+        1082,
+        1096
+      ],
+      "newLines": [
+        23,
+        37
+      ],
+      "oldSha256": "c8f5fa36d01ac1c54d1526383562302aaf9b68fd1ee695027f890863030866f2",
+      "oldAstSha256": "c8f5fa36d01ac1c54d1526383562302aaf9b68fd1ee695027f890863030866f2"
+    }
+  ],
+  "expectedDiffCount": 12,
+  "expectedDiffs": [
+    {
+      "name": "fetchRestApi",
+      "line": 8,
+      "old": "  const agent = getKProxyAgent()",
+      "new": "  const agent = getNetworkAgent()",
+      "exportOnly": false,
+      "strictSeam": true
+    },
+    {
+      "name": "generateInvocationId",
+      "line": 1,
+      "old": "function generateInvocationId(): string {",
+      "new": "export function generateInvocationId(): string {",
+      "exportOnly": true,
+      "strictSeam": false
+    },
+    {
+      "name": "getFallbackRestApiBase",
+      "line": 1,
+      "old": "function getFallbackRestApiBase(ssoRegion?: string): string {",
+      "new": "export function getFallbackRestApiBase(ssoRegion?: string): string {",
+      "exportOnly": true,
+      "strictSeam": false
+    },
+    {
+      "name": "getKiroAmzUserAgent",
+      "line": 1,
+      "old": "function getKiroAmzUserAgent(machineId?: string): string {",
+      "new": "export function getKiroAmzUserAgent(machineId?: string): string {",
+      "exportOnly": true,
+      "strictSeam": false
+    },
+    {
+      "name": "getKiroUserAgent",
+      "line": 1,
+      "old": "function getKiroUserAgent(machineId?: string): string {",
+      "new": "export function getKiroUserAgent(machineId?: string): string {",
+      "exportOnly": true,
+      "strictSeam": false
+    },
+    {
+      "name": "getNetworkAgent",
+      "line": 2,
+      "old": "  if (useKProxyForApi) {",
+      "new": "  if (deps.useKProxy()) {",
+      "exportOnly": false,
+      "strictSeam": true
+    },
+    {
+      "name": "getNetworkAgent",
+      "line": 3,
+      "old": "    const kproxyService = getKProxyService()",
+      "new": "    const kproxyService = deps.getKProxyService()",
+      "exportOnly": false,
+      "strictSeam": true
+    },
+    {
+      "name": "getRestApiBase",
+      "line": 1,
+      "old": "function getRestApiBase(ssoRegion?: string): string {",
+      "new": "export function getRestApiBase(ssoRegion?: string): string {",
+      "exportOnly": true,
+      "strictSeam": false
+    },
+    {
+      "name": "getUsageAndLimits",
+      "line": 27,
+      "old": "  if (currentUsageApiType === 'rest') {",
+      "new": "  if (getUsageApiType() === 'rest') {",
+      "exportOnly": false,
+      "strictSeam": true
+    },
+    {
+      "name": "kiroApiRequest",
+      "line": 13,
+      "old": "  const agent = getKProxyAgent()",
+      "new": "  const agent = getNetworkAgent()",
+      "exportOnly": false,
+      "strictSeam": true
+    },
+    {
+      "name": "normalizeResetDate",
+      "line": 1,
+      "old": "function normalizeResetDate(value: number | string | undefined): string | undefined {",
+      "new": "export function normalizeResetDate(value: number | string | undefined): string | undefined {",
+      "exportOnly": true,
+      "strictSeam": false
+    },
+    {
+      "name": "validateMicrosoftTokenEndpoint",
+      "line": 1,
+      "old": "function validateMicrosoftTokenEndpoint(rawEndpoint?: string): string {",
+      "new": "export function validateMicrosoftTokenEndpoint(rawEndpoint?: string): string {",
+      "exportOnly": true,
+      "strictSeam": false
+    }
+  ],
+  "unexpectedDiffCount": 3,
+  "unexpectedDiffs": [
+    {
+      "name": "getUsageLimitsRest",
+      "line": 10,
+      "old": "  const machineId = accountMachineId || getCurrentMachineId()",
+      "new": "  const machineId = accountMachineId || transport.getDeviceIdForUa()",
+      "exportOnly": false,
+      "strictSeam": false
+    },
+    {
+      "name": "kiroApiRequest",
+      "line": 10,
+      "old": "  const machineId = accountMachineId || getCurrentMachineId()",
+      "new": "  const machineId = accountMachineId || deps.getDeviceIdForUa()",
+      "exportOnly": false,
+      "strictSeam": false
+    },
+    {
+      "name": "refreshSocialToken",
+      "line": 8,
+      "old": "  const machineId = getCurrentMachineId()",
+      "new": "  const machineId = transport.getDeviceIdForUa()",
+      "exportOnly": false,
+      "strictSeam": false
+    }
+  ]
+}

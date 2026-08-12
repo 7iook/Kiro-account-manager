@@ -1,0 +1,162 @@
+diff --git a/Kiro-account-manager/package-lock.json b/Kiro-account-manager/package-lock.json
+index 345eca1..6d7fc81 100644
+--- a/Kiro-account-manager/package-lock.json
++++ b/Kiro-account-manager/package-lock.json
+@@ -13,2 +12,0 @@
+-        "@electron-toolkit/preload": "^3.0.2",
+-        "@electron-toolkit/utils": "^4.0.0",
+@@ -38,0 +37 @@
++        "@electron-toolkit/preload": "^3.0.2",
+@@ -39,0 +39 @@
++        "@electron-toolkit/utils": "^4.0.0",
+@@ -63,0 +64,3 @@
++      },
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
+@@ -730,0 +734 @@
++      "dev": true,
+@@ -749,0 +754 @@
++      "dev": true,
+@@ -789,0 +795 @@
++      "dev": true,
+@@ -2689,0 +2696 @@
++      "dev": true,
+@@ -2708,0 +2716 @@
++      "dev": true,
+@@ -3211,0 +3220 @@
++      "dev": true,
+@@ -3267,0 +3277 @@
++      "dev": true,
+@@ -3280,0 +3291 @@
++      "dev": true,
+@@ -3296,0 +3308 @@
++      "devOptional": true,
+@@ -3347,0 +3360 @@
++      "dev": true,
+@@ -3371,0 +3385 @@
++      "dev": true,
+@@ -4559,0 +4574 @@
++      "dev": true,
+@@ -4636,0 +4652 @@
++      "dev": true,
+@@ -4823,0 +4840 @@
++      "dev": true,
+@@ -4832,0 +4850 @@
++      "dev": true,
+@@ -5113,0 +5132 @@
++      "dev": true,
+@@ -5569,0 +5589 @@
++      "dev": true,
+@@ -5584,0 +5605 @@
++      "dev": true,
+@@ -5616,0 +5638 @@
++      "dev": true,
+@@ -5626 +5648 @@
+-      "devOptional": true,
++      "dev": true,
+@@ -5644 +5666 @@
+-      "devOptional": true,
++      "dev": true,
+@@ -5697,0 +5720 @@
++      "dev": true,
+@@ -5929,0 +5953 @@
++      "dev": true,
+@@ -6282,0 +6307 @@
++      "dev": true,
+@@ -6317,0 +6343 @@
++      "dev": true,
+@@ -6403 +6429 @@
+-      "devOptional": true,
++      "dev": true,
+@@ -6413 +6439 @@
+-      "devOptional": true,
++      "dev": true,
+@@ -6517,0 +6544 @@
++      "dev": true,
+@@ -6576 +6603 @@
+-      "devOptional": true,
++      "dev": true,
+@@ -6898,0 +6926 @@
++      "dev": true,
+@@ -6972,0 +7001 @@
++      "dev": true,
+@@ -7180,0 +7210 @@
++      "dev": true,
+@@ -7359,0 +7390 @@
++      "dev": true,
+@@ -7440,0 +7472 @@
++      "dev": true,
+@@ -7458,0 +7491 @@
++      "dev": true,
+@@ -7485 +7518 @@
+-      "devOptional": true,
++      "dev": true,
+@@ -7502 +7535 @@
+-      "devOptional": true,
++      "dev": true,
+@@ -7514,0 +7548 @@
++      "dev": true,
+@@ -7576 +7610 @@
+-      "devOptional": true,
++      "dev": true,
+@@ -7706,0 +7741 @@
++      "dev": true,
+@@ -7726,0 +7762 @@
++      "dev": true,
+@@ -8573,0 +8610 @@
++      "dev": true,
+@@ -8599,0 +8637 @@
++      "dev": true,
+@@ -8619,0 +8658 @@
++      "dev": true,
+@@ -8644,0 +8684 @@
++      "dev": true,
+@@ -9103,0 +9144 @@
++      "dev": true,
+@@ -9272,0 +9314 @@
++      "dev": true,
+@@ -9360,0 +9403 @@
++      "dev": true,
+@@ -9739,0 +9783 @@
++      "dev": true,
+@@ -9792 +9836 @@
+-      "devOptional": true,
++      "dev": true,
+@@ -9890,0 +9935 @@
++      "dev": true,
+@@ -9975,0 +10021 @@
++      "dev": true,
+@@ -10158,0 +10205 @@
++      "dev": true,
+@@ -10332,0 +10380 @@
++      "dev": true,
+@@ -10374,0 +10423 @@
++      "dev": true,
+@@ -10403,0 +10453 @@
++      "dev": true,
+@@ -10630,0 +10681 @@
++      "dev": true,
+@@ -10646,0 +10698 @@
++      "dev": true,
+@@ -10699,0 +10752 @@
++      "dev": true,
+@@ -10876,0 +10930 @@
++      "dev": true,
+@@ -10885,0 +10940 @@
++      "dev": true,
+@@ -10892,0 +10948 @@
++      "dev": true,
+@@ -11201,0 +11258 @@
++      "dev": true,
+@@ -11466,0 +11524 @@
++      "dev": true,
+@@ -11840,0 +11899 @@
++      "dev": true,
+@@ -12009,0 +12069 @@
++      "devOptional": true,
+@@ -12041,0 +12102 @@
++      "dev": true,
+@@ -12541,0 +12603 @@
++      "dev": true,
+@@ -12620,0 +12683 @@
++      "dev": true,

@@ -1,0 +1,1 @@
+{"ts": "02:30:54", "label": "probe/tiny", "status": 400, "ttfb": 1639, "pay": 267, "key": "QaR5MX", "ep": "US", "got": 0, "err": "{\"__type\":\"com.amazon.kiro.runtimeservice#ValidationException\",\"message\":\"Invalid model ID. Please select a different model to continue.\",\"reason\":\"INVALID_MODEL_ID\"}"}

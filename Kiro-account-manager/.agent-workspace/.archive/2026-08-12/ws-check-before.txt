@@ -1,0 +1,35 @@
+Kiro-account-manager/src/main/upstreamApi/refresh.ts:106: trailing whitespace.
++      
+Kiro-account-manager/src/main/upstreamApi/refresh.ts:112: trailing whitespace.
++      
+Kiro-account-manager/src/main/upstreamApi/refresh.ts:115: trailing whitespace.
++      
+Kiro-account-manager/src/main/upstreamApi/sso.ts:144: trailing whitespace.
++      
+Kiro-account-manager/src/main/upstreamApi/transport.ts:194: trailing whitespace.
++    
+Kiro-account-manager/src/main/upstreamApi/transport.ts:206: trailing whitespace.
++    
+Kiro-account-manager/src/main/upstreamApi/usage.ts:132: trailing whitespace.
++    
+Kiro-account-manager/src/main/upstreamApi/usage.ts:161: trailing whitespace.
++    
+Kiro-account-manager/src/main/upstreamApi/usage.ts:175: trailing whitespace.
++    
+Kiro-account-manager/src/main/upstreamApi/usage.ts:233: trailing whitespace.
++            freeTrialExpiry: typeof b.freeTrialInfo.freeTrialExpiry === 'number' 
+Kiro-account-manager/src/main/upstreamApi/usage.ts:234: trailing whitespace.
++              ? new Date(b.freeTrialInfo.freeTrialExpiry * 1000).toISOString() 
+Kiro-account-manager/src/main/upstreamApi/usage.ts:247: trailing whitespace.
++            expiresAt: typeof bonus.expiresAt === 'number' 
+Kiro-account-manager/src/main/upstreamApi/usage.ts:248: trailing whitespace.
++              ? new Date(bonus.expiresAt * 1000).toISOString() 
+Kiro-account-manager/src/main/upstreamApi/usage.ts:297: trailing whitespace.
++                freeTrialExpiry: typeof b.freeTrialInfo.freeTrialExpiry === 'number' 
+Kiro-account-manager/src/main/upstreamApi/usage.ts:298: trailing whitespace.
++                  ? new Date(b.freeTrialInfo.freeTrialExpiry * 1000).toISOString() 
+Kiro-account-manager/src/main/upstreamApi/usage.ts:310: trailing whitespace.
++                expiresAt: typeof bonus.expiresAt === 'number' 
+Kiro-account-manager/src/main/upstreamApi/usage.ts:311: trailing whitespace.
++                  ? new Date(bonus.expiresAt * 1000).toISOString() 
+WSCHECK_EXIT=2
