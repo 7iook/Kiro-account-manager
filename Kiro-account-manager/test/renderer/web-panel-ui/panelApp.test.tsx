@@ -259,13 +259,30 @@ describe('会话失效', () => {
   })
 })
 
-describe('桌面端专属能力', () => {
-  it('仍然说明复制凭据 / 编辑 / 删除需在桌面端（导入已不在此列）', async () => {
-    stubLoggedIn([account()])
+describe('浏览器凭据边界与仍需桌面端的能力', () => {
+  it('账号备注 / 分组 / 删除已由面板管理，但凭据复制和订阅管理仍不在面板', async () => {
+    stubLoggedIn([account()], {
+      'GET /panel/api/accounts/acc-1/subscriptions': {
+        body: { success: true, plans: [] }
+      }
+    })
     render(<App />)
     await screen.findByText('alice@example.com')
-    // 面板不提供凭据复制与编辑删除 —— 这些仍是桌面端专属
-    expect(screen.getByText(/复制凭据、编辑与删除请在桌面端/)).toBeInTheDocument()
+
+    // 凭据仍不进入浏览器，所以面板没有复制凭据入口；元数据编辑与删除则已由服务端完成。
+    expect(
+      screen.getByText(/凭据不会发送到浏览器；账号备注、分组与删除操作由服务器完成/)
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /复制.*凭据/ })).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: '更多操作' }))
+    expect(screen.getByRole('button', { name: '编辑账号' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '删除账号' })).toBeInTheDocument()
+    expect(screen.getByText(/凭据不会显示或通过手机编辑/)).toBeInTheDocument()
+
+    // 订阅升级/管理仍需桌面端；面板只读取并展示可用方案。
+    await userEvent.click(screen.getByRole('button', { name: '管理订阅' }))
+    expect(await screen.findByText(/订阅升级\/管理请在桌面端打开/)).toBeInTheDocument()
   })
 })
 
@@ -390,7 +407,10 @@ describe('手机端导入 ksk_', () => {
     })
     stubLoggedIn([])
     // 在既有桩之上再包一层：POST 挂住直到我们放行
-    const original = globalThis.fetch as unknown as (i: string, x?: RequestInit) => Promise<Response>
+    const original = globalThis.fetch as unknown as (
+      i: string,
+      x?: RequestInit
+    ) => Promise<Response>
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: string, init?: RequestInit) => {

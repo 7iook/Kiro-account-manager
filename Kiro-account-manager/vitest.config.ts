@@ -21,6 +21,7 @@ const REAL_IO_TESTS = [
   'test/main/server/serverAutostartPoolSync.test.ts',
   'test/main/server/dataDirectoryLock.test.ts',
   'test/main/architecture/server_bundle_esm_interop.test.ts',
+  'test/main/proxy/trustedTlsProxy.integration.test.ts',
   'test/main/upstreamApi/upstreamApiWithoutElectron.runtime.test.ts',
   'test/main/architecture/postinstall_conditional.test.ts'
 ]
