@@ -28,13 +28,15 @@
  */
 import type http from 'node:http'
 import { sendJson, sendError, type PanelErrorCode } from './respond'
-import { projectAccountsBlob, type AccountListPayload } from './dto'
+import {
+  PANEL_ACCOUNT_UNSUSPEND_CONFIRMATION,
+  projectAccountsBlob,
+  type AccountListPayload,
+  type AccountUnsuspendResponse
+} from './dto'
 import type { ApiKeyImportInput, ApiKeyImportResult } from '../accountService/importApiKey'
 import { applyAccountDataMutation, type AccountsBlob } from '../accountService/state'
-import type {
-  PanelConfigAuditActor,
-  PanelConfigOperationOutcome
-} from '../ipc/panelProxyDeps'
+import type { PanelConfigAuditActor, PanelConfigOperationOutcome } from '../ipc/panelProxyDeps'
 import type {
   PanelProxyApiKeyCreateResult,
   PanelProxyApiKeyListResult,
@@ -159,6 +161,7 @@ export interface PanelRouteDeps {
     input: unknown,
     actor: PanelConfigAuditActor
   ) => Promise<PanelConfigOperationOutcome<PanelProxyApiKeyRevokeResult>>
+  proxyClearAccountSuspended: (accountId: string) => Promise<ServiceLike>
 }
 
 /** 已解析的请求上下文（路径已去掉 `/panel` 前缀） */
@@ -625,6 +628,68 @@ async function handleAccountRestore(
   respondAccountMutation(res, result)
 }
 
+async function handleAccountUnsuspend(
+  res: http.ServerResponse,
+  deps: PanelRouteDeps,
+  accountId: string,
+  body: Record<string, unknown> | undefined
+): Promise<void> {
+  const keys = Object.keys(body ?? {})
+  if (
+    keys.length !== 1 ||
+    keys[0] !== 'confirmation' ||
+    body?.confirmation !== PANEL_ACCOUNT_UNSUSPEND_CONFIRMATION
+  ) {
+    sendError(res, 400, 'INVALID_CREDENTIAL', '强制解除封禁需要有效的二次确认')
+    return
+  }
+
+  const result = await singleFlight(`account-unsuspend:${accountId}`, () =>
+    deps.proxyClearAccountSuspended(accountId)
+  )
+  if (result.success === false) {
+    if (errorMessage(result) === 'ACCOUNT_NOT_FOUND') {
+      sendError(res, 404, 'ACCOUNT_NOT_FOUND')
+      return
+    }
+    sendError(res, 500, 'INTERNAL_ERROR')
+    return
+  }
+
+  const runtime = asRecord(result.runtime)
+  if (
+    typeof result.cleared !== 'boolean' ||
+    typeof runtime?.proxyInitialized !== 'boolean' ||
+    typeof runtime.inProxyPool !== 'boolean' ||
+    typeof runtime.suspended !== 'boolean' ||
+    typeof runtime.proxyPoolSyncPending !== 'boolean'
+  ) {
+    sendError(res, 500, 'INTERNAL_ERROR', '解除封禁结果不完整')
+    return
+  }
+
+  const fresh = projectAccountsBlob(await deps.loadAccountsBlob())
+  const account = fresh.accounts.find((candidate) => candidate.id === accountId)
+  if (!account) {
+    sendError(res, 500, 'INTERNAL_ERROR', '本地封禁标记已处理，但账号投影读取失败')
+    return
+  }
+
+  const response: AccountUnsuspendResponse = {
+    success: true,
+    cleared: result.cleared,
+    upstreamVerified: false,
+    account,
+    runtime: {
+      proxyInitialized: runtime.proxyInitialized,
+      inProxyPool: runtime.inProxyPool,
+      suspended: runtime.suspended,
+      proxyPoolSyncPending: runtime.proxyPoolSyncPending
+    }
+  }
+  sendJson(res, 200, response)
+}
+
 /**
  * 把账号记录组装成 `accountService/subscription.ts` 需要的 identity。
  *
@@ -912,7 +977,9 @@ async function routeProxyApi(
       if (!deps.proxyUpdateConfig) throw new Error('proxy config update route is not wired')
       respondConfig(
         res,
-        await configSingleFlight(deps, mutationKey, () => deps.proxyUpdateConfig!(body ?? {}, actor)),
+        await configSingleFlight(deps, mutationKey, () =>
+          deps.proxyUpdateConfig!(body ?? {}, actor)
+        ),
         true
       )
       return true
@@ -930,7 +997,9 @@ async function routeProxyApi(
       if (!deps.proxyCreateApiKey) throw new Error('proxy API key create route is not wired')
       respondConfig(
         res,
-        await configSingleFlight(deps, mutationKey, () => deps.proxyCreateApiKey!(body ?? {}, actor)),
+        await configSingleFlight(deps, mutationKey, () =>
+          deps.proxyCreateApiKey!(body ?? {}, actor)
+        ),
         true
       )
       return true
@@ -939,7 +1008,9 @@ async function routeProxyApi(
       if (!deps.proxyVerifyApiKey) throw new Error('proxy API key verify route is not wired')
       respondConfig(
         res,
-        await configSingleFlight(deps, mutationKey, () => deps.proxyVerifyApiKey!(body ?? {}, actor)),
+        await configSingleFlight(deps, mutationKey, () =>
+          deps.proxyVerifyApiKey!(body ?? {}, actor)
+        ),
         true
       )
       return true
@@ -948,7 +1019,9 @@ async function routeProxyApi(
       if (!deps.proxyRevokeApiKey) throw new Error('proxy API key revoke route is not wired')
       respondConfig(
         res,
-        await configSingleFlight(deps, mutationKey, () => deps.proxyRevokeApiKey!(body ?? {}, actor)),
+        await configSingleFlight(deps, mutationKey, () =>
+          deps.proxyRevokeApiKey!(body ?? {}, actor)
+        ),
         true
       )
       return true
@@ -1069,6 +1142,11 @@ export async function routePanelApi(
 
   if (method === 'POST' && action === 'delete') {
     await handleAccountDelete(res, deps, accountId, ctx.body)
+    return true
+  }
+
+  if (method === 'POST' && action === 'unsuspend') {
+    await handleAccountUnsuspend(res, deps, accountId, ctx.body)
     return true
   }
 

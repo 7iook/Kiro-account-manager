@@ -494,7 +494,12 @@ export function ProxyPanel({
       </button>
 
       <PanelSectionBoundary name="反代配置">
-        <ProxyConfigSection onSessionLost={onSessionLost} onNotice={onNotice} onError={onError} />
+        <ProxyConfigSection
+          onSessionLost={onSessionLost}
+          onNotice={onNotice}
+          onError={onError}
+          onProxyStatusChanged={refresh}
+        />
       </PanelSectionBoundary>
 
       <div className="mt-3 border-t border-slate-100 pt-3 dark:border-slate-800">

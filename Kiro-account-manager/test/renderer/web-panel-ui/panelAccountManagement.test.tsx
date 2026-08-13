@@ -141,10 +141,10 @@ function installAccountServer(options: { undoWindowMs?: number } = {}): { calls:
   return { calls }
 }
 
-function renderAccountCard(): void {
+function renderAccountCard(item: AccountListItem = account): void {
   render(
     <AccountCard
-      item={account}
+      item={item}
       pending={null}
       onCheck={vi.fn()}
       onRefreshToken={vi.fn()}
@@ -303,6 +303,82 @@ describe('C2 · 手机删除账号的确认与撤销', () => {
     expect(undo.hasAttribute('disabled')).toBe(false)
     await waitFor(() => expect(undo.hasAttribute('disabled')).toBe(true))
     expect(screen.getByText(/撤销窗口已结束/)).toBeTruthy()
+  })
+})
+
+describe('台账 #27 · 手机强制解除账号封禁', () => {
+  it('必须输入目标标识二次确认，并明确告知未验证上游且可能立刻再次被封', async () => {
+    const suspendedAccount: AccountListItem = {
+      ...account,
+      status: 'error',
+      lastError: '[TEMPORARILY_SUSPENDED] Account blocked by upstream'
+    }
+    const calls: SeenRequest[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request: SeenRequest = {
+          method: (init?.method ?? 'GET').toUpperCase(),
+          url: String(input),
+          headers: normaliseHeaders(init?.headers),
+          ...(typeof init?.body === 'string'
+            ? { body: JSON.parse(init.body) as Record<string, unknown> }
+            : {})
+        }
+        calls.push(request)
+        if (request.method === 'POST' && request.url.endsWith('/accounts/acc-a/unsuspend')) {
+          return response({
+            success: true,
+            cleared: true,
+            upstreamVerified: false,
+            account: {
+              ...account,
+              status: 'active'
+            },
+            runtime: {
+              proxyInitialized: true,
+              inProxyPool: true,
+              suspended: false,
+              proxyPoolSyncPending: false
+            }
+          })
+        }
+        return response({ code: 'ACCOUNT_NOT_FOUND' }, 404)
+      })
+    )
+
+    renderAccountCard(suspendedAccount)
+    await userEvent.click(screen.getByRole('button', { name: '更多操作' }))
+    await userEvent.click(screen.getByRole('button', { name: '强制解除封禁' }))
+
+    const dialog = screen.getByRole('dialog', { name: '强制解除账号封禁' })
+    expect(within(dialog).getByText(/不会向上游验证/)).toBeTruthy()
+    expect(within(dialog).getByText(/未验证.*可能立刻再次被封/)).toBeTruthy()
+
+    const confirm = within(dialog).getByRole('button', { name: '确认强制解除' })
+    expect(confirm).toBeDisabled()
+    const input = within(dialog).getByRole('textbox', {
+      name: '输入 alice@example.com 以确认强制解除'
+    })
+    await userEvent.type(input, 'alice')
+    expect(confirm).toBeDisabled()
+    expect(calls).toHaveLength(0)
+    await userEvent.clear(input)
+    await userEvent.type(input, 'alice@example.com')
+    expect(confirm).toBeEnabled()
+    await userEvent.click(confirm)
+
+    await waitFor(() => expect(screen.getByText('正常')).toBeTruthy())
+    expect(
+      screen.getByText(/本机封禁标记已清除.*已回到反代池.*上游状态未验证.*可能立刻再次被封/)
+    ).toBeTruthy()
+    const request = calls.find((call) => call.url.endsWith('/accounts/acc-a/unsuspend'))
+    expect(request).toMatchObject({
+      method: 'POST',
+      headers: { 'x-panel-request': '1' },
+      body: { confirmation: 'FORCE_UNSUSPEND' }
+    })
+    expect(calls.some((call) => call.url.endsWith('/accounts/acc-a/check'))).toBe(false)
   })
 })
 

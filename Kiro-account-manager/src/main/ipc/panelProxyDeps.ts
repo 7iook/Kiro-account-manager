@@ -18,6 +18,7 @@
  * 顺序有第二个真源时，两处早晚分叉，表现是「面板绿灯但反代打旧号」。
  */
 import { randomBytes, randomUUID } from 'node:crypto'
+import { applyAccountDataMutation, type AccountsBlob } from '../accountService/state'
 import {
   activateProxyAccount,
   buildProxyAccountsFromStore,
@@ -29,12 +30,10 @@ import type { AccountPool } from '../proxy/accountPool'
 import type { ApiKey, ProxyConfig } from '../proxy/types'
 import type { HoldAutoReleaseState, HeldRequestsInfo } from '../proxy/proxyServer'
 import type { HoldEpisode } from '../proxy/holdGate'
-import {
-  applyProxyConfigUpdate,
-  ProxyConfigUpdateError
-} from '../proxy/applyProxyConfigUpdate'
+import { applyProxyConfigUpdate, ProxyConfigUpdateError } from '../proxy/applyProxyConfigUpdate'
 import { proxyLogger } from '../proxy/logger'
 import { redactString } from '../utils/redact'
+import { isAccountSuspensionError } from '../../shared/accountSuspension'
 import {
   panelProxyApiKeyHint,
   projectPanelProxyApiKeyList,
@@ -129,6 +128,23 @@ export type PanelConfigOperationOutcome<T> =
       message: string
     }
 
+export type PanelAccountUnsuspendResult =
+  | {
+      success: true
+      cleared: boolean
+      upstreamVerified: false
+      runtime: {
+        proxyInitialized: boolean
+        inProxyPool: boolean
+        suspended: boolean
+        proxyPoolSyncPending: boolean
+      }
+    }
+  | {
+      success: false
+      error: 'ACCOUNT_NOT_FOUND'
+    }
+
 export interface PanelProxyRouteDeps {
   proxyGetStatus: () => Promise<unknown>
   proxySyncPool: () => Promise<unknown>
@@ -158,6 +174,7 @@ export interface PanelProxyRouteDeps {
     input: unknown,
     actor: PanelConfigAuditActor
   ) => Promise<PanelConfigOperationOutcome<PanelProxyApiKeyRevokeResult>>
+  proxyClearAccountSuspended: (accountId: string) => Promise<PanelAccountUnsuspendResult>
 }
 
 /** 面板可见的反代状态。**不含任何凭据** —— 只有 id / email 级别的标识 */
@@ -220,7 +237,9 @@ export interface PanelProxyStatus {
   recentEpisodes: HoldEpisode[]
 }
 
-function bindingContext(data: ReturnType<PanelProxyDepsImpl['loadAccountData']>): ProxyBindingContext {
+function bindingContext(
+  data: ReturnType<PanelProxyDepsImpl['loadAccountData']>
+): ProxyBindingContext {
   return {
     bindings: data?.accountProxyBindings ?? {},
     proxyPool: data?.proxyPool ?? {}
@@ -312,6 +331,51 @@ function syncPool(impl: PanelProxyDepsImpl, server: ProxyServerRef): number {
   return syncProxyPoolFromStore(impl.loadAccountData, server, 'panel-sync').poolSize
 }
 
+function storedAccountRecord(
+  data: StoredProxyAccountData | AccountsBlob | undefined,
+  accountId: string
+): Record<string, unknown> | null {
+  const accounts: unknown = data?.accounts
+  if (Array.isArray(accounts)) {
+    const account = accounts.find(
+      (candidate) =>
+        candidate !== null &&
+        typeof candidate === 'object' &&
+        !Array.isArray(candidate) &&
+        (candidate as Record<string, unknown>).id === accountId
+    )
+    return account ? (account as Record<string, unknown>) : null
+  }
+  if (!accounts || typeof accounts !== 'object') return null
+  const account = (accounts as Record<string, unknown>)[accountId]
+  return account && typeof account === 'object' && !Array.isArray(account)
+    ? (account as Record<string, unknown>)
+    : null
+}
+
+function withoutStoredSuspension(blob: AccountsBlob, accountId: string): AccountsBlob {
+  const current = storedAccountRecord(blob, accountId)
+  if (!current || !blob.accounts) return blob
+  // 这个高级动作只清理由共享分类器确认过的封禁标记。直接调用 HTTP 端点时也不能把
+  // 普通网络错误、测活失败等 lastError 顺手抹掉，否则“解除封禁”会变成通用清错按钮。
+  if (!isAccountSuspensionError(current.lastError)) return blob
+  const updated: Record<string, unknown> = { ...current, status: 'active' }
+  delete updated.lastError
+  if (Array.isArray(blob.accounts)) {
+    return {
+      ...blob,
+      accounts: blob.accounts.map((candidate) => (candidate === current ? updated : candidate))
+    }
+  }
+  return {
+    ...blob,
+    accounts: {
+      ...(blob.accounts as Record<string, unknown>),
+      [accountId]: updated
+    }
+  }
+}
+
 function configuredApiKeyCount(config: ProxyConfig): number {
   return (
     (config.apiKey ? 1 : 0) +
@@ -320,7 +384,7 @@ function configuredApiKeyCount(config: ProxyConfig): number {
 }
 
 function safeAuditText(value: string, config: ProxyConfig, maxLength: number): string {
-  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, maxLength)
+  const normalized = value.replace(/\p{Cc}/gu, ' ').slice(0, maxLength)
   const secrets = [config.apiKey, ...(config.apiKeys ?? []).map((entry) => entry.key)].filter(
     (entry): entry is string => typeof entry === 'string' && entry.length > 0
   )
@@ -335,7 +399,11 @@ interface ConfigAuditInput {
   fields: string[]
   change:
     | { key: 'logRequests' | 'port'; before: boolean | number; after: boolean | number }
-    | { operation: 'create' | 'verify' | 'revoke'; configuredBefore: boolean; configuredAfter: boolean }
+    | {
+        operation: 'create' | 'verify' | 'revoke'
+        configuredBefore: boolean
+        configuredAfter: boolean
+      }
     | null
   requiresRestart: boolean
   apply: 'not_attempted' | 'succeeded' | 'failed'
@@ -366,9 +434,11 @@ function writeConfigAudit(input: ConfigAuditInput): void {
   else proxyLogger.warn('PanelConfigAudit', message, data)
 }
 
-function updateFailure(
-  error: unknown
-): { kind: 'apply' | 'persist' | 'internal'; message: string; rollback: 'succeeded' | 'failed' } {
+function updateFailure(error: unknown): {
+  kind: 'apply' | 'persist' | 'internal'
+  message: string
+  rollback: 'succeeded' | 'failed'
+} {
   if (error instanceof ProxyConfigUpdateError) {
     const rollback = error.rollbackSucceeded ? 'succeeded' : 'failed'
     if (error.phase === 'persist') {
@@ -406,9 +476,15 @@ export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): PanelProxyRouteDe
   })
   const configView = (): PanelProxyConfigView => {
     const server = impl.getProxyServer()
-    return projectPanelProxyConfig(server?.getConfig() ?? impl.getLatestProxyConfig(), server?.needsRestart() ?? false)
+    return projectPanelProxyConfig(
+      server?.getConfig() ?? impl.getLatestProxyConfig(),
+      server?.needsRestart() ?? false
+    )
   }
-  const applyUpdate = (patch: Partial<ProxyConfig>, mode: 'hot' | 'restart' = 'hot') =>
+  const applyUpdate = (
+    patch: Partial<ProxyConfig>,
+    mode: 'hot' | 'restart' = 'hot'
+  ): ReturnType<typeof applyProxyConfigUpdate> =>
     applyProxyConfigUpdate(
       {
         getLatestConfig: latestConfig,
@@ -473,9 +549,9 @@ export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): PanelProxyRouteDe
     // 三字段一律取调度器真实读数，面板不自己按配置推算 ——
     // 「配置开着」与「调度器真的在跑」是两件事，按配置推算就会显示
     // 「自动放行已开启」而实际不执行（决策卡 §1 Must NOT #5）。
-    // 字段名与 `HoldAutoReleaseState` 逐字一致，故整体展开而不逐字段搬运。
-    const { count: _heldCount, ...auto } = server.getHeldRequestsInfo()
-    const selectedId = config.enableMultiAccount === false ? config.selectedAccountIds?.[0] : undefined
+    const heldInfo = server.getHeldRequestsInfo()
+    const selectedId =
+      config.enableMultiAccount === false ? config.selectedAccountIds?.[0] : undefined
     const out: PanelProxyStatus = {
       success: true,
       // 真实判据：读 server 句柄。不是"我发过启动请求所以应该在跑"
@@ -488,7 +564,11 @@ export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): PanelProxyRouteDe
       totalRequests: stats.totalRequests,
       successRequests: stats.successRequests,
       failedRequests: stats.failedRequests,
-      ...auto
+      autoReleaseEnabled: heldInfo.autoReleaseEnabled,
+      nextAutoReleaseAt: heldInfo.nextAutoReleaseAt,
+      autoReleaseCount: heldInfo.autoReleaseCount,
+      currentEpisode: heldInfo.currentEpisode,
+      recentEpisodes: heldInfo.recentEpisodes
     }
     if (selectedId) {
       out.selectedAccountId = selectedId
@@ -724,13 +804,7 @@ export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): PanelProxyRouteDe
           (candidate) => candidate.id === validation.value.id && candidate.enabled && candidate.key
         )
         if (!entry) {
-          return rejected(
-            actor,
-            previous,
-            '未找到可验证的新 API Key。',
-            ['apiKeys'],
-            auditChange
-          )
+          return rejected(actor, previous, '未找到可验证的新 API Key。', ['apiKeys'], auditChange)
         }
         if (typeof entry.lastUsedAt !== 'number' || entry.lastUsedAt < entry.createdAt) {
           writeConfigAudit({
@@ -827,7 +901,13 @@ export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): PanelProxyRouteDe
             (candidate) => candidate.id === validation.value.id && candidate.enabled
           )
           if (targetIndex < 0) {
-            return rejected(actor, previous, '待吊销 API Key 不存在或已停用。', ['apiKeys'], invalidAudit)
+            return rejected(
+              actor,
+              previous,
+              '待吊销 API Key 不存在或已停用。',
+              ['apiKeys'],
+              invalidAudit
+            )
           }
           patch = {
             apiKeys: (previous.apiKeys ?? []).map((candidate, index) =>
@@ -889,6 +969,54 @@ export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): PanelProxyRouteDe
       return { success: true, mode: result.mode, accountId: result.accountId, email: result.email }
     },
 
+    proxyClearAccountSuspended: async (accountId) => {
+      const storedBefore = storedAccountRecord(impl.loadAccountData(), accountId)
+      const server = impl.getProxyServer()
+      const pool = server?.getAccountPool()
+      const runtimeBefore = pool?.getAccount(accountId) ?? null
+      if (!storedBefore && !runtimeBefore) {
+        return { success: false, error: 'ACCOUNT_NOT_FOUND' }
+      }
+
+      const storedWasSuspended =
+        typeof storedBefore?.lastError === 'string' &&
+        isAccountSuspensionError(storedBefore.lastError)
+      const runtimeWasSuspended = runtimeBefore ? pool!.isSuspended(runtimeBefore) : false
+
+      if (storedBefore) {
+        await applyAccountDataMutation((blob) => withoutStoredSuspension(blob, accountId))
+      }
+      if (runtimeBefore) {
+        pool!.clearSuspended(accountId)
+      }
+
+      let proxyPoolSyncPending = false
+      if (server && storedBefore) {
+        try {
+          syncPool(impl, server)
+        } catch (error) {
+          proxyPoolSyncPending = true
+          console.warn(
+            '[webPanel] account unsuspended, but live proxy pool refresh is pending',
+            error
+          )
+        }
+      }
+
+      const runtimeAfter = pool?.getAccount(accountId) ?? null
+      return {
+        success: true,
+        cleared: storedWasSuspended || runtimeWasSuspended,
+        upstreamVerified: false,
+        runtime: {
+          proxyInitialized: server !== null,
+          inProxyPool: runtimeAfter !== null,
+          suspended: runtimeAfter ? pool!.isSuspended(runtimeAfter) : false,
+          proxyPoolSyncPending
+        }
+      }
+    },
+
     proxyStart: async () => {
       try {
         const server = impl.initProxyServer()
@@ -911,7 +1039,10 @@ export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): PanelProxyRouteDe
       } catch (error) {
         // 启动失败原因如实回传（端口占用是最常见的一种），不吞
         console.error('[panelProxy] start failed:', error)
-        return { success: false, error: error instanceof Error ? error.message : 'PROXY_START_FAILED' }
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : 'PROXY_START_FAILED'
+        }
       }
     },
 

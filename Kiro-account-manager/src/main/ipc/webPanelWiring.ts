@@ -464,6 +464,8 @@ export function buildPanelRouteDeps(impl: {
   proxyStop: () => Promise<unknown>
   /** 立刻放行全部挂起请求（面板唯一的挂起门闸动作，不含任何配置写入） */
   proxyReleaseHeld: () => Promise<unknown>
+  /** 强制清除账号本地封禁闩锁；不探测、也不声称上游已恢复。 */
+  proxyClearAccountSuspended: (accountId: string) => Promise<unknown>
 }): PanelRouteDeps {
   const asService = <A extends unknown[]>(
     fn: (...args: A) => Promise<unknown>
@@ -488,6 +490,7 @@ export function buildPanelRouteDeps(impl: {
     proxyActivateAccount: asService(impl.proxyActivateAccount),
     proxyStart: asService(impl.proxyStart),
     proxyStop: asService(impl.proxyStop),
-    proxyReleaseHeld: asService(impl.proxyReleaseHeld)
+    proxyReleaseHeld: asService(impl.proxyReleaseHeld),
+    proxyClearAccountSuspended: asService(impl.proxyClearAccountSuspended)
   }
 }

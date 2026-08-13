@@ -22,6 +22,7 @@ import {
   fetchAccountGroups,
   fetchAccounts,
   restoreDeletedAccount,
+  unsuspendAccount,
   updateAccountMetadata,
   type AccountListItem,
   type PanelAccountGroup
@@ -66,14 +67,19 @@ export function AccountCard({
     nickname?: string
     groupId?: string
     isActive: boolean
+    status?: string
+    lastError?: string
   } | null>(null)
   const [editOpen, setEditOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
+  const [unsuspendOpen, setUnsuspendOpen] = useState(false)
   const [groups, setGroups] = useState<PanelAccountGroup[]>([])
   const [editRevision, setEditRevision] = useState(0)
   const [nicknameDraft, setNicknameDraft] = useState('')
   const [groupDraft, setGroupDraft] = useState('')
   const [deleteConfirmation, setDeleteConfirmation] = useState('')
+  const [unsuspendConfirmation, setUnsuspendConfirmation] = useState('')
+  const [unsuspendNotice, setUnsuspendNotice] = useState<string | null>(null)
   const [deleted, setDeleted] = useState<{
     undoUntil: number
     proxyPoolSyncPending: boolean
@@ -149,11 +155,12 @@ export function AccountCard({
         nickname: nicknameDraft === '' ? null : nicknameDraft,
         groupId: groupDraft === '' ? null : groupDraft
       })
-      setMetadata({
+      setMetadata((current) => ({
+        ...current,
         nickname: response.account.nickname,
         groupId: response.account.groupId,
         isActive: response.account.isActive
-      })
+      }))
       announcePanelAccountsInvalidated()
       setEditOpen(false)
     } catch (error) {
@@ -192,12 +199,13 @@ export function AccountCard({
     setManagementError(null)
     try {
       const response = await restoreDeletedAccount(item.id)
-      setMetadata({
+      setMetadata((current) => ({
+        ...current,
         nickname: response.account.nickname,
         groupId: response.account.groupId,
         // 恢复账号不静默恢复为当前激活账号，服务端明确返回 false。
         isActive: response.account.isActive
-      })
+      }))
       setDeleted(null)
       setUndoExpired(false)
       announcePanelAccountsInvalidated()
@@ -206,6 +214,39 @@ export function AccountCard({
           ? '账号已恢复，但反代账号池尚未同步；请在反代面板点“重新同步账号池”。'
           : null
       )
+    } catch (error) {
+      handleManagementError(error)
+    } finally {
+      setManagementBusy(false)
+    }
+  }
+
+  const confirmUnsuspend = async (): Promise<void> => {
+    if (managementBusy || unsuspendConfirmation !== confirmationTarget) return
+    setManagementBusy(true)
+    setManagementError(null)
+    setUnsuspendNotice(null)
+    try {
+      const response = await unsuspendAccount(item.id)
+      setMetadata((current) => ({
+        ...current,
+        nickname: response.account.nickname,
+        groupId: response.account.groupId,
+        isActive: response.account.isActive,
+        status: response.account.status,
+        lastError: response.account.lastError
+      }))
+      const poolState = response.runtime.proxyPoolSyncPending
+        ? '反代账号池同步尚未完成，请在反代面板重新同步账号池'
+        : response.runtime.inProxyPool
+          ? '已回到反代池'
+          : response.runtime.proxyInitialized
+            ? '当前未进入反代池'
+            : '反代尚未初始化'
+      setUnsuspendNotice(`本机封禁标记已清除，${poolState}；上游状态未验证，可能立刻再次被封。`)
+      setUnsuspendOpen(false)
+      setUnsuspendConfirmation('')
+      announcePanelAccountsInvalidated()
     } catch (error) {
       handleManagementError(error)
     } finally {
@@ -349,6 +390,14 @@ export function AccountCard({
           {viewItem.lastError}
         </p>
       )}
+      {unsuspendNotice !== null && (
+        <p
+          role="status"
+          className="mt-2 rounded-lg bg-amber-50 px-2 py-1.5 text-xs text-amber-800 dark:bg-amber-950 dark:text-amber-200"
+        >
+          {unsuspendNotice}
+        </p>
+      )}
 
       {/* ── 主动作：刷新额度 ── */}
       <div className="mt-3 flex gap-2">
@@ -442,6 +491,21 @@ export function AccountCard({
             </div>
           </div>
           <div className="grid grid-cols-2 gap-2 border-t border-slate-200 pt-3 dark:border-slate-700">
+            {banned && (
+              <button
+                type="button"
+                onClick={() => {
+                  setManagementError(null)
+                  setUnsuspendNotice(null)
+                  setUnsuspendConfirmation('')
+                  setUnsuspendOpen(true)
+                }}
+                disabled={busy || managementBusy}
+                className="col-span-2 h-11 rounded-xl border border-amber-400 text-sm font-medium text-amber-800 active:bg-amber-50 disabled:opacity-50 dark:border-amber-700 dark:text-amber-200 dark:active:bg-amber-950"
+              >
+                强制解除封禁
+              </button>
+            )}
             <button
               type="button"
               onClick={() => void openEditor()}
@@ -464,11 +528,71 @@ export function AccountCard({
             </button>
           </div>
           <p className="text-xs text-slate-500 dark:text-slate-400">凭据不会显示或通过手机编辑。</p>
-          {managementError !== null && !editOpen && !deleteOpen && (
+          {managementError !== null && !editOpen && !deleteOpen && !unsuspendOpen && (
             <p role="status" className="text-xs text-red-700 dark:text-red-300">
               {managementError}
             </p>
           )}
+        </div>
+      )}
+
+      {unsuspendOpen && (
+        <div className="fixed inset-0 z-50 flex items-end bg-slate-950/50 p-3 sm:items-center sm:justify-center">
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={`unsuspend-account-title-${item.id}`}
+            className="max-h-[90vh] w-full overflow-y-auto rounded-2xl bg-white p-4 shadow-xl sm:max-w-md dark:bg-slate-900"
+          >
+            <h2
+              id={`unsuspend-account-title-${item.id}`}
+              className="text-lg font-semibold text-amber-800 dark:text-amber-200"
+            >
+              强制解除账号封禁
+            </h2>
+            <div className="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
+              <p>此操作只会清除本机封禁标记，不会向上游验证账号是否恢复。</p>
+              <p className="mt-2 font-medium">结果仍是未验证状态，账号可能立刻再次被封。</p>
+            </div>
+            <label className="mt-4 block text-sm text-slate-700 dark:text-slate-200">
+              <span className="mb-1 block">输入 {confirmationTarget} 以确认强制解除</span>
+              <input
+                value={unsuspendConfirmation}
+                onChange={(event) => setUnsuspendConfirmation(event.target.value)}
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                className="h-11 w-full rounded-xl border border-amber-300 bg-white px-3 text-base text-slate-900 outline-none focus:border-amber-500 dark:border-amber-800 dark:bg-slate-950 dark:text-slate-100"
+              />
+            </label>
+            {managementError !== null && (
+              <p role="status" className="mt-3 text-sm text-red-700 dark:text-red-300">
+                {managementError}
+              </p>
+            )}
+            <div className="mt-5 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setUnsuspendOpen(false)
+                  setUnsuspendConfirmation('')
+                  setManagementError(null)
+                }}
+                disabled={managementBusy}
+                className="h-11 rounded-xl border border-slate-300 text-sm text-slate-700 disabled:opacity-50 dark:border-slate-600 dark:text-slate-200"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmUnsuspend()}
+                disabled={managementBusy || unsuspendConfirmation !== confirmationTarget}
+                className="h-11 rounded-xl bg-amber-600 text-sm font-medium text-white active:bg-amber-700 disabled:opacity-50"
+              >
+                {managementBusy ? '解除中…' : '确认强制解除'}
+              </button>
+            </div>
+          </section>
         </div>
       )}
 

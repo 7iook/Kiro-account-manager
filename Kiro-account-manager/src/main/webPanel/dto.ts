@@ -192,6 +192,26 @@ export interface AccountListPayload {
   revision?: number
 }
 
+export const PANEL_ACCOUNT_UNSUSPEND_CONFIRMATION = 'FORCE_UNSUSPEND' as const
+
+export interface AccountUnsuspendRequest {
+  confirmation: typeof PANEL_ACCOUNT_UNSUSPEND_CONFIRMATION
+}
+
+export interface AccountUnsuspendResponse {
+  success: true
+  cleared: boolean
+  /** 强制本地清除从不探测上游；固定为 false，防止调用方把本地状态当成上游结论。 */
+  upstreamVerified: false
+  account: AccountListItem
+  runtime: {
+    proxyInitialized: boolean
+    inProxyPool: boolean
+    suspended: boolean
+    proxyPoolSyncPending: boolean
+  }
+}
+
 /**
  * 把 `loadAccounts()` 的整表 blob 投影成面板列表响应。
  *
@@ -223,4 +243,3 @@ export function projectAccountsBlob(input: unknown): AccountListPayload {
   const revision = asNumber(blob.revision)
   return revision !== undefined ? { accounts, revision } : { accounts }
 }
-

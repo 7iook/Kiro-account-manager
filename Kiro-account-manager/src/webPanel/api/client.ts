@@ -42,19 +42,23 @@ export class PanelApiError extends Error {
   readonly status: number
   /** 429 时服务端 `Retry-After` 头给的秒数 */
   readonly retryAfterSec?: number
+  /** 服务端经统一脱敏出口返回的补充说明；稳定分支仍只看 code。 */
+  readonly serverMessage?: string
 
   constructor(
     status: number,
     code: PanelErrorCode,
     message: string,
     retryAfterSec?: number,
-    cause?: unknown
+    cause?: unknown,
+    serverMessage?: string
   ) {
     super(message)
     this.name = 'PanelApiError'
     this.status = status
     this.code = code
     if (retryAfterSec !== undefined) this.retryAfterSec = retryAfterSec
+    if (serverMessage !== undefined) this.serverMessage = serverMessage
     // 网络层原始错误挂在标准 cause 上，不丢根因（§4.4：不得静默吞异常）
     if (cause !== undefined) this.cause = cause
   }
@@ -142,6 +146,7 @@ export async function panelRequest<T>(method: string, path: string, body?: unkno
 
   if (!response.ok) {
     const rawCode = (parsed as { code?: unknown } | undefined)?.code
+    const rawMessage = (parsed as { message?: unknown } | undefined)?.message
     const code: PanelErrorCode = isPanelErrorCode(rawCode) ? rawCode : 'INTERNAL_ERROR'
     const retryAfterRaw = response.headers.get('Retry-After')
     const retryAfterSec = retryAfterRaw ? Number.parseInt(retryAfterRaw, 10) : undefined
@@ -149,7 +154,9 @@ export async function panelRequest<T>(method: string, path: string, body?: unkno
       response.status,
       code,
       ERROR_TEXT[code],
-      Number.isFinite(retryAfterSec) ? retryAfterSec : undefined
+      Number.isFinite(retryAfterSec) ? retryAfterSec : undefined,
+      undefined,
+      typeof rawMessage === 'string' && rawMessage.length > 0 ? rawMessage : undefined
     )
   }
 

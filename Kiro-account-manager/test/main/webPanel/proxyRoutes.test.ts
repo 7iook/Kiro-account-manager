@@ -28,10 +28,7 @@ import {
   type ProxyActivationHost
 } from '../../../src/main/proxy/activation'
 import type { ProxyConfig } from '../../../src/main/proxy/types'
-import {
-  buildPanelProxyDeps,
-  type ProxyServerRef
-} from '../../../src/main/ipc/panelProxyDeps'
+import { buildPanelProxyDeps, type ProxyServerRef } from '../../../src/main/ipc/panelProxyDeps'
 
 const ADMIN_KEY = 'test-admin-key-0123456789abcdef'
 const TOKEN_A = 'ZZtokenAsecretZZ'
@@ -248,7 +245,8 @@ function stubRouteDeps(
   loadAccountsBlob: () => Promise<unknown> = async () => ({
     revision: 1,
     accounts: stub.records
-  })
+  }),
+  loadAccountData: () => Record<string, unknown> = () => ({ accounts: stub.records })
 ): PanelRouteDeps {
   const serverRef: ProxyServerRef = {
     isRunning: stub.isRunning,
@@ -283,7 +281,7 @@ function stubRouteDeps(
     getProxyServer: () => serverRef,
     initProxyServer: () => serverRef,
     getLatestProxyConfig: () => stub.config as ProxyConfig,
-    loadAccountData: () => ({ accounts: stub.records }),
+    loadAccountData: () => loadAccountData() as { accounts?: Record<string, unknown> },
     persistProxyConfig: stub.persistConfig
   })
   return {
@@ -304,8 +302,13 @@ function stubRouteDeps(
     proxyListApiKeys: configDeps.proxyListApiKeys,
     proxyCreateApiKey: configDeps.proxyCreateApiKey,
     proxyVerifyApiKey: configDeps.proxyVerifyApiKey,
-    proxyRevokeApiKey: configDeps.proxyRevokeApiKey
-  }
+    proxyRevokeApiKey: configDeps.proxyRevokeApiKey,
+    proxyClearAccountSuspended: (
+      configDeps as unknown as {
+        proxyClearAccountSuspended?: (accountId: string) => Promise<Record<string, unknown>>
+      }
+    ).proxyClearAccountSuspended
+  } as PanelRouteDeps
 }
 
 const servers: WebPanelServer[] = []
@@ -313,11 +316,12 @@ const servers: WebPanelServer[] = []
 function makeServer(
   stub: ReturnType<typeof makeProxyStub>,
   config: Partial<WebPanelConfig> = {},
-  loadAccountsBlob?: () => Promise<unknown>
+  loadAccountsBlob?: () => Promise<unknown>,
+  loadAccountData?: () => Record<string, unknown>
 ): WebPanelServer {
   const server = new WebPanelServer({
     auth: new PanelAuth(memoryKeyStore()),
-    routeDeps: stubRouteDeps(stub, loadAccountsBlob),
+    routeDeps: stubRouteDeps(stub, loadAccountsBlob, loadAccountData),
     getConfig: () => ({ enabled: true, port: 0, host: '127.0.0.1', ...config })
   })
   servers.push(server)
@@ -370,7 +374,8 @@ describe('面板反代端点 · 鉴权闸门（启停是高影响操作）', () 
       ['GET', '/api/proxy/api-keys'],
       ['POST', '/api/proxy/api-keys/create'],
       ['POST', '/api/proxy/api-keys/verify'],
-      ['POST', '/api/proxy/api-keys/revoke']
+      ['POST', '/api/proxy/api-keys/revoke'],
+      ['POST', '/api/accounts/acc-a/unsuspend']
     ] as const) {
       const res = await fetch(`${base(server)}${path}`, {
         method,
@@ -1027,6 +1032,114 @@ describe('面板账号管理端点 · 鉴权与 revision 仲裁', () => {
         { id: 'g1', name: '主力', color: '#10b981', order: 1 },
         { id: 'g2', name: '备用', color: '#64748b', order: 2 }
       ]
+    })
+  })
+
+  it('强制解除封禁路由拒绝未认证请求；认证后同时清盘上标记和真实 AccountPool 闩锁', async () => {
+    const fixture = accountManagementFixture()
+    const accounts = fixture.accounts as Record<string, Record<string, unknown>>
+    accounts['acc-a'] = {
+      ...accounts['acc-a'],
+      status: 'error',
+      lastError: '[TEMPORARILY_SUSPENDED] Account blocked by upstream'
+    }
+    const store = memoryAccountStore(fixture)
+    setStoreRef(store)
+    const stub = makeProxyStub()
+    stub.pool.addAccount({
+      id: 'acc-a',
+      email: 'a@example.com',
+      accessToken: TOKEN_A,
+      isAvailable: false,
+      suspendedAt: Date.now(),
+      suspendReason: 'TEMPORARILY_SUSPENDED'
+    })
+    const server = makeServer(
+      stub,
+      {},
+      async () => store.get('accountData'),
+      () => store.get('accountData') as Record<string, unknown>
+    )
+    await server.start()
+
+    const anonymous = await fetch(`${base(server)}/api/accounts/acc-a/unsuspend`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Panel-Request': '1' },
+      body: JSON.stringify({ confirmation: 'FORCE_UNSUSPEND' })
+    })
+    expect(anonymous.status).toBe(401)
+    expect(stub.pool.isSuspended(stub.pool.getAccount('acc-a')!)).toBe(true)
+    expect(
+      (store.snapshot().accounts as Record<string, Record<string, unknown>>)['acc-a']
+        .lastError as string
+    ).toContain('TEMPORARILY_SUSPENDED')
+
+    const cookie = await login(server)
+    const rejectedConfirmation = await fetch(`${base(server)}/api/accounts/acc-a/unsuspend`, {
+      method: 'POST',
+      headers: authed(cookie),
+      body: JSON.stringify({ confirmation: 'WRONG' })
+    })
+    expect(rejectedConfirmation.status).toBe(400)
+    expect(stub.pool.isSuspended(stub.pool.getAccount('acc-a')!)).toBe(true)
+
+    const cleared = await fetch(`${base(server)}/api/accounts/acc-a/unsuspend`, {
+      method: 'POST',
+      headers: authed(cookie),
+      body: JSON.stringify({ confirmation: 'FORCE_UNSUSPEND' })
+    })
+
+    expect(cleared.status).toBe(200)
+    expect(await cleared.json()).toMatchObject({
+      success: true,
+      cleared: true,
+      upstreamVerified: false,
+      account: { id: 'acc-a', status: 'active' },
+      runtime: {
+        proxyInitialized: true,
+        inProxyPool: true,
+        suspended: false,
+        proxyPoolSyncPending: false
+      }
+    })
+    const persisted = (store.snapshot().accounts as Record<string, Record<string, unknown>>)[
+      'acc-a'
+    ]
+    expect(persisted.status).toBe('active')
+    expect(persisted.lastError).toBeUndefined()
+    const runtime = stub.pool.getAccount('acc-a')
+    expect(runtime).not.toBeNull()
+    expect(stub.pool.isSuspended(runtime!)).toBe(false)
+
+    const genericFailureSnapshot = store.snapshot()
+    const genericFailure = (
+      genericFailureSnapshot.accounts as Record<string, Record<string, unknown>>
+    )['acc-b']
+    genericFailure.status = 'error'
+    genericFailure.lastError = 'temporary network failure'
+    await store.set('accountData', genericFailureSnapshot)
+
+    const noSuspensionToClear = await fetch(`${base(server)}/api/accounts/acc-b/unsuspend`, {
+      method: 'POST',
+      headers: authed(cookie),
+      body: JSON.stringify({ confirmation: 'FORCE_UNSUSPEND' })
+    })
+    expect(noSuspensionToClear.status).toBe(200)
+    expect(await noSuspensionToClear.json()).toMatchObject({
+      success: true,
+      cleared: false,
+      upstreamVerified: false,
+      account: {
+        id: 'acc-b',
+        status: 'error',
+        lastError: 'temporary network failure'
+      }
+    })
+    expect(
+      (store.snapshot().accounts as Record<string, Record<string, unknown>>)['acc-b']
+    ).toMatchObject({
+      status: 'error',
+      lastError: 'temporary network failure'
     })
   })
 })

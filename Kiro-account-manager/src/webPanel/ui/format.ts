@@ -10,6 +10,7 @@
  * 与桌面端保持一致的只有配色与文案口径（下面逐处标注来源）。
  */
 import type { AccountListItem } from '../api/panel'
+import { isAccountSuspensionError } from '../../shared/accountSuspension'
 
 /** 额度数字：整数千分位。`undefined` → `-`（不是 0 —— 0 是真实值，未知不是） */
 export function formatUsage(v: number | undefined): string {
@@ -57,25 +58,9 @@ export function statusLabel(status: string | undefined): string {
   return STATUS_LABEL[status] ?? status
 }
 
-/**
- * 封禁判定。照桌面端 `_helpers.ts:isBannedError` 的关键词集合。
- *
- * 为什么面板也要自己判：DTO 给的是 `lastError` 原文，没有 `isBanned` 布尔。
- * 判据重复是已知的小债（见交付报告），但把关键词集合塞进 DTO 属于改契约，不在本轮范围。
- */
+/** 与账号池准入、运行期闩锁及桌面展示共用同一个封禁分类真源。 */
 export function isBannedError(error: string | undefined): boolean {
-  if (!error) return false
-  const lower = error.toLowerCase()
-  return (
-    lower.includes('accountsuspendedexception') ||
-    lower.includes('account suspended') ||
-    lower.includes('temporarily_suspended') ||
-    lower.includes('temporarily suspended') ||
-    (lower.includes('user id is') && lower.includes('suspended')) ||
-    lower.includes('账户已封禁') ||
-    lower.includes('已封禁') ||
-    /\b423\b/.test(lower)
-  )
+  return isAccountSuspensionError(error)
 }
 
 /** 订阅徽章配色。照桌面端 `_helpers.ts:getSubscriptionColor` */
@@ -114,7 +99,10 @@ export function displayName(item: AccountListItem): string {
  * - 已到点或时钟回拨导致为负 → `即将放行`（不显示负号 —— 负倒计时看起来像 bug，
  *   而它的真实含义是「这一刻正在放或马上放」）。
  */
-export function formatCountdown(target: number | null | undefined, now: number = Date.now()): string {
+export function formatCountdown(
+  target: number | null | undefined,
+  now: number = Date.now()
+): string {
   if (target === null || target === undefined || !Number.isFinite(target)) return '-'
   const diff = target - now
   if (diff <= 0) return '即将放行'

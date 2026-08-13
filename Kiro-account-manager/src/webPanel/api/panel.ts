@@ -16,16 +16,35 @@
  * （登录必须在鉴权闸门**之前**，登出/会话在闸门之后），没进 `routePanelApi`。
  * 这不影响客户端 —— 对浏览器它们和其他端点同一形状。
  */
-import type { AccountListItem, AccountListPayload } from '../../main/webPanel/dto'
+import {
+  PANEL_ACCOUNT_UNSUSPEND_CONFIRMATION,
+  type AccountListItem,
+  type AccountListPayload,
+  type AccountUnsuspendResponse
+} from '../../main/webPanel/dto'
 import type {
+  PanelProxyApiKeyCreateResult,
+  PanelProxyApiKeyListResult,
+  PanelProxyApiKeyRevokeResult,
+  PanelProxyApiKeyVerifyResult,
   PanelProxyConfigPatch,
   PanelProxyConfigResult,
-  PanelProxyConfigView
+  PanelProxyConfigView,
+  PanelProxyPortChangeResult
 } from '../../main/webPanel/proxyConfigPolicy'
 import { panelRequest, PanelApiError } from './client'
 
 export type { AccountListItem, AccountListPayload }
-export type { PanelProxyConfigPatch, PanelProxyConfigResult, PanelProxyConfigView }
+export type {
+  PanelProxyApiKeyCreateResult,
+  PanelProxyApiKeyListResult,
+  PanelProxyApiKeyRevokeResult,
+  PanelProxyApiKeyVerifyResult,
+  PanelProxyConfigPatch,
+  PanelProxyConfigResult,
+  PanelProxyConfigView,
+  PanelProxyPortChangeResult
+}
 
 /**
  * 登录。
@@ -131,6 +150,15 @@ export async function deleteAccount(
 
 export async function restoreDeletedAccount(id: string): Promise<AccountMutationResponse> {
   return panelRequest('POST', `/accounts/${encodeURIComponent(id)}/restore`)
+}
+
+/**
+ * 强制清除本机封禁标记。该动作不向上游探测，因此成功响应也只表示本地状态已清除。
+ */
+export async function unsuspendAccount(id: string): Promise<AccountUnsuspendResponse> {
+  return panelRequest('POST', `/accounts/${encodeURIComponent(id)}/unsuspend`, {
+    confirmation: PANEL_ACCOUNT_UNSUSPEND_CONFIRMATION
+  })
 }
 
 /**
@@ -463,6 +491,45 @@ export async function updateProxyConfig(
   patch: PanelProxyConfigPatch
 ): Promise<PanelProxyConfigResult> {
   return panelRequest<PanelProxyConfigResult>('POST', '/proxy/config', patch)
+}
+
+/** 受控重启后才会成功返回；expectedCurrentPort 防止在旧投影上覆盖并发变更。 */
+export async function changeProxyPort(
+  port: number,
+  expectedCurrentPort: number
+): Promise<PanelProxyPortChangeResult> {
+  return panelRequest('POST', '/proxy/config/port', {
+    port,
+    expectedCurrentPort,
+    confirmation: 'CHANGE_PROXY_PORT'
+  })
+}
+
+/** API Key 列表只有不可逆 hint，不含任何完整 key。 */
+export async function fetchProxyApiKeys(): Promise<PanelProxyApiKeyListResult> {
+  return panelRequest('GET', '/proxy/api-keys')
+}
+
+/** 新 key 只在这次响应中返回完整值；调用方不得把它并入列表或日志。 */
+export async function createProxyApiKey(): Promise<PanelProxyApiKeyCreateResult> {
+  return panelRequest('POST', '/proxy/api-keys/create', {
+    confirmation: 'CREATE_PROXY_API_KEY'
+  })
+}
+
+export async function verifyProxyApiKey(id: string): Promise<PanelProxyApiKeyVerifyResult> {
+  return panelRequest('POST', '/proxy/api-keys/verify', { id })
+}
+
+export async function revokeProxyApiKey(
+  id: string,
+  replacementId: string
+): Promise<PanelProxyApiKeyRevokeResult> {
+  return panelRequest('POST', '/proxy/api-keys/revoke', {
+    id,
+    replacementId,
+    confirmation: 'REVOKE_PROXY_API_KEY'
+  })
 }
 
 /**
