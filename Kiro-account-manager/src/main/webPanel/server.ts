@@ -296,7 +296,8 @@ export class WebPanelServer {
       }
 
       const url = req.url ?? '/'
-      const pathOnly = url.split('?')[0]
+      const [pathOnly, rawQuery = ''] = url.split('?', 2)
+      const query = Object.fromEntries(new URLSearchParams(rawQuery))
 
       // 只服务 /panel 命名空间；其余一律 404（与反代 /v1/* 隔离）
       if (pathOnly !== PANEL_PATH_PREFIX && !pathOnly.startsWith(`${PANEL_PATH_PREFIX}/`)) {
@@ -416,6 +417,7 @@ export class WebPanelServer {
         method,
         path,
         body,
+        query,
         clientIP,
         userAgent: headerValue(req.headers['user-agent']) ?? ''
       }

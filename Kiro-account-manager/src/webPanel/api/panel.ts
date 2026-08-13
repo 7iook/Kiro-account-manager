@@ -32,6 +32,12 @@ import type {
   PanelProxyConfigView,
   PanelProxyPortChangeResult
 } from '../../main/webPanel/proxyConfigPolicy'
+import type { PanelProxyLogPage } from '../../main/webPanel/proxyLogsPolicy'
+import type {
+  PanelUpstreamProxyMutationView,
+  PanelUpstreamProxyPoolView,
+  PanelUpstreamProxyView
+} from '../../main/webPanel/upstreamProxyPoolPolicy'
 import { panelRequest, PanelApiError } from './client'
 
 export type { AccountListItem, AccountListPayload }
@@ -44,6 +50,12 @@ export type {
   PanelProxyConfigResult,
   PanelProxyConfigView,
   PanelProxyPortChangeResult
+}
+export type {
+  PanelProxyLogPage,
+  PanelUpstreamProxyMutationView,
+  PanelUpstreamProxyPoolView,
+  PanelUpstreamProxyView
 }
 
 /**
@@ -530,6 +542,154 @@ export async function revokeProxyApiKey(
     replacementId,
     confirmation: 'REVOKE_PROXY_API_KEY'
   })
+}
+
+/** 2xx 响应缺少代理池安全投影；不能把它降级成“空代理池”。 */
+export class PanelUpstreamProxyPoolResponseError extends Error {
+  constructor() {
+    super('服务端没有返回完整的上游代理池投影')
+    this.name = 'PanelUpstreamProxyPoolResponseError'
+  }
+}
+
+/** 2xx 响应缺少日志分页投影；不能把它降级成“没有日志”。 */
+export class PanelProxyLogsResponseError extends Error {
+  constructor() {
+    super('服务端没有返回完整的反代日志投影')
+    this.name = 'PanelProxyLogsResponseError'
+  }
+}
+
+const UPSTREAM_PROTOCOLS = new Set(['http', 'https', 'socks4', 'socks5'])
+const UPSTREAM_STATUSES = new Set(['untested', 'testing', 'alive', 'dead', 'slow'])
+const LOG_LEVELS = new Set(['DEBUG', 'INFO', 'WARN', 'ERROR'])
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) >= 0
+}
+
+function isPanelUpstreamProxyView(value: unknown): value is PanelUpstreamProxyView {
+  if (!isRecord(value)) return false
+  return (
+    typeof value.id === 'string' &&
+    typeof value.protocol === 'string' &&
+    UPSTREAM_PROTOCOLS.has(value.protocol) &&
+    typeof value.host === 'string' &&
+    Number.isInteger(value.port) &&
+    (value.port as number) >= 1 &&
+    (value.port as number) <= 65535 &&
+    (value.label === undefined || typeof value.label === 'string') &&
+    typeof value.status === 'string' &&
+    UPSTREAM_STATUSES.has(value.status) &&
+    typeof value.enabled === 'boolean' &&
+    typeof value.hasCredentials === 'boolean' &&
+    isNonNegativeInteger(value.usedCount) &&
+    isNonNegativeInteger(value.failCount)
+  )
+}
+
+function isPanelUpstreamProxyPoolView(value: unknown): value is PanelUpstreamProxyPoolView {
+  return (
+    isRecord(value) &&
+    isNonNegativeInteger(value.revision) &&
+    Array.isArray(value.entries) &&
+    value.entries.every(isPanelUpstreamProxyView)
+  )
+}
+
+function requirePanelUpstreamProxyPool(value: unknown): PanelUpstreamProxyPoolView {
+  if (!isPanelUpstreamProxyPoolView(value)) throw new PanelUpstreamProxyPoolResponseError()
+  return value
+}
+
+function requirePanelUpstreamProxyMutation(value: unknown): PanelUpstreamProxyMutationView {
+  if (
+    !isPanelUpstreamProxyPoolView(value) ||
+    !isRecord(value) ||
+    typeof value.accountPoolSyncPending !== 'boolean'
+  ) {
+    throw new PanelUpstreamProxyPoolResponseError()
+  }
+  return {
+    revision: value.revision,
+    entries: value.entries,
+    accountPoolSyncPending: value.accountPoolSyncPending
+  }
+}
+
+function isPanelProxyLogPage(value: unknown): value is PanelProxyLogPage {
+  return (
+    isRecord(value) &&
+    isNonNegativeInteger(value.total) &&
+    (value.nextCursor === null || isNonNegativeInteger(value.nextCursor)) &&
+    Array.isArray(value.entries) &&
+    value.entries.every(
+      (entry) =>
+        isRecord(entry) &&
+        typeof entry.timestamp === 'string' &&
+        typeof entry.level === 'string' &&
+        LOG_LEVELS.has(entry.level) &&
+        typeof entry.category === 'string' &&
+        typeof entry.message === 'string' &&
+        !Object.prototype.hasOwnProperty.call(entry, 'data')
+    )
+  )
+}
+
+export async function fetchProxyLogs(cursor?: number, limit = 50): Promise<PanelProxyLogPage> {
+  const search = new URLSearchParams({ limit: String(limit) })
+  if (cursor !== undefined) search.set('cursor', String(cursor))
+  const page = await panelRequest<unknown>('GET', `/proxy/logs?${search.toString()}`)
+  if (!isPanelProxyLogPage(page)) throw new PanelProxyLogsResponseError()
+  return page
+}
+
+export async function fetchUpstreamProxyPool(): Promise<PanelUpstreamProxyPoolView> {
+  return requirePanelUpstreamProxyPool(await panelRequest<unknown>('GET', '/proxy/upstreams'))
+}
+
+export async function createUpstreamProxy(
+  expectedRevision: number,
+  url: string,
+  label?: string
+): Promise<PanelUpstreamProxyMutationView> {
+  return requirePanelUpstreamProxyMutation(
+    await panelRequest<unknown>('POST', '/proxy/upstreams', {
+      expectedRevision,
+      url,
+      ...(label ? { label } : {})
+    })
+  )
+}
+
+export interface PanelUpstreamProxyChanges {
+  url?: string
+  label?: string
+  enabled?: boolean
+}
+
+export async function updateUpstreamProxy(
+  id: string,
+  expectedRevision: number,
+  changes: PanelUpstreamProxyChanges
+): Promise<PanelUpstreamProxyMutationView> {
+  return requirePanelUpstreamProxyMutation(
+    await panelRequest<unknown>('PATCH', `/proxy/upstreams/${encodeURIComponent(id)}`, {
+      expectedRevision,
+      changes
+    })
+  )
+}
+
+export async function deleteUpstreamProxy(
+  id: string,
+  expectedRevision: number
+): Promise<PanelUpstreamProxyMutationView> {
+  return requirePanelUpstreamProxyMutation(
+    await panelRequest<unknown>('POST', `/proxy/upstreams/${encodeURIComponent(id)}/delete`, {
+      expectedRevision
+    })
+  )
 }
 
 /**

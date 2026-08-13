@@ -37,6 +37,8 @@ import { PANEL_ACCOUNTS_INVALIDATED_EVENT } from './accountDataEvents'
 import { formatCountdown, formatPercent } from './format'
 import { PanelSectionBoundary } from './PanelSectionBoundary'
 import { ProxyConfigSection } from './ProxyConfigSection'
+import { ProxyLogsSection } from './ProxyLogsSection'
+import { UpstreamProxyPoolSection } from './UpstreamProxyPoolSection'
 
 interface ProxyPanelProps {
   /** 账号列表（已由 App 加载）—— 选号弹窗的候选来源 */
@@ -500,6 +502,14 @@ export function ProxyPanel({
           onError={onError}
           onProxyStatusChanged={refresh}
         />
+      </PanelSectionBoundary>
+
+      <PanelSectionBoundary name="上游代理池">
+        <UpstreamProxyPoolSection onSessionLost={onSessionLost} onNotice={onNotice} />
+      </PanelSectionBoundary>
+
+      <PanelSectionBoundary name="反代日志">
+        <ProxyLogsSection onSessionLost={onSessionLost} />
       </PanelSectionBoundary>
 
       <div className="mt-3 border-t border-slate-100 pt-3 dark:border-slate-800">

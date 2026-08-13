@@ -75,6 +75,7 @@ const ERROR_TEXT: Record<PanelErrorCode, string> = {
   INVALID_CREDENTIAL: '账号凭据不可用（可能已失效或缺少刷新凭证）',
   ACCOUNT_ALREADY_EXISTS: '账号已存在',
   ACCOUNT_NOT_FOUND: '账号不存在，请刷新列表',
+  PROXY_UPSTREAM_NOT_FOUND: '上游代理不存在，请刷新代理池',
   TOKEN_REFRESH_FAILED: '刷新 Token 失败，请稍后重试',
   STALE_REVISION: '数据已被其他端修改，请刷新后重试',
   RATE_LIMITED: '操作过于频繁，请稍候再试',

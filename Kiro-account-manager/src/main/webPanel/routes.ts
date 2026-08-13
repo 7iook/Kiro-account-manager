@@ -27,6 +27,7 @@
  * 面板的稳定错误码契约（决策卡 §3）在这一层做，不改业务层返回值。
  */
 import type http from 'node:http'
+import { randomUUID } from 'node:crypto'
 import { sendJson, sendError, type PanelErrorCode } from './respond'
 import {
   PANEL_ACCOUNT_UNSUSPEND_CONFIRMATION,
@@ -37,6 +38,7 @@ import {
 import type { ApiKeyImportInput, ApiKeyImportResult } from '../accountService/importApiKey'
 import { applyAccountDataMutation, type AccountsBlob } from '../accountService/state'
 import type { PanelConfigAuditActor, PanelConfigOperationOutcome } from '../ipc/panelProxyDeps'
+import { proxyLogStore } from '../proxy/logger'
 import type {
   PanelProxyApiKeyCreateResult,
   PanelProxyApiKeyListResult,
@@ -46,6 +48,19 @@ import type {
   PanelProxyConfigView,
   PanelProxyPortChangeResult
 } from './proxyConfigPolicy'
+import { parsePanelProxyLogQuery, projectPanelProxyLogs } from './proxyLogsPolicy'
+import {
+  addPanelUpstreamProxy,
+  deletePanelUpstreamProxy,
+  hasDuplicatePanelUpstreamProxy,
+  hasPanelUpstreamProxy,
+  projectPanelUpstreamProxyPool,
+  updatePanelUpstreamProxy,
+  validatePanelUpstreamProxyCreate,
+  validatePanelUpstreamProxyDelete,
+  validatePanelUpstreamProxyUpdate,
+  type PanelUpstreamProxyMutationView
+} from './upstreamProxyPoolPolicy'
 
 /** 业务层的通用返回形状 —— 两种 error 形状都要能吃（见文件头说明） */
 type ServiceLike = {
@@ -171,6 +186,8 @@ export interface PanelRequestContext {
   path: string
   /** 已解析的 JSON body（非 JSON / 空 body → undefined） */
   body?: Record<string, unknown>
+  /** 已解码的查询参数；重复键采用 URLSearchParams 的最后一个值。 */
+  query?: Record<string, string>
   /** 经 trusted-proxy 链解析后的客户端地址；不能直接采用 X-Forwarded-For。 */
   clientIP?: string
   /** 仅用于配置审计，服务端会截断并再次脱敏。 */
@@ -916,6 +933,160 @@ function respondConfig<T>(
   sendError(res, 500, 'INTERNAL_ERROR', result.message)
 }
 
+type UpstreamMutationResult =
+  | ({ success: true } & PanelUpstreamProxyMutationView)
+  | { success: false; error: 'STALE_REVISION' | 'PROXY_UPSTREAM_NOT_FOUND' }
+
+function respondUpstreamMutation(res: http.ServerResponse, result: UpstreamMutationResult): void {
+  res.setHeader('Cache-Control', 'no-store')
+  if (!result.success) {
+    if (result.error === 'STALE_REVISION') {
+      sendError(res, 409, 'STALE_REVISION')
+      return
+    }
+    sendError(res, 404, 'PROXY_UPSTREAM_NOT_FOUND')
+    return
+  }
+  sendJson(res, 200, {
+    revision: result.revision,
+    entries: result.entries,
+    accountPoolSyncPending: result.accountPoolSyncPending
+  })
+}
+
+async function currentUpstreamMutationView(
+  deps: PanelRouteDeps,
+  accountPoolSyncPending: boolean
+): Promise<PanelUpstreamProxyMutationView> {
+  return {
+    ...projectPanelUpstreamProxyPool(await deps.loadAccountsBlob()),
+    accountPoolSyncPending
+  }
+}
+
+async function handleUpstreamCreate(
+  res: http.ServerResponse,
+  deps: PanelRouteDeps,
+  body: Record<string, unknown> | undefined
+): Promise<void> {
+  const validation = validatePanelUpstreamProxyCreate(body ?? {})
+  if (!validation.ok) {
+    sendError(res, 400, 'INVALID_CONFIG', validation.message)
+    return
+  }
+  const before = await deps.loadAccountsBlob()
+  if (hasDuplicatePanelUpstreamProxy(before, validation.value.proxy)) {
+    sendError(res, 409, 'INVALID_CONFIG', '相同协议、地址、端口和用户名的代理已存在。')
+    return
+  }
+
+  const id = randomUUID()
+  const result = (await singleFlight(
+    `upstream-create:${validation.value.expectedRevision}:${validation.value.proxy.url}`,
+    async () => {
+      const applied = await applyAccountDataMutation(
+        (prev) => addPanelUpstreamProxy(prev, id, validation.value, Date.now()),
+        { expectedRevision: validation.value.expectedRevision }
+      )
+      if (!applied.ok) return { success: false, error: applied.code }
+      return {
+        success: true,
+        ...(await currentUpstreamMutationView(deps, false))
+      }
+    }
+  )) as UpstreamMutationResult
+  respondUpstreamMutation(res, result)
+}
+
+async function handleUpstreamUpdate(
+  res: http.ServerResponse,
+  deps: PanelRouteDeps,
+  id: string,
+  body: Record<string, unknown> | undefined
+): Promise<void> {
+  const validation = validatePanelUpstreamProxyUpdate(body ?? {})
+  if (!validation.ok) {
+    sendError(res, 400, 'INVALID_CONFIG', validation.message)
+    return
+  }
+  const before = await deps.loadAccountsBlob()
+  if (!hasPanelUpstreamProxy(before, id)) {
+    sendError(res, 404, 'PROXY_UPSTREAM_NOT_FOUND')
+    return
+  }
+  if (
+    validation.value.changes.proxy &&
+    hasDuplicatePanelUpstreamProxy(before, validation.value.changes.proxy, id)
+  ) {
+    sendError(res, 409, 'INVALID_CONFIG', '相同协议、地址、端口和用户名的代理已存在。')
+    return
+  }
+
+  const result = (await singleFlight(
+    `upstream-update:${id}:${validation.value.expectedRevision}:${JSON.stringify(body ?? {})}`,
+    async () => {
+      const applied = await applyAccountDataMutation(
+        (prev) => updatePanelUpstreamProxy(prev, id, validation.value),
+        { expectedRevision: validation.value.expectedRevision }
+      )
+      if (!applied.ok) return { success: false, error: applied.code }
+      const accountPoolSyncPending = await syncProxyPoolAfterAccountSetChange(deps)
+      return {
+        success: true,
+        ...(await currentUpstreamMutationView(deps, accountPoolSyncPending))
+      }
+    }
+  )) as UpstreamMutationResult
+  respondUpstreamMutation(res, result)
+}
+
+async function handleUpstreamDelete(
+  res: http.ServerResponse,
+  deps: PanelRouteDeps,
+  id: string,
+  body: Record<string, unknown> | undefined
+): Promise<void> {
+  const validation = validatePanelUpstreamProxyDelete(body ?? {})
+  if (!validation.ok) {
+    sendError(res, 400, 'INVALID_CONFIG', validation.message)
+    return
+  }
+  if (!hasPanelUpstreamProxy(await deps.loadAccountsBlob(), id)) {
+    sendError(res, 404, 'PROXY_UPSTREAM_NOT_FOUND')
+    return
+  }
+
+  const result = (await singleFlight(
+    `upstream-delete:${id}:${validation.value.expectedRevision}`,
+    async () => {
+      const applied = await applyAccountDataMutation((prev) => deletePanelUpstreamProxy(prev, id), {
+        expectedRevision: validation.value.expectedRevision
+      })
+      if (!applied.ok) return { success: false, error: applied.code }
+      const accountPoolSyncPending = await syncProxyPoolAfterAccountSetChange(deps)
+      return {
+        success: true,
+        ...(await currentUpstreamMutationView(deps, accountPoolSyncPending))
+      }
+    }
+  )) as UpstreamMutationResult
+  respondUpstreamMutation(res, result)
+}
+
+function parseUpstreamItemPath(path: string): { id: string; action: '' | 'delete' } | null {
+  const prefix = '/api/proxy/upstreams/'
+  if (!path.startsWith(prefix)) return null
+  const parts = path.slice(prefix.length).split('/')
+  if (parts.length > 2 || (parts.length === 2 && parts[1] !== 'delete')) return null
+  try {
+    const id = decodeURIComponent(parts[0])
+    if (!id || id.length > 200 || id.includes('/')) return null
+    return { id, action: parts[1] === 'delete' ? 'delete' : '' }
+  } catch {
+    return null
+  }
+}
+
 /**
  * 反代命名空间路由 —— `/api/proxy/*`
  *
@@ -961,6 +1132,38 @@ async function routeProxyApi(
     }
     res.setHeader('Cache-Control', 'no-store')
     sendJson(res, 200, await deps.proxyListApiKeys())
+    return true
+  }
+
+  if (path === '/api/proxy/logs' && method === 'GET') {
+    const query = parsePanelProxyLogQuery(ctx.query ?? {})
+    if (!query.ok) {
+      sendError(res, 400, 'INVALID_CONFIG', query.message)
+      return true
+    }
+    res.setHeader('Cache-Control', 'no-store')
+    sendJson(res, 200, projectPanelProxyLogs(proxyLogStore.getAll(), query))
+    return true
+  }
+
+  if (path === '/api/proxy/upstreams' && method === 'GET') {
+    res.setHeader('Cache-Control', 'no-store')
+    sendJson(res, 200, projectPanelUpstreamProxyPool(await deps.loadAccountsBlob()))
+    return true
+  }
+
+  if (path === '/api/proxy/upstreams' && method === 'POST') {
+    await handleUpstreamCreate(res, deps, body)
+    return true
+  }
+
+  const upstreamItem = parseUpstreamItemPath(path)
+  if (upstreamItem && method === 'PATCH' && upstreamItem.action === '') {
+    await handleUpstreamUpdate(res, deps, upstreamItem.id, body)
+    return true
+  }
+  if (upstreamItem && method === 'POST' && upstreamItem.action === 'delete') {
+    await handleUpstreamDelete(res, deps, upstreamItem.id, body)
     return true
   }
 
