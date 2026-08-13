@@ -52,6 +52,7 @@ import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument }
 import { HoldGate, realClock, type HoldGateRuntimeConfig, type HeldRequestHooks, type HoldReason, type HoldEpisode, type HoldGateEvent } from './holdGate'
 import { normalizeHoldConfig } from './holdConfig'
 import { ensureProxySelfSignedCert, type ProxySelfSignedCert } from './selfSignedCert'
+import { classifyAccountSuspension } from '../../shared/accountSuspension'
 
 type HoldAttemptContext = {
   /** 请求是否曾被 HoldGate 成功放行;一旦为 true,本请求剩余生命周期不再复位。 */
@@ -1477,43 +1478,6 @@ export class ProxyServer {
     })
   }
 
-  // 检测错误消息中是否包含账号被长期封禁的特征
-  // 返回 { reason, message } 表示需要标记 suspended；返回 null 表示非封禁错误
-  // 覆盖：
-  //   - Kiro 后端 HTTP 403 + body: { reason: "TEMPORARILY_SUSPENDED", message: "..." }
-  //   - CodeWhisperer AccountSuspendedException
-  //   - 423 Locked
-  private detectSuspendedError(errMsg: string): { reason: string; message: string } | null {
-    if (!errMsg) return null
-
-    // 1) 显式 reason: "TEMPORARILY_SUSPENDED" (Kiro 风控)
-    const reasonMatch = errMsg.match(/"reason"\s*:\s*"(TEMPORARILY_SUSPENDED|ACCOUNT_SUSPENDED|PERMANENTLY_SUSPENDED)"/i)
-    if (reasonMatch) {
-      // 尝试提取 message 字段
-      const msgMatch = errMsg.match(/"message"\s*:\s*"([^"]+)"/)
-      return { reason: reasonMatch[1].toUpperCase(), message: msgMatch?.[1] || errMsg }
-    }
-
-    // 2) 文本特征 "temporarily suspended" / "user id is ... suspended"
-    if (/User\s+ID\s+is\s+(temporarily\s+)?suspended/i.test(errMsg) || /temporarily\s+suspended/i.test(errMsg)) {
-      const msgMatch = errMsg.match(/"message"\s*:\s*"([^"]+)"/)
-      return { reason: 'TEMPORARILY_SUSPENDED', message: msgMatch?.[1] || errMsg }
-    }
-
-    // 3) AccountSuspendedException (CodeWhisperer)
-    if (errMsg.includes('AccountSuspendedException') || errMsg.includes('Account suspended')) {
-      const msgMatch = errMsg.match(/"message"\s*:\s*"([^"]+)"/)
-      return { reason: 'AccountSuspendedException', message: msgMatch?.[1] || errMsg }
-    }
-
-    // 4) HTTP 423 Locked
-    if (/\b423\b/.test(errMsg) && /locked|suspended/i.test(errMsg)) {
-      return { reason: 'ACCOUNT_LOCKED', message: errMsg }
-    }
-
-    return null
-  }
-
   private waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
     this.throwIfAborted(signal)
     return new Promise((resolve, reject) => {
@@ -2051,7 +2015,7 @@ export class ProxyServer {
 
         // 优先检测账号被长期封禁（不是 token 问题，刷新也没用）
         // 特征：HTTP 403 + reason: "TEMPORARILY_SUSPENDED" 或 AccountSuspendedException / 423
-        const suspendInfo = this.detectSuspendedError(errMsg)
+        const suspendInfo = classifyAccountSuspension(errMsg)
         if (suspendInfo) {
           const newlyMarked = this.accountPool.markSuspended(currentAccount.id, suspendInfo.reason, suspendInfo.message)
           if (newlyMarked) {
@@ -3642,7 +3606,7 @@ export class ProxyServer {
           this.recordRequestFailed()
           const errStatusCode = extractHttpStatusCode(error.message)
           this.accountPool.recordError(account.id, errStatusCode !== undefined ? classifyError(errStatusCode) : ErrorType.RECOVERABLE, errStatusCode)
-          const suspendInfoOai = this.detectSuspendedError(error.message)
+          const suspendInfoOai = classifyAccountSuspension(error.message)
           if (suspendInfoOai) {
             const newlyMarked = this.accountPool.markSuspended(account.id, suspendInfoOai.reason, suspendInfoOai.message)
             if (newlyMarked) this.events.onAccountSuspended?.({ accountId: account.id, email: (account as { email?: string }).email, reason: suspendInfoOai.reason, message: suspendInfoOai.message })
@@ -3914,7 +3878,7 @@ export class ProxyServer {
             this.recordRequestFailed()
             const sc = extractHttpStatusCode(error.message)
             this.accountPool.recordError(acc.id, sc !== undefined ? classifyError(sc) : ErrorType.RECOVERABLE, sc)
-            const susp = this.detectSuspendedError(error.message)
+            const susp = classifyAccountSuspension(error.message)
             if (susp) { const nm = this.accountPool.markSuspended(acc.id, susp.reason, susp.message); if (nm) this.events.onAccountSuspended?.({ accountId: acc.id, email: (acc as { email?: string }).email, reason: susp.reason, message: susp.message }) }
             // 首字节前失败 → 交给 runWithHold 切号/挂起;已吐正文 → 现状 error。
             if (!bodyStarted) { if (!settled) { settled = true; recordError(error); resolveAttempt('pre_body_failed') } ; return }
@@ -4300,7 +4264,7 @@ export class ProxyServer {
    */
   private isSwitchWorthyError(errMsg: string): boolean {
     if (!errMsg) return false
-    if (this.detectSuspendedError(errMsg)) return true
+    if (classifyAccountSuspension(errMsg)) return true
     // 大小写不敏感匹配(RCA 2026-08-03):kiroApi 429 撞爆抛的错是 "Rate limited on ..."(R 大写),
     // 之前用 String.includes 区分大小写 → 不命中 → 走原样报错 → 用户看到 AI SUB 莫名中断。
     const lower = errMsg.toLowerCase()
@@ -4993,7 +4957,7 @@ export class ProxyServer {
           this.accountPool.recordError(account.id, errStatusCode2 !== undefined ? classifyError(errStatusCode2) : ErrorType.RECOVERABLE, errStatusCode2)
           // 单账号被 403 suspended 时 recordError 不足以标记长期封禁,补一道 detect+markSuspended,
           // 否则 resume 会再次选中同一挂账号死循环。
-          const suspendInfo2 = this.detectSuspendedError(error.message)
+          const suspendInfo2 = classifyAccountSuspension(error.message)
           if (suspendInfo2) {
             const newlyMarked = this.accountPool.markSuspended(account.id, suspendInfo2.reason, suspendInfo2.message)
             if (newlyMarked) {
