@@ -11,14 +11,12 @@ const AUTHORITATIVE_CLASSIFIER = 'src/shared/accountSuspension.ts'
  * 这些不是通用账号封禁分类器：
  * - kiroApi / registrar 在各自协议边界读取结构化 HTTP/响应字段；
  * - RegisterPage 只把注册失败翻译成诊断文案，不参与账号池/选号；
- * - webPanel 当前由并行任务占用，本轮不能修改，先精确冻结这一处存量副本。
  */
 const ALLOWED_RAW_DECISION_FILES = new Set([
   AUTHORITATIVE_CLASSIFIER,
   'src/main/proxy/kiroApi.ts',
   'src/main/registration/registrar.ts',
-  'src/renderer/src/components/pages/RegisterPage.tsx',
-  'src/webPanel/ui/format.ts'
+  'src/renderer/src/components/pages/RegisterPage.tsx'
 ])
 
 interface RawDecisionFinding {
@@ -95,13 +93,10 @@ function collectRawDecisions(file: string, source: string): RawDecisionFinding[]
     if (
       ts.isRegularExpressionLiteral(node) &&
       containsRawSuspensionMarker(node.text) &&
-      (
-        (ts.isPropertyAccessExpression(node.parent) &&
-          ts.isCallExpression(node.parent.parent)) ||
+      ((ts.isPropertyAccessExpression(node.parent) && ts.isCallExpression(node.parent.parent)) ||
         (ts.isCallExpression(node.parent) &&
           ts.isPropertyAccessExpression(node.parent.expression) &&
-          ['match', 'search', 'replace'].includes(node.parent.expression.name.text))
-      )
+          ['match', 'search', 'replace'].includes(node.parent.expression.name.text)))
     ) {
       add(node)
     }
@@ -114,7 +109,8 @@ function collectRawDecisions(file: string, source: string): RawDecisionFinding[]
 
 describe('账号封禁文本分类架构门禁', () => {
   it('扫描器能抓住新复制的 ACCOUNT_SUSPENDED 判定（防空门禁）', () => {
-    const mutant = "export const copied = (message: string) => message.includes('ACCOUNT_SUSPENDED')"
+    const mutant =
+      "export const copied = (message: string) => message.includes('ACCOUNT_SUSPENDED')"
     expect(collectRawDecisions(resolve(PROJECT_ROOT, 'src/mutant.ts'), mutant)).toHaveLength(1)
   })
 
@@ -135,9 +131,7 @@ describe('账号封禁文本分类架构门禁', () => {
       '权威分类器必须实际包含原文判定；零命中的门禁与没有门禁同形'
     ).toBeGreaterThan(0)
 
-    const unexpected = findings.filter(
-      (finding) => !ALLOWED_RAW_DECISION_FILES.has(finding.file)
-    )
+    const unexpected = findings.filter((finding) => !ALLOWED_RAW_DECISION_FILES.has(finding.file))
     expect(
       unexpected,
       unexpected
