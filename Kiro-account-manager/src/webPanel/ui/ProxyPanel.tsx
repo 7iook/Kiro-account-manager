@@ -35,6 +35,8 @@ import {
 import { PanelApiError } from '../api/client'
 import { PANEL_ACCOUNTS_INVALIDATED_EVENT } from './accountDataEvents'
 import { formatCountdown, formatPercent } from './format'
+import { PanelSectionBoundary } from './PanelSectionBoundary'
+import { ProxyConfigSection } from './ProxyConfigSection'
 
 interface ProxyPanelProps {
   /** 账号列表（已由 App 加载）—— 选号弹窗的候选来源 */
@@ -490,6 +492,10 @@ export function ProxyPanel({
       >
         {busy === 'sync' ? '同步中…' : '重新同步账号池'}
       </button>
+
+      <PanelSectionBoundary name="反代配置">
+        <ProxyConfigSection onSessionLost={onSessionLost} onNotice={onNotice} onError={onError} />
+      </PanelSectionBoundary>
 
       <div className="mt-3 border-t border-slate-100 pt-3 dark:border-slate-800">
         <p className="text-xs text-slate-500 dark:text-slate-400">

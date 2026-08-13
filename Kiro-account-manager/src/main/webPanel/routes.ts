@@ -31,6 +31,19 @@ import { sendJson, sendError, type PanelErrorCode } from './respond'
 import { projectAccountsBlob, type AccountListPayload } from './dto'
 import type { ApiKeyImportInput, ApiKeyImportResult } from '../accountService/importApiKey'
 import { applyAccountDataMutation, type AccountsBlob } from '../accountService/state'
+import type {
+  PanelConfigAuditActor,
+  PanelConfigOperationOutcome
+} from '../ipc/panelProxyDeps'
+import type {
+  PanelProxyApiKeyCreateResult,
+  PanelProxyApiKeyListResult,
+  PanelProxyApiKeyRevokeResult,
+  PanelProxyApiKeyVerifyResult,
+  PanelProxyConfigResult,
+  PanelProxyConfigView,
+  PanelProxyPortChangeResult
+} from './proxyConfigPolicy'
 
 /** 业务层的通用返回形状 —— 两种 error 形状都要能吃（见文件头说明） */
 type ServiceLike = {
@@ -123,6 +136,29 @@ export interface PanelRouteDeps {
    * 留在桌面端（同上文「为什么没有 proxyUpdateConfig」的同一理由）。
    */
   proxyReleaseHeld: () => Promise<ServiceLike>
+  /** 手机面板可见的反代配置安全投影；生产装配由 panelProxyDeps 注入。 */
+  proxyGetConfig?: () => Promise<PanelProxyConfigView>
+  proxyUpdateConfig?: (
+    input: unknown,
+    actor: PanelConfigAuditActor
+  ) => Promise<PanelConfigOperationOutcome<PanelProxyConfigResult>>
+  proxyChangePort?: (
+    input: unknown,
+    actor: PanelConfigAuditActor
+  ) => Promise<PanelConfigOperationOutcome<PanelProxyPortChangeResult>>
+  proxyListApiKeys?: () => Promise<PanelProxyApiKeyListResult>
+  proxyCreateApiKey?: (
+    input: unknown,
+    actor: PanelConfigAuditActor
+  ) => Promise<PanelConfigOperationOutcome<PanelProxyApiKeyCreateResult>>
+  proxyVerifyApiKey?: (
+    input: unknown,
+    actor: PanelConfigAuditActor
+  ) => Promise<PanelConfigOperationOutcome<PanelProxyApiKeyVerifyResult>>
+  proxyRevokeApiKey?: (
+    input: unknown,
+    actor: PanelConfigAuditActor
+  ) => Promise<PanelConfigOperationOutcome<PanelProxyApiKeyRevokeResult>>
 }
 
 /** 已解析的请求上下文（路径已去掉 `/panel` 前缀） */
@@ -132,6 +168,10 @@ export interface PanelRequestContext {
   path: string
   /** 已解析的 JSON body（非 JSON / 空 body → undefined） */
   body?: Record<string, unknown>
+  /** 经 trusted-proxy 链解析后的客户端地址；不能直接采用 X-Forwarded-For。 */
+  clientIP?: string
+  /** 仅用于配置审计，服务端会截断并再次脱敏。 */
+  userAgent?: string
 }
 
 /** 业务层返回的 error 归一成一句话（两种形状都吃） */
@@ -633,6 +673,29 @@ async function singleFlight(key: string, run: () => Promise<ServiceLike>): Promi
   return task
 }
 
+/** 配置动作的并发双击去重；不同请求仍由 panelProxyDeps 的串行队列依次合并最新值。 */
+const configInFlight = new WeakMap<
+  PanelRouteDeps,
+  Map<string, Promise<PanelConfigOperationOutcome<unknown>>>
+>()
+
+async function configSingleFlight<T>(
+  scope: PanelRouteDeps,
+  key: string,
+  run: () => Promise<PanelConfigOperationOutcome<T>>
+): Promise<PanelConfigOperationOutcome<T>> {
+  let flights = configInFlight.get(scope)
+  if (!flights) {
+    flights = new Map()
+    configInFlight.set(scope, flights)
+  }
+  const existing = flights.get(key)
+  if (existing) return existing as Promise<PanelConfigOperationOutcome<T>>
+  const task = run().finally(() => flights?.delete(key))
+  flights.set(key, task as Promise<PanelConfigOperationOutcome<unknown>>)
+  return task
+}
+
 /** 列表：`load-accounts` → 白名单投影后出网 */
 async function handleList(res: http.ServerResponse, deps: PanelRouteDeps): Promise<void> {
   const blob = await deps.loadAccountsBlob()
@@ -767,6 +830,27 @@ function respondProxy(res: http.ServerResponse, result: ServiceLike | undefined)
   sendJson(res, 200, result ?? { success: true })
 }
 
+function respondConfig<T>(
+  res: http.ServerResponse,
+  result: PanelConfigOperationOutcome<T>,
+  noStore = false
+): void {
+  if (noStore) res.setHeader('Cache-Control', 'no-store')
+  if (result.ok) {
+    sendJson(res, 200, result.value)
+    return
+  }
+  if (result.kind === 'invalid') {
+    sendError(res, 400, 'INVALID_CONFIG', result.message)
+    return
+  }
+  if (result.kind === 'conflict') {
+    sendError(res, 409, 'INVALID_CONFIG', result.message)
+    return
+  }
+  sendError(res, 500, 'INTERNAL_ERROR', result.message)
+}
+
 /**
  * 反代命名空间路由 —— `/api/proxy/*`
  *
@@ -797,9 +881,78 @@ async function routeProxyApi(
     return true
   }
 
+  if (path === '/api/proxy/config' && method === 'GET') {
+    if (!deps.proxyGetConfig) {
+      throw new Error('proxy config route is not wired')
+    }
+    res.setHeader('Cache-Control', 'no-store')
+    sendJson(res, 200, await deps.proxyGetConfig())
+    return true
+  }
+
+  if (path === '/api/proxy/api-keys' && method === 'GET') {
+    if (!deps.proxyListApiKeys) {
+      throw new Error('proxy API key list route is not wired')
+    }
+    res.setHeader('Cache-Control', 'no-store')
+    sendJson(res, 200, await deps.proxyListApiKeys())
+    return true
+  }
+
   if (method !== 'POST') return false
 
+  const actor: PanelConfigAuditActor = {
+    clientIP: ctx.clientIP ?? 'unknown',
+    userAgent: ctx.userAgent ?? ''
+  }
+  const mutationKey = `${path}:${JSON.stringify(body ?? {})}`
+
   switch (path) {
+    case '/api/proxy/config':
+      if (!deps.proxyUpdateConfig) throw new Error('proxy config update route is not wired')
+      respondConfig(
+        res,
+        await configSingleFlight(deps, mutationKey, () => deps.proxyUpdateConfig!(body ?? {}, actor)),
+        true
+      )
+      return true
+
+    case '/api/proxy/config/port':
+      if (!deps.proxyChangePort) throw new Error('proxy port route is not wired')
+      respondConfig(
+        res,
+        await configSingleFlight(deps, mutationKey, () => deps.proxyChangePort!(body ?? {}, actor)),
+        true
+      )
+      return true
+
+    case '/api/proxy/api-keys/create':
+      if (!deps.proxyCreateApiKey) throw new Error('proxy API key create route is not wired')
+      respondConfig(
+        res,
+        await configSingleFlight(deps, mutationKey, () => deps.proxyCreateApiKey!(body ?? {}, actor)),
+        true
+      )
+      return true
+
+    case '/api/proxy/api-keys/verify':
+      if (!deps.proxyVerifyApiKey) throw new Error('proxy API key verify route is not wired')
+      respondConfig(
+        res,
+        await configSingleFlight(deps, mutationKey, () => deps.proxyVerifyApiKey!(body ?? {}, actor)),
+        true
+      )
+      return true
+
+    case '/api/proxy/api-keys/revoke':
+      if (!deps.proxyRevokeApiKey) throw new Error('proxy API key revoke route is not wired')
+      respondConfig(
+        res,
+        await configSingleFlight(deps, mutationKey, () => deps.proxyRevokeApiKey!(body ?? {}, actor)),
+        true
+      )
+      return true
+
     // 启动。单飞去重：手机端连点不会真启两次（实现侧幂等，这里再收一道）
     case '/api/proxy/start':
       respondProxy(res, await singleFlight('proxy-start', () => deps.proxyStart()))

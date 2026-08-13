@@ -83,7 +83,11 @@ import type {
 import type { PanelAccountIdentity, PanelRouteDeps } from '../webPanel/routes'
 import { PanelAuth, type AdminKeyStore } from '../webPanel/auth'
 import { WebPanelServer, type WebPanelConfig } from '../webPanel/server'
-import { buildPanelProxyDeps, type ProxyServerRef } from '../ipc/panelProxyDeps'
+import {
+  buildPanelProxyDeps,
+  type PanelProxyRouteDeps,
+  type ProxyServerRef
+} from '../ipc/panelProxyDeps'
 import {
   activateProxyAccount,
   buildProxyAccountsFromStore,
@@ -631,7 +635,10 @@ function applyServerAutoSwitchDecision(
   if (!server?.isRunning()) {
     const config = readProxyConfig(store)
     if (config.enableMultiAccount === false) {
-      store.set('proxyConfig', { ...config, selectedAccountIds: [decision.toAccountId] })
+      store.set(
+        'proxyConfig',
+        withoutTrustedTlsProxyIPs({ ...config, selectedAccountIds: [decision.toAccountId] })
+      )
     }
     store.set(AUTO_SWITCH_APPLIED_DECISION_KEY, decision.id)
     return true
@@ -1022,9 +1029,9 @@ export function restoreOrphanProxySession(store: AccountStorePort): void {
  * routes 的公共契约），所以两端各自收一次。只动类型、不动值 —— 断言而非转换，
  * 运行期零开销、零行为差异。
  */
-function asServiceMap<T extends Record<string, (...args: never[]) => Promise<unknown>>>(
-  deps: T
-): { [K in keyof T]: (...args: Parameters<T[K]>) => Promise<Record<string, unknown>> } {
+function asServiceMap(
+  deps: PanelProxyRouteDeps
+): Pick<PanelRouteDeps, keyof PanelProxyRouteDeps> {
   return deps as never
 }
 
@@ -1112,6 +1119,7 @@ function buildServerRouteDeps(ctx: {
       buildPanelProxyDeps({
         getProxyServer: () => ctx.getProxyServer() as ProxyServerRef | null,
         initProxyServer: () => ctx.initProxyServer() as unknown as ProxyServerRef,
+        getLatestProxyConfig: () => readProxyConfig(store),
         loadAccountData: () => store.get('accountData') as never,
         persistProxyConfig: (cfg) => {
           // 与桌面 `proxy-update-config` 一致地落盘 —— 不写盘的话，下次自启动会丢掉

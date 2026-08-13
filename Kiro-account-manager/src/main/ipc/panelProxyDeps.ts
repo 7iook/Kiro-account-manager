@@ -17,6 +17,7 @@
  * 在本文件的 `proxyStart` 里且只此一处。路由层与面板 UI 都不重复这个顺序 ——
  * 顺序有第二个真源时，两处早晚分叉，表现是「面板绿灯但反代打旧号」。
  */
+import { randomBytes, randomUUID } from 'node:crypto'
 import {
   activateProxyAccount,
   buildProxyAccountsFromStore,
@@ -25,9 +26,32 @@ import {
   type ProxyBindingContext
 } from '../proxy/activation'
 import type { AccountPool } from '../proxy/accountPool'
-import type { ProxyConfig } from '../proxy/types'
+import type { ApiKey, ProxyConfig } from '../proxy/types'
 import type { HoldAutoReleaseState, HeldRequestsInfo } from '../proxy/proxyServer'
 import type { HoldEpisode } from '../proxy/holdGate'
+import {
+  applyProxyConfigUpdate,
+  ProxyConfigUpdateError
+} from '../proxy/applyProxyConfigUpdate'
+import { proxyLogger } from '../proxy/logger'
+import { redactString } from '../utils/redact'
+import {
+  panelProxyApiKeyHint,
+  projectPanelProxyApiKeyList,
+  projectPanelProxyConfig,
+  validatePanelProxyApiKeyCreate,
+  validatePanelProxyApiKeyRevoke,
+  validatePanelProxyApiKeyVerify,
+  validatePanelProxyConfigPatch,
+  validatePanelProxyPortChange,
+  type PanelProxyApiKeyCreateResult,
+  type PanelProxyApiKeyListResult,
+  type PanelProxyApiKeyRevokeResult,
+  type PanelProxyApiKeyVerifyResult,
+  type PanelProxyConfigResult,
+  type PanelProxyConfigView,
+  type PanelProxyPortChangeResult
+} from '../webPanel/proxyConfigPolicy'
 
 /** 反代服务器的最小接口（避免把整个 ProxyServer 类型拖进来） */
 export interface ProxyServerRef {
@@ -38,6 +62,8 @@ export interface ProxyServerRef {
   invalidateSessionAffinity: () => number
   start: () => Promise<void>
   stop: () => Promise<void>
+  restartServer: () => Promise<void>
+  needsRestart: () => boolean
   getStats: () => { totalRequests: number; successRequests: number; failedRequests: number }
   /**
    * 自动放行调度器的当前读数（决策卡 §3 三字段）。
@@ -78,14 +104,60 @@ export interface PanelProxyDepsImpl {
   getProxyServer: () => ProxyServerRef | null
   /** 惰性初始化并返回实例（仅启动路径用） */
   initProxyServer: () => ProxyServerRef
+  /** 未初始化时从持久态读取；已初始化时调用方应返回实例的最新运行态。 */
+  getLatestProxyConfig: () => ProxyConfig
   /** 从盘上读 `accountData`（账号表 + 出口代理绑定） */
   loadAccountData: () => StoredProxyAccountData | undefined
   /** 把当前配置写回 store（对齐 `proxy-update-config` 的持久化行为） */
-  persistProxyConfig: (config: ProxyConfig) => void
+  persistProxyConfig: (config: ProxyConfig) => void | Promise<void>
   /** 托盘菜单状态刷新（桌面端启停后会做，面板启停也要做，否则托盘显示与实际不符） */
   updateTrayMenu?: () => void
   /** 停止前归档会话统计（对齐 `proxy-stop` 的既有行为） */
   archiveSessionIfAny?: () => void
+}
+
+export interface PanelConfigAuditActor {
+  clientIP: string
+  userAgent: string
+}
+
+export type PanelConfigOperationOutcome<T> =
+  | { ok: true; value: T }
+  | {
+      ok: false
+      kind: 'invalid' | 'conflict' | 'apply' | 'persist' | 'internal'
+      message: string
+    }
+
+export interface PanelProxyRouteDeps {
+  proxyGetStatus: () => Promise<unknown>
+  proxySyncPool: () => Promise<unknown>
+  proxyActivateAccount: (accountId: string) => Promise<unknown>
+  proxyStart: () => Promise<unknown>
+  proxyStop: () => Promise<unknown>
+  proxyReleaseHeld: () => Promise<unknown>
+  proxyGetConfig: () => Promise<PanelProxyConfigView>
+  proxyUpdateConfig: (
+    input: unknown,
+    actor: PanelConfigAuditActor
+  ) => Promise<PanelConfigOperationOutcome<PanelProxyConfigResult>>
+  proxyChangePort: (
+    input: unknown,
+    actor: PanelConfigAuditActor
+  ) => Promise<PanelConfigOperationOutcome<PanelProxyPortChangeResult>>
+  proxyListApiKeys: () => Promise<PanelProxyApiKeyListResult>
+  proxyCreateApiKey: (
+    input: unknown,
+    actor: PanelConfigAuditActor
+  ) => Promise<PanelConfigOperationOutcome<PanelProxyApiKeyCreateResult>>
+  proxyVerifyApiKey: (
+    input: unknown,
+    actor: PanelConfigAuditActor
+  ) => Promise<PanelConfigOperationOutcome<PanelProxyApiKeyVerifyResult>>
+  proxyRevokeApiKey: (
+    input: unknown,
+    actor: PanelConfigAuditActor
+  ) => Promise<PanelConfigOperationOutcome<PanelProxyApiKeyRevokeResult>>
 }
 
 /** 面板可见的反代状态。**不含任何凭据** —— 只有 id / email 级别的标识 */
@@ -240,19 +312,125 @@ function syncPool(impl: PanelProxyDepsImpl, server: ProxyServerRef): number {
   return syncProxyPoolFromStore(impl.loadAccountData, server, 'panel-sync').poolSize
 }
 
+function configuredApiKeyCount(config: ProxyConfig): number {
+  return (
+    (config.apiKey ? 1 : 0) +
+    (config.apiKeys ?? []).filter((entry) => entry.enabled && entry.key).length
+  )
+}
+
+function safeAuditText(value: string, config: ProxyConfig, maxLength: number): string {
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, maxLength)
+  const secrets = [config.apiKey, ...(config.apiKeys ?? []).map((entry) => entry.key)].filter(
+    (entry): entry is string => typeof entry === 'string' && entry.length > 0
+  )
+  if (secrets.some((secret) => normalized.includes(secret))) return '[redacted]'
+  return redactString(normalized).replace(/key:[a-f0-9]{12}/gi, '[redacted-hint]')
+}
+
+interface ConfigAuditInput {
+  actor: PanelConfigAuditActor
+  config: ProxyConfig
+  outcome: 'success' | 'rejected' | 'failed'
+  fields: string[]
+  change:
+    | { key: 'logRequests' | 'port'; before: boolean | number; after: boolean | number }
+    | { operation: 'create' | 'verify' | 'revoke'; configuredBefore: boolean; configuredAfter: boolean }
+    | null
+  requiresRestart: boolean
+  apply: 'not_attempted' | 'succeeded' | 'failed'
+  persist: 'not_attempted' | 'succeeded' | 'failed'
+  rollback?: 'not_needed' | 'succeeded' | 'failed'
+}
+
+/**
+ * C1 配置审计固定写持久 proxyLogStore，刻意不读取 `enableAuditLog`。
+ * secret 动作的 change 形状只有 operation/configuredBefore/configuredAfter。
+ */
+function writeConfigAudit(input: ConfigAuditInput): void {
+  const data = {
+    timestamp: new Date().toISOString(),
+    actor: 'admin',
+    clientIP: safeAuditText(input.actor.clientIP, input.config, 64),
+    userAgent: safeAuditText(input.actor.userAgent, input.config, 256),
+    outcome: input.outcome,
+    fields: input.fields,
+    change: input.change,
+    requiresRestart: input.requiresRestart,
+    apply: input.apply,
+    persist: input.persist,
+    rollback: input.rollback ?? 'not_needed'
+  }
+  const message = 'Panel proxy configuration operation'
+  if (input.outcome === 'success') proxyLogger.info('PanelConfigAudit', message, data)
+  else proxyLogger.warn('PanelConfigAudit', message, data)
+}
+
+function updateFailure(
+  error: unknown
+): { kind: 'apply' | 'persist' | 'internal'; message: string; rollback: 'succeeded' | 'failed' } {
+  if (error instanceof ProxyConfigUpdateError) {
+    const rollback = error.rollbackSucceeded ? 'succeeded' : 'failed'
+    if (error.phase === 'persist') {
+      return {
+        kind: 'persist',
+        message: error.rollbackSucceeded
+          ? '配置持久化失败，运行态和盘上值已恢复。'
+          : '配置持久化失败，自动回滚未完成；请检查反代与磁盘状态。',
+        rollback
+      }
+    }
+    return {
+      kind: 'apply',
+      message: error.rollbackSucceeded
+        ? '配置运行态应用失败，已恢复原配置。'
+        : '配置运行态应用失败，自动回滚未完成；请检查反代状态。',
+      rollback
+    }
+  }
+  return {
+    kind: 'internal',
+    message: '配置操作失败，请查看服务端审计日志。',
+    rollback: 'failed'
+  }
+}
+
 /**
  * 组装面板的六个反代端点实现。
  *
  * 返回值直接展开进 `buildPanelRouteDeps({...})`。
  */
-export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): {
-  proxyGetStatus: () => Promise<unknown>
-  proxySyncPool: () => Promise<unknown>
-  proxyActivateAccount: (accountId: string) => Promise<unknown>
-  proxyStart: () => Promise<unknown>
-  proxyStop: () => Promise<unknown>
-  proxyReleaseHeld: () => Promise<unknown>
-} {
+export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): PanelProxyRouteDeps {
+  const latestConfig = (): ProxyConfig => ({
+    ...(impl.getProxyServer()?.getConfig() ?? impl.getLatestProxyConfig())
+  })
+  const configView = (): PanelProxyConfigView => {
+    const server = impl.getProxyServer()
+    return projectPanelProxyConfig(server?.getConfig() ?? impl.getLatestProxyConfig(), server?.needsRestart() ?? false)
+  }
+  const applyUpdate = (patch: Partial<ProxyConfig>, mode: 'hot' | 'restart' = 'hot') =>
+    applyProxyConfigUpdate(
+      {
+        getLatestConfig: latestConfig,
+        getProxyServer: () => impl.getProxyServer(),
+        persistProxyConfig: impl.persistProxyConfig
+      },
+      patch,
+      mode
+    )
+
+  // 配置写必须串行：每个动作都在轮到自己时重新读最新 config，避免两个手机会话
+  // 同时 patch 时都从旧快照合并，后完成者把前一个无关字段覆盖掉。
+  let mutationTail: Promise<void> = Promise.resolve()
+  const serializeMutation = <T>(run: () => Promise<T>): Promise<T> => {
+    const task = mutationTail.then(run, run)
+    mutationTail = task.then(
+      () => undefined,
+      () => undefined
+    )
+    return task
+  }
+
   /**
    * 面板状态读数。
    *
@@ -320,7 +498,374 @@ export function buildPanelProxyDeps(impl: PanelProxyDepsImpl): {
     return out
   }
 
+  const rejected = <T>(
+    actor: PanelConfigAuditActor,
+    config: ProxyConfig,
+    message: string,
+    fields: string[],
+    change: ConfigAuditInput['change'] = null
+  ): PanelConfigOperationOutcome<T> => {
+    writeConfigAudit({
+      actor,
+      config,
+      outcome: 'rejected',
+      fields,
+      change,
+      requiresRestart: false,
+      apply: 'not_attempted',
+      persist: 'not_attempted'
+    })
+    return { ok: false, kind: 'invalid', message }
+  }
+
+  const failed = <T>(
+    actor: PanelConfigAuditActor,
+    config: ProxyConfig,
+    error: unknown,
+    fields: string[],
+    change: ConfigAuditInput['change'],
+    requiresRestart: boolean
+  ): PanelConfigOperationOutcome<T> => {
+    const detail = updateFailure(error)
+    writeConfigAudit({
+      actor,
+      config,
+      outcome: 'failed',
+      fields,
+      change,
+      requiresRestart,
+      apply: detail.kind === 'persist' ? 'succeeded' : 'failed',
+      persist: detail.kind === 'persist' ? 'failed' : 'not_attempted',
+      rollback: detail.rollback
+    })
+    return { ok: false, kind: detail.kind, message: detail.message }
+  }
+
   return {
+    proxyGetConfig: async () => configView(),
+
+    proxyUpdateConfig: (input, actor) =>
+      serializeMutation(async () => {
+        const previous = latestConfig()
+        const validation = validatePanelProxyConfigPatch(input)
+        if (!validation.ok) {
+          return rejected(actor, previous, validation.message, validation.fields)
+        }
+        const nextValue = validation.value.changes.logRequests as boolean
+        const change = {
+          key: 'logRequests' as const,
+          before: previous.logRequests === true,
+          after: nextValue
+        }
+        if (change.before === change.after) {
+          writeConfigAudit({
+            actor,
+            config: previous,
+            outcome: 'success',
+            fields: [],
+            change,
+            requiresRestart: false,
+            apply: 'not_attempted',
+            persist: 'not_attempted'
+          })
+          return {
+            ok: true,
+            value: {
+              appliedFields: [],
+              requiresRestart: false,
+              config: configView()
+            }
+          }
+        }
+        try {
+          const applied = await applyUpdate({ logRequests: nextValue })
+          writeConfigAudit({
+            actor,
+            config: applied.config,
+            outcome: 'success',
+            fields: ['logRequests'],
+            change,
+            requiresRestart: false,
+            apply: 'succeeded',
+            persist: 'succeeded'
+          })
+          return {
+            ok: true,
+            value: {
+              appliedFields: ['logRequests'],
+              requiresRestart: false,
+              config: projectPanelProxyConfig(
+                applied.config,
+                impl.getProxyServer()?.needsRestart() ?? false
+              )
+            }
+          }
+        } catch (error) {
+          return failed(actor, previous, error, ['logRequests'], change, false)
+        }
+      }),
+
+    proxyChangePort: (input, actor) =>
+      serializeMutation(async () => {
+        const previous = latestConfig()
+        const validation = validatePanelProxyPortChange(input, previous.port)
+        if (!validation.ok) {
+          return rejected(actor, previous, validation.message, validation.fields)
+        }
+        const change = {
+          key: 'port' as const,
+          before: previous.port,
+          after: validation.value.port
+        }
+        try {
+          const applied = await applyUpdate({ port: validation.value.port }, 'restart')
+          impl.updateTrayMenu?.()
+          writeConfigAudit({
+            actor,
+            config: applied.config,
+            outcome: 'success',
+            fields: ['port'],
+            change,
+            requiresRestart: false,
+            apply: 'succeeded',
+            persist: 'succeeded'
+          })
+          return {
+            ok: true,
+            value: {
+              previousPort: previous.port,
+              port: applied.config.port,
+              restarted: applied.restarted,
+              requiresRestart: false as const,
+              config: projectPanelProxyConfig(applied.config, false)
+            }
+          }
+        } catch (error) {
+          return failed(actor, previous, error, ['port'], change, true)
+        }
+      }),
+
+    proxyListApiKeys: async () => projectPanelProxyApiKeyList(latestConfig()),
+
+    proxyCreateApiKey: (input, actor) =>
+      serializeMutation(async () => {
+        const previous = latestConfig()
+        const validation = validatePanelProxyApiKeyCreate(input)
+        const configuredBefore = configuredApiKeyCount(previous) > 0
+        const auditChange = {
+          operation: 'create' as const,
+          configuredBefore,
+          configuredAfter: true
+        }
+        if (!validation.ok) {
+          return rejected(actor, previous, validation.message, validation.fields, auditChange)
+        }
+        const createdAt = Date.now()
+        const id = randomUUID()
+        const key = `sk-${randomBytes(24).toString('hex')}`
+        const entry: ApiKey = {
+          id,
+          name: `Panel key ${new Date(createdAt).toISOString()}`,
+          key,
+          format: 'sk',
+          enabled: true,
+          createdAt,
+          usage: {
+            totalRequests: 0,
+            totalCredits: 0,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+            daily: {}
+          }
+        }
+        try {
+          const applied = await applyUpdate({
+            apiKeys: [...(previous.apiKeys ?? []), entry]
+          })
+          writeConfigAudit({
+            actor,
+            config: applied.config,
+            outcome: 'success',
+            fields: ['apiKeys'],
+            change: auditChange,
+            requiresRestart: false,
+            apply: 'succeeded',
+            persist: 'succeeded'
+          })
+          return {
+            ok: true,
+            value: {
+              id,
+              key,
+              hint: panelProxyApiKeyHint(id),
+              createdAt,
+              config: projectPanelProxyConfig(applied.config, false)
+            }
+          }
+        } catch (error) {
+          return failed(actor, previous, error, ['apiKeys'], auditChange, false)
+        }
+      }),
+
+    proxyVerifyApiKey: (input, actor) =>
+      serializeMutation(async () => {
+        const previous = latestConfig()
+        const configured = configuredApiKeyCount(previous) > 0
+        const auditChange = {
+          operation: 'verify' as const,
+          configuredBefore: configured,
+          configuredAfter: configured
+        }
+        const validation = validatePanelProxyApiKeyVerify(input)
+        if (!validation.ok) {
+          return rejected(actor, previous, validation.message, validation.fields, auditChange)
+        }
+        const entry = previous.apiKeys?.find(
+          (candidate) => candidate.id === validation.value.id && candidate.enabled && candidate.key
+        )
+        if (!entry) {
+          return rejected(
+            actor,
+            previous,
+            '未找到可验证的新 API Key。',
+            ['apiKeys'],
+            auditChange
+          )
+        }
+        if (typeof entry.lastUsedAt !== 'number' || entry.lastUsedAt < entry.createdAt) {
+          writeConfigAudit({
+            actor,
+            config: previous,
+            outcome: 'rejected',
+            fields: ['apiKeys'],
+            change: auditChange,
+            requiresRestart: false,
+            apply: 'not_attempted',
+            persist: 'not_attempted'
+          })
+          return {
+            ok: false,
+            kind: 'conflict',
+            message: '新 API Key 尚未成功服务过数据面请求，不能标记为已验证。'
+          }
+        }
+        try {
+          const applied = await applyUpdate({
+            apiKeys: (previous.apiKeys ?? []).map((candidate) => ({ ...candidate }))
+          })
+          writeConfigAudit({
+            actor,
+            config: applied.config,
+            outcome: 'success',
+            fields: ['apiKeys'],
+            change: auditChange,
+            requiresRestart: false,
+            apply: 'succeeded',
+            persist: 'succeeded'
+          })
+          return {
+            ok: true,
+            value: {
+              id: entry.id,
+              verified: true as const,
+              verifiedAt: entry.lastUsedAt,
+              config: projectPanelProxyConfig(applied.config, false)
+            }
+          }
+        } catch (error) {
+          return failed(actor, previous, error, ['apiKeys'], auditChange, false)
+        }
+      }),
+
+    proxyRevokeApiKey: (input, actor) =>
+      serializeMutation(async () => {
+        const previous = latestConfig()
+        const configuredBefore = configuredApiKeyCount(previous) > 0
+        const validation = validatePanelProxyApiKeyRevoke(input)
+        const invalidAudit = {
+          operation: 'revoke' as const,
+          configuredBefore,
+          configuredAfter: configuredBefore
+        }
+        if (!validation.ok) {
+          return rejected(actor, previous, validation.message, validation.fields, invalidAudit)
+        }
+        const replacement = previous.apiKeys?.find(
+          (candidate) =>
+            candidate.id === validation.value.replacementId &&
+            candidate.enabled &&
+            candidate.key &&
+            typeof candidate.lastUsedAt === 'number' &&
+            candidate.lastUsedAt >= candidate.createdAt
+        )
+        if (!replacement) {
+          writeConfigAudit({
+            actor,
+            config: previous,
+            outcome: 'rejected',
+            fields: ['apiKeys'],
+            change: invalidAudit,
+            requiresRestart: false,
+            apply: 'not_attempted',
+            persist: 'not_attempted'
+          })
+          return {
+            ok: false,
+            kind: 'conflict',
+            message: '替代 API Key 尚未通过真实请求验证，不能吊销旧 key。'
+          }
+        }
+
+        let patch: Partial<ProxyConfig>
+        if (validation.value.id === 'legacy') {
+          if (!previous.apiKey) {
+            return rejected(actor, previous, '旧版 API Key 已不存在。', ['apiKeys'], invalidAudit)
+          }
+          patch = { apiKey: undefined }
+        } else {
+          const targetIndex = (previous.apiKeys ?? []).findIndex(
+            (candidate) => candidate.id === validation.value.id && candidate.enabled
+          )
+          if (targetIndex < 0) {
+            return rejected(actor, previous, '待吊销 API Key 不存在或已停用。', ['apiKeys'], invalidAudit)
+          }
+          patch = {
+            apiKeys: (previous.apiKeys ?? []).map((candidate, index) =>
+              index === targetIndex ? { ...candidate, enabled: false } : { ...candidate }
+            )
+          }
+        }
+
+        try {
+          const applied = await applyUpdate(patch)
+          const auditChange = {
+            operation: 'revoke' as const,
+            configuredBefore,
+            configuredAfter: configuredApiKeyCount(applied.config) > 0
+          }
+          writeConfigAudit({
+            actor,
+            config: applied.config,
+            outcome: 'success',
+            fields: ['apiKeys'],
+            change: auditChange,
+            requiresRestart: false,
+            apply: 'succeeded',
+            persist: 'succeeded'
+          })
+          return {
+            ok: true,
+            value: {
+              revokedId: validation.value.id,
+              replacementId: replacement.id,
+              config: projectPanelProxyConfig(applied.config, false)
+            }
+          }
+        } catch (error) {
+          return failed(actor, previous, error, ['apiKeys'], invalidAudit, false)
+        }
+      }),
+
     proxyGetStatus: async () => status(),
 
     proxySyncPool: async () => {

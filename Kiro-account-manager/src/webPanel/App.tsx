@@ -41,6 +41,7 @@ import { LoginScreen } from './ui/LoginScreen'
 import { AccountCard } from './ui/AccountCard'
 import { ImportPanel } from './ui/ImportPanel'
 import { ProxyPanel } from './ui/ProxyPanel'
+import { PanelSectionBoundary } from './ui/PanelSectionBoundary'
 
 /** 会话三态。`unknown` 是启动时的真实状态，不能默认成 `logged-out`（会闪一下登录页） */
 type SessionState = 'unknown' | 'logged-in' | 'logged-out'
@@ -253,97 +254,103 @@ export function App(): React.JSX.Element {
       {/* 反代服务 —— 用户日常流程的第三、四步（选号 + 启停）。
           放最上面：日常打开面板多半是为了启停反代，而账号列表可能很长，
           放后面在手机上要一直滚。 */}
-      <ProxyPanel
-        accounts={accounts}
-        onSessionLost={dropSession}
-        onNotice={setNotice}
-        onError={setError}
-      />
+      <PanelSectionBoundary name="反代服务">
+        <ProxyPanel
+          accounts={accounts}
+          onSessionLost={dropSession}
+          onNotice={setNotice}
+          onError={setError}
+        />
+      </PanelSectionBoundary>
 
       {/* 导入 —— 日常流程的第一步，但**频次低于启停**（账号加一次用很久），
           故排在反代之后、列表之前。导入成功后重拉列表：服务端写入已落盘，
           重拉能拿到真实的新账号（而不是把响应拼进本地状态）。 */}
-      <ImportPanel onImported={() => loadAccounts()} />
+      <PanelSectionBoundary name="账号导入">
+        <ImportPanel onImported={() => loadAccounts()} />
+      </PanelSectionBoundary>
 
-      {accounts === null ? (
-        <p className="py-10 text-center text-sm text-slate-500">加载中…</p>
-      ) : accounts.length === 0 ? (
-        <div className="rounded-2xl border border-dashed border-slate-300 p-6 text-center dark:border-slate-700">
-          <p className="text-sm text-slate-600 dark:text-slate-300">还没有账号</p>
-          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            用上面的「粘贴 API Key 导入账号」添加第一个账号。
-          </p>
-        </div>
-      ) : (
-        <>
-          <ul aria-label="账号列表" className="space-y-3">
-            {accounts.map((item) => (
-              <AccountCard
-                key={item.id}
-                item={item}
-                pending={pending[item.id] ?? null}
-                onCheck={() =>
-                  void runAction(item.id, 'check', async () => {
-                    const res = await checkAccount(item.id)
-                    // 业务层用 `success:false` + error 表达失败，HTTP 已由路由层归一；
-                    // 但 `success` 缺失也是合法的（部分函数原样透传上游），所以只在显式 false 时报错。
-                    if (res.success === false) {
-                      setError('刷新失败，请稍后重试')
-                      return
-                    }
-                    mergeCheckResult(item.id, res)
-                  })
-                }
-                onRefreshToken={() =>
-                  void runAction(item.id, 'refresh-token', async () => {
-                    await apiRefreshToken(item.id)
-                    // Token 过期时间变了，重拉列表拿新的 expiresAt（这个字段服务端确实会落盘）
-                    await loadAccounts()
-                    setNotice('Token 已刷新')
-                  })
-                }
-                onSwitch={() =>
-                  void runAction(item.id, 'switch', async () => {
-                    await switchToIde(item.id)
-                    await loadAccounts()
-                    setNotice('已切换电脑端 IDE 登录态')
-                  })
-                }
-                onSwitchCli={() =>
-                  void runAction(item.id, 'switch-cli', async () => {
-                    await switchToCli(item.id)
-                    setNotice('已切换电脑端 CLI 登录态')
-                  })
-                }
-                onToggleOverage={(enabled) =>
-                  void runAction(item.id, 'overage', async () => {
-                    await setOverage(item.id, enabled)
-                    setNotice(enabled ? '已开启超额使用' : '已关闭超额使用')
-                  })
-                }
-                onOpenSubscription={() =>
-                  void runAction(item.id, 'subscription', async () => {
-                    // 订阅**管理链接**端点（`GET /subscription-url`）当前不可用：
-                    // 它的 subscriptionType 从 `ctx.body` 读，而服务端只对
-                    // POST/PUT/PATCH 解析 body，GET 的 query 也未解析 → 永远拿不到参数；
-                    // 且返回的 URL 会被响应出口的强制脱敏打码（实测 JWT 段变成 eyJhbG***EjXk）。
-                    // 详见交付报告的契约发现。这里退而列出可用方案，让用户知道去桌面端办。
-                    const res = await fetchSubscriptions(item.id)
-                    if (res.success === false) {
-                      setError('获取订阅信息失败')
-                      return
-                    }
-                    setNotice('订阅升级/管理请在桌面端打开，面板暂只能查看方案')
-                  })
-                }
-              />
-            ))}
-          </ul>
-          <p className="mt-4 text-center text-xs text-slate-500 dark:text-slate-400">
-            凭据不会发送到浏览器；账号备注、分组与删除操作由服务器完成。
-          </p>
-        </>
-      )}
+      <PanelSectionBoundary name="账号列表">
+        {accounts === null ? (
+          <p className="py-10 text-center text-sm text-slate-500">加载中…</p>
+        ) : accounts.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-slate-300 p-6 text-center dark:border-slate-700">
+            <p className="text-sm text-slate-600 dark:text-slate-300">还没有账号</p>
+            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+              用上面的「粘贴 API Key 导入账号」添加第一个账号。
+            </p>
+          </div>
+        ) : (
+          <>
+            <ul aria-label="账号列表" className="space-y-3">
+              {accounts.map((item) => (
+                <AccountCard
+                  key={item.id}
+                  item={item}
+                  pending={pending[item.id] ?? null}
+                  onCheck={() =>
+                    void runAction(item.id, 'check', async () => {
+                      const res = await checkAccount(item.id)
+                      // 业务层用 `success:false` + error 表达失败，HTTP 已由路由层归一；
+                      // 但 `success` 缺失也是合法的（部分函数原样透传上游），所以只在显式 false 时报错。
+                      if (res.success === false) {
+                        setError('刷新失败，请稍后重试')
+                        return
+                      }
+                      mergeCheckResult(item.id, res)
+                    })
+                  }
+                  onRefreshToken={() =>
+                    void runAction(item.id, 'refresh-token', async () => {
+                      await apiRefreshToken(item.id)
+                      // Token 过期时间变了，重拉列表拿新的 expiresAt（这个字段服务端确实会落盘）
+                      await loadAccounts()
+                      setNotice('Token 已刷新')
+                    })
+                  }
+                  onSwitch={() =>
+                    void runAction(item.id, 'switch', async () => {
+                      await switchToIde(item.id)
+                      await loadAccounts()
+                      setNotice('已切换电脑端 IDE 登录态')
+                    })
+                  }
+                  onSwitchCli={() =>
+                    void runAction(item.id, 'switch-cli', async () => {
+                      await switchToCli(item.id)
+                      setNotice('已切换电脑端 CLI 登录态')
+                    })
+                  }
+                  onToggleOverage={(enabled) =>
+                    void runAction(item.id, 'overage', async () => {
+                      await setOverage(item.id, enabled)
+                      setNotice(enabled ? '已开启超额使用' : '已关闭超额使用')
+                    })
+                  }
+                  onOpenSubscription={() =>
+                    void runAction(item.id, 'subscription', async () => {
+                      // 订阅**管理链接**端点（`GET /subscription-url`）当前不可用：
+                      // 它的 subscriptionType 从 `ctx.body` 读，而服务端只对
+                      // POST/PUT/PATCH 解析 body，GET 的 query 也未解析 → 永远拿不到参数；
+                      // 且返回的 URL 会被响应出口的强制脱敏打码（实测 JWT 段变成 eyJhbG***EjXk）。
+                      // 详见交付报告的契约发现。这里退而列出可用方案，让用户知道去桌面端办。
+                      const res = await fetchSubscriptions(item.id)
+                      if (res.success === false) {
+                        setError('获取订阅信息失败')
+                        return
+                      }
+                      setNotice('订阅升级/管理请在桌面端打开，面板暂只能查看方案')
+                    })
+                  }
+                />
+              ))}
+            </ul>
+            <p className="mt-4 text-center text-xs text-slate-500 dark:text-slate-400">
+              凭据不会发送到浏览器；账号备注、分组与删除操作由服务器完成。
+            </p>
+          </>
+        )}
+      </PanelSectionBoundary>
     </div>
   )
 }

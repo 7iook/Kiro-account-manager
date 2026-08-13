@@ -17,9 +17,15 @@
  * 这不影响客户端 —— 对浏览器它们和其他端点同一形状。
  */
 import type { AccountListItem, AccountListPayload } from '../../main/webPanel/dto'
+import type {
+  PanelProxyConfigPatch,
+  PanelProxyConfigResult,
+  PanelProxyConfigView
+} from '../../main/webPanel/proxyConfigPolicy'
 import { panelRequest, PanelApiError } from './client'
 
 export type { AccountListItem, AccountListPayload }
+export type { PanelProxyConfigPatch, PanelProxyConfigResult, PanelProxyConfigView }
 
 /**
  * 登录。
@@ -388,6 +394,75 @@ export interface ProxyStatus {
 
 export async function fetchProxyStatus(): Promise<ProxyStatus> {
   return panelRequest<ProxyStatus>('GET', '/proxy/status')
+}
+
+/** 2xx 响应缺少配置投影；这是协议损坏，不是“配置采用默认值”。 */
+export class PanelProxyConfigResponseError extends Error {
+  constructor() {
+    super('服务端没有返回完整的反代配置')
+    this.name = 'PanelProxyConfigResponseError'
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * TypeScript 类型不会校验 HTTP 运行时响应。旧服务、空响应或不完整测试桩都可能
+ * 给出 2xx 但缺字段；在 API 边界拒绝它，避免任一深层字段访问炸掉整个 React 树。
+ */
+function isPanelProxyConfigView(value: unknown): value is PanelProxyConfigView {
+  if (!isRecord(value)) return false
+
+  const editable = value.editable
+  const readOnly = value.readOnly
+  const apiKeys = value.apiKeys
+  const proxyListen = value.proxyListen
+
+  return (
+    isRecord(editable) &&
+    typeof editable.logRequests === 'boolean' &&
+    Array.isArray(readOnly) &&
+    readOnly.every(
+      (item) => isRecord(item) && typeof item.key === 'string' && typeof item.reason === 'string'
+    ) &&
+    isRecord(apiKeys) &&
+    typeof apiKeys.configured === 'boolean' &&
+    typeof apiKeys.count === 'number' &&
+    Number.isFinite(apiKeys.count) &&
+    Array.isArray(apiKeys.hints) &&
+    apiKeys.hints.every((hint) => typeof hint === 'string') &&
+    isRecord(proxyListen) &&
+    typeof proxyListen.host === 'string' &&
+    typeof proxyListen.port === 'number' &&
+    Number.isFinite(proxyListen.port) &&
+    typeof proxyListen.requiresRestart === 'boolean'
+  )
+}
+
+/**
+ * 读取手机面板可见的反代配置安全投影。
+ *
+ * 响应类型直接复用服务端 policy DTO；尤其是 API Key 只含 configured/count/hints，
+ * 浏览器侧没有任何原值可还原。
+ */
+export async function fetchProxyConfig(): Promise<PanelProxyConfigView> {
+  const config = await panelRequest<unknown>('GET', '/proxy/config')
+  if (!isPanelProxyConfigView(config)) throw new PanelProxyConfigResponseError()
+  return config
+}
+
+/**
+ * 更新通用低风险配置。
+ *
+ * 当前通用 patch 只允许 `logRequests`；端口和 API Key 必须等待各自的专用二次确认
+ * 端点，绝不把它们塞进这个 DTO，也不借 `startProxy()` 夹带。
+ */
+export async function updateProxyConfig(
+  patch: PanelProxyConfigPatch
+): Promise<PanelProxyConfigResult> {
+  return panelRequest<PanelProxyConfigResult>('POST', '/proxy/config', patch)
 }
 
 /**

@@ -67,13 +67,34 @@ interface StatusShape {
   recentEpisodes?: PanelHoldEpisode[]
 }
 
+const proxyConfigView = {
+  editable: { logRequests: false },
+  readOnly: [
+    { key: 'logStreamEvents', value: false, reason: '只能通过配置文件修改。' },
+    { key: 'enablePerfDiagLog', value: false, reason: '只能通过配置文件修改。' },
+    { key: 'enableAuditLog', value: false, reason: '手机配置审计始终开启。' },
+    {
+      key: 'modelMappings',
+      value: { configured: false, count: 0 },
+      reason: '模型映射只读。'
+    },
+    { key: 'agentMode', value: 'vibe', reason: 'Agent 模式只读。' },
+    { key: 'payloadSizeLimitKB', value: null, reason: 'Payload 上限只读。' }
+  ],
+  apiKeys: { configured: false, count: 0, hints: [] },
+  proxyListen: { host: '127.0.0.1', port: 5580, requiresRestart: false }
+}
+
 /** 可编程的假服务端。`statusQueue` 让每次 GET /status 返回不同读数 */
 function stubServer(opts: {
   status: StatusShape | StatusShape[]
   startResponse?: { ok: boolean; body?: unknown; status?: number }
   activateResponse?: { ok: boolean; body?: unknown; status?: number }
   releaseResponse?: { ok: boolean; body?: unknown; status?: number }
-}) {
+}): {
+  fetchMock: ReturnType<typeof vi.fn>
+  calls: Array<{ method: string; url: string; headers: Record<string, string> }>
+} {
   const statuses = Array.isArray(opts.status) ? [...opts.status] : [opts.status]
   const calls: Array<{ method: string; url: string; headers: Record<string, string> }> = []
 
@@ -110,6 +131,7 @@ function stubServer(opts: {
         recentEpisodes: s.recentEpisodes ?? []
       })
     }
+    if (method === 'GET' && url.endsWith('/proxy/config')) return json(proxyConfigView)
     if (url.endsWith('/proxy/start')) {
       const r = opts.startResponse ?? { ok: true, body: { success: true, poolSize: 2 } }
       return json(r.body ?? { success: true }, r.ok ? 200 : (r.status ?? 409))
@@ -135,7 +157,11 @@ function stubServer(opts: {
 
 const noop = (): void => undefined
 
-function renderPanel(overrides: Partial<Parameters<typeof ProxyPanel>[0]> = {}) {
+function renderPanel(overrides: Partial<Parameters<typeof ProxyPanel>[0]> = {}): {
+  onNotice: ReturnType<typeof vi.fn>
+  onError: ReturnType<typeof vi.fn>
+  onSessionLost: ReturnType<typeof vi.fn>
+} {
   const onNotice = vi.fn()
   const onError = vi.fn()
   const onSessionLost = vi.fn()
@@ -253,7 +279,10 @@ describe('反代面板 · 选号', () => {
 
   it('选号只发一个请求（三步顺序在服务端，客户端不拆开编排）', async () => {
     const { fetchMock, calls } = stubServer({
-      status: [{ running: true }, { running: true, selectedAccountId: 'acc-b', selectedAccountEmail: 'bob@example.com' }]
+      status: [
+        { running: true },
+        { running: true, selectedAccountId: 'acc-b', selectedAccountEmail: 'bob@example.com' }
+      ]
     })
     vi.stubGlobal('fetch', fetchMock)
     const { onNotice } = renderPanel()
@@ -292,7 +321,11 @@ describe('反代面板 · 选号', () => {
 
   it('显示当前账号（手机上要能看到正在用哪个号）', async () => {
     const { fetchMock } = stubServer({
-      status: { running: true, selectedAccountId: 'acc-a', selectedAccountEmail: 'alice@example.com' }
+      status: {
+        running: true,
+        selectedAccountId: 'acc-a',
+        selectedAccountEmail: 'alice@example.com'
+      }
     })
     vi.stubGlobal('fetch', fetchMock)
     renderPanel()
@@ -307,7 +340,9 @@ describe('反代面板 · 停止的在飞请求提示', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     renderPanel()
-    await waitFor(() => expect(screen.getByText(/停止会中断正在进行的请求。已服务 42 次/)).toBeTruthy())
+    await waitFor(() =>
+      expect(screen.getByText(/停止会中断正在进行的请求。已服务 42 次/)).toBeTruthy()
+    )
   })
 
   it('会话失效（401）上报给 App，由顶层踢回登录页', async () => {
@@ -410,7 +445,12 @@ describe('反代面板 · 自动放行读数与手动放行（决策卡 §3 手�
 
   it('没有下一次放行时不显示 0 或负倒计时', async () => {
     const { fetchMock } = stubServer({
-      status: { running: true, autoReleaseEnabled: true, nextAutoReleaseAt: null, autoReleaseCount: 3 }
+      status: {
+        running: true,
+        autoReleaseEnabled: true,
+        nextAutoReleaseAt: null,
+        autoReleaseCount: 3
+      }
     })
     vi.stubGlobal('fetch', fetchMock)
     renderPanel()
@@ -524,9 +564,19 @@ describe('反代面板 · 跨放行周期后与服务端重新对齐', () => {
       const { fetchMock, calls } = stubServer({
         status: [
           // 挂载读数：T1 = 2 秒后放行，已放行 4 次
-          { running: true, autoReleaseEnabled: true, nextAutoReleaseAt: t0 + 2000, autoReleaseCount: 4 },
+          {
+            running: true,
+            autoReleaseEnabled: true,
+            nextAutoReleaseAt: t0 + 2000,
+            autoReleaseCount: 4
+          },
           // 服务端在 T1 放行了一次并排好下一周期：T2 = 挂载后 62 秒，次数 5
-          { running: true, autoReleaseEnabled: true, nextAutoReleaseAt: t0 + 62_000, autoReleaseCount: 5 }
+          {
+            running: true,
+            autoReleaseEnabled: true,
+            nextAutoReleaseAt: t0 + 62_000,
+            autoReleaseCount: 5
+          }
         ]
       })
       vi.stubGlobal('fetch', fetchMock)

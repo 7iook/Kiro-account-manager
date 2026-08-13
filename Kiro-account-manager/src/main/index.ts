@@ -39,6 +39,7 @@ import {
 // 用量/订阅解析 SSOT 的最后一个 index.ts 消费点随 backgroundBatchRefresh 一并搬走
 // （parseCreditUsage / parseSubscription 现由 accountService 内部各业务函数直接引用）。
 import type { VerifyApiKeyResult } from '../shared/types/credential'
+import { isAccountSuspensionError } from '../shared/accountSuspension'
 import { buildCompleteLoginResult } from './proxy/profile-selection'
 import { checkPoolAdmission, logPoolAdmissionSkips, type PoolAdmissionSkip } from './proxy/activation'
 import {
@@ -67,6 +68,7 @@ import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 //   故 electron 依赖留在 wiring 一侧。
 import { WebPanelWiring, buildPanelRouteDeps } from './ipc/webPanelWiring'
 import { buildPanelProxyDeps } from './ipc/panelProxyDeps'
+import { applyProxyConfigUpdate } from './proxy/applyProxyConfigUpdate'
 import {
   applyAccountDataMutation,
   setStoreRef as setAccountStoreRef,
@@ -454,6 +456,13 @@ function debouncedUpdateTrayMenu(): void {
 // ============ Kiro API 反代服务器 ============
 let proxyServer: ProxyServer | null = null
 
+/** 部署期 TLS 代理信任不是用户配置；任何桌面写回路径都必须先剥离。 */
+function withoutTrustedTlsProxyIPs(config: ProxyConfig): ProxyConfig {
+  const persisted = { ...config } as ProxyConfig & { trustedTlsProxyIPs?: unknown }
+  delete persisted.trustedTlsProxyIPs
+  return persisted
+}
+
 /**
  * 局域网 web 面板装配实例(W6)。
  *
@@ -470,7 +479,12 @@ function initProxyServer(): ProxyServer {
   proxyLogStore.initialize(app.getPath('userData'))
 
   // 从 store 加载保存的配置，如果没有则使用默认配置
-  const savedConfig = store?.get('proxyConfig') as Partial<ProxyConfig> | undefined
+  const savedRaw = store?.get('proxyConfig') as
+    | (Partial<ProxyConfig> & { trustedTlsProxyIPs?: unknown })
+    | undefined
+  const savedConfig = savedRaw
+    ? withoutTrustedTlsProxyIPs({ ...savedRaw } as ProxyConfig)
+    : undefined
   // 从 store 加载保存的 Usage API 类型
   const savedUsageApiType = store?.get('usageApiType') as 'rest' | 'cbor' | undefined
   if (savedUsageApiType) {
@@ -526,7 +540,7 @@ function initProxyServer(): ProxyServer {
       // 无条件写回:`proxy-get-status` 在 proxyServer 未初始化时会**原样返回 store 里的
       // config**,若 store 里缺该字段,渲染进程 `config.enableTokenBufferReserve || false`
       // 会显示"关闭"而主进程实际已开启 → 显示与实际不一致。这里确保 store 里一定有该字段。
-      store.set('proxyConfig', config)
+      store.set('proxyConfig', withoutTrustedTlsProxyIPs(config))
       if (wasOff) {
         console.log('[Migration] enableTokenBufferReserve 由历史 false 纠正为 true(防上下文超限 400)')
       }
@@ -1604,16 +1618,9 @@ let backgroundBatchRefreshImpl:
 const poolRefreshInFlightIds = new Set<string>()
 let mainPoolRefreshTimer: NodeJS.Timeout | null = null
 
-/** 主进程侧的封禁/挂起判定，镜像渲染进程的 isBannedAccountError */
+/** 兼容调度器既有调用名；封禁语义来自跨进程共享分类器。 */
 function isBannedAccountErrorMain(error?: string): boolean {
-  if (!error) return false
-  const e = error.toLowerCase()
-  return e.includes('accountsuspendedexception')
-    || e.includes('account suspended')
-    || e.includes('temporarily_suspended')
-    || e.includes('temporarily suspended')
-    || e.includes('已封禁')
-    || /\b423\b/.test(e)
+  return isAccountSuspensionError(error)
 }
 
 /**
@@ -3231,54 +3238,97 @@ app.whenReady().then(async () => {
   // 决策卡 §3 第二处豁免:桌面端 `account-get-*` / `account-set-overage` 把 accessToken
   // 当第一个入参(:6108 起)。面板端点**按 accountId 寻址**,token 由 routes.ts 从 store
   // 内部取出后组装进 identity —— 绝不让浏览器把 token 经局域网发过来。
+  const panelRouteImpl = {
+    loadAccountsBlob: () => svcLoadAccounts(accountDeps),
+    importApiKeys: (input: ApiKeyImportInput) => svcImportApiKeys(buildApiKeyImportDeps(), input),
+    checkAccountStatus: (account: unknown) =>
+      checkAccountStatus(accountServiceDeps, account as never),
+    refreshAccountToken: (account: unknown) =>
+      refreshAccountToken(accountServiceDeps, account as never),
+    switchAccountToIde: (credentials: unknown) =>
+      switchAccountToIde(
+        {
+          refreshTokenByMethod,
+          writeKiroAuthTokenFile,
+          resolveProfileArnForWrite,
+          setLastSwitchedAccountId: (id) => {
+            lastSwitchedAccountId = id
+          },
+          setLastWrittenTokenSignature: (sig) => {
+            lastWrittenTokenSignature = sig
+          },
+          isProactiveRenewalEnabled: () => proactiveRenewalEnabled,
+          scheduleProactiveRenewal
+        },
+        credentials as SwitchAccountCredentials
+      ),
+    switchAccountToCli: (credentials: unknown) =>
+      switchAccountToCli(buildSwitchCliDeps(), credentials as SwitchAccountCliCredentials),
+    logoutFromIde: () => logoutAccount(buildLogoutDeps()),
+    getAccountModels: (identity: import('./webPanel/routes').PanelAccountIdentity) =>
+      getAccountModels({ fetchKiroModels }, identity),
+    getAccountSubscriptions: (identity: import('./webPanel/routes').PanelAccountIdentity) =>
+      getAccountSubscriptions({ fetchAvailableSubscriptions }, identity),
+    getAccountSubscriptionUrl: (
+      identity: import('./webPanel/routes').PanelAccountIdentity,
+      subscriptionType?: string
+    ) => getAccountSubscriptionUrl({ fetchSubscriptionToken }, identity, subscriptionType),
+    setAccountOverage: (
+      identity: import('./webPanel/routes').PanelAccountIdentity,
+      enabled: boolean
+    ) => setAccountOverage({ setUserPreference }, identity, enabled ? 'ENABLED' : 'DISABLED'),
+    // 反代编排(W8):用户日常的第三、四步 —— 在手机上选号 + 启停反代。
+    // 顺序与判据都在 proxy/activation.ts 与 ipc/panelProxyDeps.ts,面板不重算。
+    ...buildPanelProxyDeps({
+      getProxyServer: () => proxyServer,
+      initProxyServer: () => initProxyServer(),
+      loadAccountData: () => store?.get('accountData') as never,
+      getLatestProxyConfig: () => {
+        const saved = store?.get('proxyConfig') as
+          | (Partial<ProxyConfig> & { trustedTlsProxyIPs?: unknown })
+          | undefined
+        return withoutTrustedTlsProxyIPs({
+          enabled: false,
+          port: 5580,
+          host: '127.0.0.1',
+          enableMultiAccount: true,
+          selectedAccountIds: [],
+          logRequests: true,
+          maxConcurrent: 10,
+          maxRetries: 3,
+          retryDelayMs: 1000,
+          tokenRefreshBeforeExpiry: 300,
+          clientDrivenToolExecution: true,
+          enableTokenBufferReserve: true,
+          tokenBufferReserve: 20000,
+          ...saved
+        })
+      },
+      persistProxyConfig: (config) => {
+        if (!store) {
+          throw new Error('[webPanel] store not initialized; cannot persist proxy config')
+        }
+        store.set('proxyConfig', withoutTrustedTlsProxyIPs(config))
+      },
+      updateTrayMenu: () => updateTrayMenu(),
+      archiveSessionIfAny: () => archiveProxySessionIfAny()
+    })
+  }
+
   webPanelWiring = new WebPanelWiring({
     getStore: () => store ?? null,
     ensureStore: () => initStore(),
-    routeDeps: buildPanelRouteDeps({
-      loadAccountsBlob: () => svcLoadAccounts(accountDeps),
-      importApiKeys: (input) => svcImportApiKeys(buildApiKeyImportDeps(), input),
-      checkAccountStatus: (account) => checkAccountStatus(accountServiceDeps, account as never),
-      refreshAccountToken: (account) => refreshAccountToken(accountServiceDeps, account as never),
-      switchAccountToIde: (credentials) =>
-        switchAccountToIde(
-          {
-            refreshTokenByMethod,
-            writeKiroAuthTokenFile,
-            resolveProfileArnForWrite,
-            setLastSwitchedAccountId: (id) => {
-              lastSwitchedAccountId = id
-            },
-            setLastWrittenTokenSignature: (sig) => {
-              lastWrittenTokenSignature = sig
-            },
-            isProactiveRenewalEnabled: () => proactiveRenewalEnabled,
-            scheduleProactiveRenewal
-          },
-          credentials as SwitchAccountCredentials
-        ),
-      switchAccountToCli: (credentials) =>
-        switchAccountToCli(buildSwitchCliDeps(), credentials as SwitchAccountCliCredentials),
-      logoutFromIde: () => logoutAccount(buildLogoutDeps()),
-      getAccountModels: (identity) => getAccountModels({ fetchKiroModels }, identity),
-      getAccountSubscriptions: (identity) =>
-        getAccountSubscriptions({ fetchAvailableSubscriptions }, identity),
-      getAccountSubscriptionUrl: (identity, subscriptionType) =>
-        getAccountSubscriptionUrl({ fetchSubscriptionToken }, identity, subscriptionType),
-      setAccountOverage: (identity, enabled) =>
-        setAccountOverage({ setUserPreference }, identity, enabled ? 'ENABLED' : 'DISABLED'),
-      // 反代编排(W8):用户日常的第三、四步 —— 在手机上选号 + 启停反代。
-      // 顺序与判据都在 proxy/activation.ts 与 ipc/panelProxyDeps.ts,面板不重算。
-      ...buildPanelProxyDeps({
-        getProxyServer: () => proxyServer,
-        initProxyServer: () => initProxyServer(),
-        loadAccountData: () => store?.get('accountData') as never,
-        persistProxyConfig: (config) => {
-          store?.set('proxyConfig', config)
-        },
-        updateTrayMenu: () => updateTrayMenu(),
-        archiveSessionIfAny: () => archiveProxySessionIfAny()
-      })
-    })
+    routeDeps: {
+      ...buildPanelRouteDeps(panelRouteImpl),
+      // buildPanelRouteDeps 的旧适配层只消费六个运行端点；配置端点保留强类型后直连。
+      proxyGetConfig: panelRouteImpl.proxyGetConfig,
+      proxyUpdateConfig: panelRouteImpl.proxyUpdateConfig,
+      proxyChangePort: panelRouteImpl.proxyChangePort,
+      proxyListApiKeys: panelRouteImpl.proxyListApiKeys,
+      proxyCreateApiKey: panelRouteImpl.proxyCreateApiKey,
+      proxyVerifyApiKey: panelRouteImpl.proxyVerifyApiKey,
+      proxyRevokeApiKey: panelRouteImpl.proxyRevokeApiKey
+    }
   })
   webPanelWiring.registerIpcHandlers()
 
@@ -4736,8 +4786,22 @@ app.whenReady().then(async () => {
   ipcMain.handle('proxy-update-config', async (_event, config: Partial<ProxyConfig>) => {
     try {
       const server = initProxyServer()
-      server.updateConfig(config)
-      const newConfig = server.getConfig()
+      const requiresRestart = (['port', 'host', 'tls', 'fallbackPort'] as Array<keyof ProxyConfig>)
+        .some((key) => key in config)
+      const { config: newConfig } = await applyProxyConfigUpdate(
+        {
+          getLatestConfig: () => server.getConfig(),
+          getProxyServer: () => server,
+          persistProxyConfig: (next) => {
+            if (!store) {
+              throw new Error('[ProxyServer] store not initialized; cannot persist config')
+            }
+            store.set('proxyConfig', withoutTrustedTlsProxyIPs(next))
+          }
+        },
+        config,
+        requiresRestart ? 'restart' : 'hot'
+      )
       // 同步流式日志开关
       if (config.logStreamEvents !== undefined) {
         setLogStreamEvents(config.logStreamEvents)
@@ -4776,10 +4840,6 @@ app.whenReady().then(async () => {
       // 工作区路径变化时重新加载 steering
       if (config.workspacePath !== undefined) {
         server.loadSteering()
-      }
-      // 保存配置到 store（用于自启动）
-      if (store) {
-        store.set('proxyConfig', newConfig)
       }
       return { success: true, config: newConfig }
     } catch (error) {
@@ -4907,7 +4967,7 @@ app.whenReady().then(async () => {
       server.updateConfig({ apiKeys })
       
       if (store) {
-        store.set('proxyConfig', server.getConfig())
+        store.set('proxyConfig', withoutTrustedTlsProxyIPs(server.getConfig()))
       }
       
       return { success: true, apiKey: newApiKey }
@@ -4935,7 +4995,7 @@ app.whenReady().then(async () => {
       server.updateConfig({ apiKeys })
       
       if (store) {
-        store.set('proxyConfig', server.getConfig())
+        store.set('proxyConfig', withoutTrustedTlsProxyIPs(server.getConfig()))
       }
       
       return { success: true, apiKey: apiKeys[index] }
@@ -4960,7 +5020,7 @@ app.whenReady().then(async () => {
       server.updateConfig({ apiKeys })
       
       if (store) {
-        store.set('proxyConfig', server.getConfig())
+        store.set('proxyConfig', withoutTrustedTlsProxyIPs(server.getConfig()))
       }
       
       return { success: true }
@@ -4992,7 +5052,7 @@ app.whenReady().then(async () => {
       server.updateConfig({ apiKeys })
       
       if (store) {
-        store.set('proxyConfig', server.getConfig())
+        store.set('proxyConfig', withoutTrustedTlsProxyIPs(server.getConfig()))
       }
       
       return { success: true }

@@ -412,7 +412,13 @@ export class WebPanelServer {
         if (parsed === undefined) return
         body = parsed
       }
-      const ctx: PanelRequestContext = { method, path, body }
+      const ctx: PanelRequestContext = {
+        method,
+        path,
+        body,
+        clientIP,
+        userAgent: headerValue(req.headers['user-agent']) ?? ''
+      }
       const handled = await routePanelApi(ctx, res, this.routeDeps)
       if (!handled) {
         sendError(res, 404, 'ACCOUNT_NOT_FOUND', 'Not found')

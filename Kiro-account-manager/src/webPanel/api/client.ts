@@ -75,6 +75,7 @@ const ERROR_TEXT: Record<PanelErrorCode, string> = {
   STALE_REVISION: '数据已被其他端修改，请刷新后重试',
   RATE_LIMITED: '操作过于频繁，请稍候再试',
   INTERNAL_ERROR: '操作失败，请稍后重试',
+  INVALID_CONFIG: '配置内容无效，请检查后重试',
   // 反代编排（W8）。这张表是 `isPanelErrorCode` 的判据（`in ERROR_TEXT`），
   // 漏补会让新错误码静默退化成 INTERNAL_ERROR —— 用户看到「操作失败」而不是
   // 「没有可用账号」，真因被抹掉。

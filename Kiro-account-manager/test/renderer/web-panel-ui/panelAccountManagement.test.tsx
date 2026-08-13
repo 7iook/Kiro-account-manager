@@ -38,6 +38,24 @@ function response(body: unknown, status = 200): Response {
   })
 }
 
+const proxyConfigView = {
+  editable: { logRequests: false },
+  readOnly: [
+    { key: 'logStreamEvents', value: false, reason: '只能通过配置文件修改。' },
+    { key: 'enablePerfDiagLog', value: false, reason: '只能通过配置文件修改。' },
+    { key: 'enableAuditLog', value: false, reason: '手机配置审计始终开启。' },
+    {
+      key: 'modelMappings',
+      value: { configured: false, count: 0 },
+      reason: '模型映射只读。'
+    },
+    { key: 'agentMode', value: 'vibe', reason: 'Agent 模式只读。' },
+    { key: 'payloadSizeLimitKB', value: null, reason: 'Payload 上限只读。' }
+  ],
+  apiKeys: { configured: false, count: 0, hints: [] },
+  proxyListen: { host: '127.0.0.1', port: 5580, requiresRestart: false }
+}
+
 function normaliseHeaders(input: HeadersInit | undefined): Record<string, string> {
   const headers = new Headers(input)
   return Object.fromEntries(
@@ -80,6 +98,9 @@ function installAccountServer(options: { undoWindowMs?: number } = {}): { calls:
           currentEpisode: null,
           recentEpisodes: []
         })
+      }
+      if (request.url.endsWith('/proxy/config') && request.method === 'GET') {
+        return response(proxyConfigView)
       }
       if (request.url.endsWith('/account-groups')) {
         return response({
@@ -314,6 +335,9 @@ describe('C6 · 手机轮换 adminKey', () => {
             currentEpisode: null,
             recentEpisodes: []
           })
+        }
+        if (request.url.endsWith('/proxy/config') && request.method === 'GET') {
+          return response(proxyConfigView)
         }
         if (request.url.endsWith('/admin-key/rotate')) return response({ key: nextKey })
         return response({ code: 'ACCOUNT_NOT_FOUND' }, 404)

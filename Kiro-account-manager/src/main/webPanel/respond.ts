@@ -29,10 +29,60 @@
 import type http from 'node:http'
 import { redactValue } from '../utils/redact'
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * `apiKeys` 通常必须整字段遮罩；唯一例外是 C1 的不可逆摘要。
+ *
+ * 不能把 `apiKeys` 加进通用 SAFE_KEYS：其它端点仍可能把内部 `ApiKey[]` 误传到这里。
+ * 这里只放行一个封闭形状，且 hint 只能是服务端生成的 id 指纹，不得含 key 原文。
+ */
+function safeApiKeySummary(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) return null
+  const keys = Object.keys(value)
+  if (keys.length !== 3 || !keys.includes('configured') || !keys.includes('count') || !keys.includes('hints')) {
+    return null
+  }
+  const { configured, count, hints } = value
+  if (typeof configured !== 'boolean' || !Number.isInteger(count) || (count as number) < 0) return null
+  if (
+    !Array.isArray(hints) ||
+    hints.length !== count ||
+    !hints.every(
+      (hint) =>
+        typeof hint === 'string' &&
+        (hint === 'legacy:configured' || /^key:[a-f0-9]{12}$/.test(hint))
+    )
+  ) {
+    return null
+  }
+  return { configured, count, hints: [...hints] }
+}
+
+function restoreSafeApiKeySummaries(
+  source: Record<string, unknown>,
+  redacted: Record<string, unknown>
+): void {
+  for (const [key, value] of Object.entries(source)) {
+    if (key === 'apiKeys') {
+      const summary = safeApiKeySummary(value)
+      if (summary) redacted[key] = summary
+      continue
+    }
+    const safeChild = redacted[key]
+    if (isRecord(value) && isRecord(safeChild)) {
+      restoreSafeApiKeySummaries(value, safeChild)
+    }
+  }
+}
+
 /** 决策卡 §3 的稳定错误码（非错误字符串） */
 export type PanelErrorCode =
   | 'UNAUTHORIZED'
   | 'INVALID_CREDENTIAL'
+  | 'INVALID_CONFIG'
   | 'ACCOUNT_ALREADY_EXISTS'
   | 'ACCOUNT_NOT_FOUND'
   | 'TOKEN_REFRESH_FAILED'
@@ -59,6 +109,12 @@ export type PanelErrorCode =
  */
 export function sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
   const safe = redactValue(payload)
+  // `redactValue` 会按敏感键名把 apiKeys 整体变成 "***"。仅对上面的封闭摘要形状
+  // 递归恢复安全值（通用 patch 的摘要位于 config.apiKeys）；任何数组、附加字段或
+  // 非指纹 hint 都继续保持遮罩。
+  if (isRecord(payload) && isRecord(safe)) {
+    restoreSafeApiKeySummaries(payload, safe)
+  }
   let body: string
   try {
     body = JSON.stringify(safe ?? null)

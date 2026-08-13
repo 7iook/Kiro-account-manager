@@ -45,6 +45,42 @@ interface SeenRequest {
   headers: Record<string, string>
 }
 
+const proxyStatus = {
+  success: true,
+  running: false,
+  port: 5580,
+  host: '127.0.0.1',
+  enableMultiAccount: false,
+  poolSize: 0,
+  availableCount: 0,
+  totalRequests: 0,
+  successRequests: 0,
+  failedRequests: 0,
+  autoReleaseEnabled: false,
+  nextAutoReleaseAt: null,
+  autoReleaseCount: 0,
+  currentEpisode: null,
+  recentEpisodes: []
+}
+
+const proxyConfigView = {
+  editable: { logRequests: false },
+  readOnly: [
+    { key: 'logStreamEvents', value: false, reason: '只能通过配置文件修改。' },
+    { key: 'enablePerfDiagLog', value: false, reason: '只能通过配置文件修改。' },
+    { key: 'enableAuditLog', value: false, reason: '手机配置审计始终开启。' },
+    {
+      key: 'modelMappings',
+      value: { configured: false, count: 0 },
+      reason: '模型映射只读。'
+    },
+    { key: 'agentMode', value: 'vibe', reason: 'Agent 模式只读。' },
+    { key: 'payloadSizeLimitKB', value: null, reason: 'Payload 上限只读。' }
+  ],
+  apiKeys: { configured: false, count: 0, hints: [] },
+  proxyListen: { host: '127.0.0.1', port: 5580, requiresRestart: false }
+}
+
 let seen: SeenRequest[] = []
 
 /**
@@ -80,6 +116,8 @@ function stubLoggedIn(accounts: unknown[], extra: Record<string, StubRoute> = {}
   stubFetch({
     'GET /panel/api/session': { body: { ok: true, authenticated: true } },
     'GET /panel/api/accounts': { body: { accounts, revision: 1 } },
+    'GET /panel/api/proxy/status': { body: proxyStatus },
+    'GET /panel/api/proxy/config': { body: proxyConfigView },
     ...extra
   })
 }
