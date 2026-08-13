@@ -340,7 +340,7 @@ export function App(): React.JSX.Element {
             ))}
           </ul>
           <p className="mt-4 text-center text-xs text-slate-500 dark:text-slate-400">
-            复制凭据、编辑与删除请在桌面端操作。
+            凭据不会发送到浏览器；账号备注、分组与删除操作由服务器完成。
           </p>
         </>
       )}

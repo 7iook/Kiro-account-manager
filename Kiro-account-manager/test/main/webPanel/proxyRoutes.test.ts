@@ -19,8 +19,14 @@ import { WebPanelServer, type WebPanelConfig } from '../../../src/main/webPanel/
 import { PanelAuth, type AdminKeyStore } from '../../../src/main/webPanel/auth'
 import { PANEL_PATH_PREFIX } from '../../../src/main/webPanel/cookie'
 import type { PanelRouteDeps } from '../../../src/main/webPanel/routes'
+import { setStoreRef } from '../../../src/main/accountService/state'
+import type { AccountStorePort } from '../../../src/main/persistence/accountStorePort'
 import { AccountPool } from '../../../src/main/proxy/accountPool'
-import { activateProxyAccount, buildProxyAccountsFromStore, type ProxyActivationHost } from '../../../src/main/proxy/activation'
+import {
+  activateProxyAccount,
+  buildProxyAccountsFromStore,
+  type ProxyActivationHost
+} from '../../../src/main/proxy/activation'
 import type { ProxyConfig } from '../../../src/main/proxy/types'
 
 const ADMIN_KEY = 'test-admin-key-0123456789abcdef'
@@ -29,7 +35,12 @@ const TOKEN_B = 'ZZtokenBsecretZZ'
 
 function memoryKeyStore(): AdminKeyStore {
   let key: string | null = ADMIN_KEY
-  return { get: () => key, set: (k) => { key = k } }
+  return {
+    get: () => key,
+    set: (k) => {
+      key = k
+    }
+  }
 }
 
 function accountRecords(): Record<string, unknown> {
@@ -66,7 +77,24 @@ function accountRecords(): Record<string, unknown> {
  * 用真 pool 而不是 mock：这批用例要证明的是「池里到底有没有那个账号」，
  * 对 mock 断言等于什么都没证明。
  */
-function makeProxyStub(opts: { enableMultiAccount?: boolean; heldCount?: number } = {}) {
+interface ProxyStub {
+  pool: AccountPool
+  config: Partial<ProxyConfig>
+  host: ProxyActivationHost
+  records: Record<string, unknown>
+  readonly affinityDrops: number
+  readonly releaseCalls: number
+  readonly heldCount: number
+  isRunning: () => boolean
+  start: () => Promise<void>
+  stop: () => Promise<void>
+  blockRelease: () => void
+  openRelease: () => void
+  releaseHeld: () => Promise<number>
+  syncFromStore: () => number
+}
+
+function makeProxyStub(opts: { enableMultiAccount?: boolean; heldCount?: number } = {}): ProxyStub {
   const pool = new AccountPool()
   const config: Partial<ProxyConfig> = {
     port: 5580,
@@ -90,7 +118,10 @@ function makeProxyStub(opts: { enableMultiAccount?: boolean; heldCount?: number 
     getAccountPool: () => pool,
     getConfig: () => config as ProxyConfig,
     updateConfig: (patch) => Object.assign(config, patch),
-    invalidateSessionAffinity: () => { affinityDrops++; return affinityDrops },
+    invalidateSessionAffinity: () => {
+      affinityDrops++
+      return affinityDrops
+    },
     loadAccountRecords: () => records
   }
 
@@ -99,17 +130,31 @@ function makeProxyStub(opts: { enableMultiAccount?: boolean; heldCount?: number 
     config,
     host,
     records,
-    get affinityDrops() { return affinityDrops },
-    get releaseCalls() { return releaseCalls },
-    get heldCount() { return held },
+    get affinityDrops() {
+      return affinityDrops
+    },
+    get releaseCalls() {
+      return releaseCalls
+    },
+    get heldCount() {
+      return held
+    },
     isRunning: () => running,
-    start: async () => { running = true },
-    stop: async () => { running = false },
+    start: async () => {
+      running = true
+    },
+    stop: async () => {
+      running = false
+    },
     /** 让后续放行卡住，直到 openRelease() 被调用（制造真实重叠窗口） */
     blockRelease: () => {
-      releaseGate = new Promise<void>((resolve) => { openGate = resolve })
+      releaseGate = new Promise<void>((resolve) => {
+        openGate = resolve
+      })
     },
-    openRelease: () => { openGate?.() },
+    openRelease: () => {
+      openGate?.()
+    },
     /** 放行:认领全部挂起条目。已空时返回 0(幂等,不报错) */
     releaseHeld: async () => {
       releaseCalls++
@@ -128,9 +173,16 @@ function makeProxyStub(opts: { enableMultiAccount?: boolean; heldCount?: number 
 }
 
 /** 把反代替身接成 PanelRouteDeps 的 proxy 侧实现（镜像生产装配的形状） */
-function proxyDeps(stub: ReturnType<typeof makeProxyStub>): Pick<
+function proxyDeps(
+  stub: ReturnType<typeof makeProxyStub>
+): Pick<
   PanelRouteDeps,
-  'proxyGetStatus' | 'proxySyncPool' | 'proxyActivateAccount' | 'proxyStart' | 'proxyStop' | 'proxyReleaseHeld'
+  | 'proxyGetStatus'
+  | 'proxySyncPool'
+  | 'proxyActivateAccount'
+  | 'proxyStart'
+  | 'proxyStop'
+  | 'proxyReleaseHeld'
 > {
   return {
     proxyGetStatus: async () => ({
@@ -172,9 +224,15 @@ function proxyDeps(stub: ReturnType<typeof makeProxyStub>): Pick<
   }
 }
 
-function stubRouteDeps(stub: ReturnType<typeof makeProxyStub>): PanelRouteDeps {
+function stubRouteDeps(
+  stub: ReturnType<typeof makeProxyStub>,
+  loadAccountsBlob: () => Promise<unknown> = async () => ({
+    revision: 1,
+    accounts: stub.records
+  })
+): PanelRouteDeps {
   return {
-    loadAccountsBlob: async () => ({ revision: 1, accounts: stub.records }),
+    loadAccountsBlob,
     checkAccountStatus: async () => ({ success: true }),
     refreshAccountToken: async () => ({ success: true }),
     switchAccountToIde: async () => ({ success: true }),
@@ -190,10 +248,14 @@ function stubRouteDeps(stub: ReturnType<typeof makeProxyStub>): PanelRouteDeps {
 
 const servers: WebPanelServer[] = []
 
-function makeServer(stub: ReturnType<typeof makeProxyStub>, config: Partial<WebPanelConfig> = {}) {
+function makeServer(
+  stub: ReturnType<typeof makeProxyStub>,
+  config: Partial<WebPanelConfig> = {},
+  loadAccountsBlob?: () => Promise<unknown>
+): WebPanelServer {
   const server = new WebPanelServer({
     auth: new PanelAuth(memoryKeyStore()),
-    routeDeps: stubRouteDeps(stub),
+    routeDeps: stubRouteDeps(stub, loadAccountsBlob),
     getConfig: () => ({ enabled: true, port: 0, host: '127.0.0.1', ...config })
   })
   servers.push(server)
@@ -201,7 +263,11 @@ function makeServer(stub: ReturnType<typeof makeProxyStub>, config: Partial<WebP
 }
 
 afterEach(async () => {
-  while (servers.length) await servers.pop()?.stop().catch(() => undefined)
+  while (servers.length)
+    await servers
+      .pop()
+      ?.stop()
+      .catch(() => undefined)
 })
 
 function base(server: WebPanelServer): string {
@@ -210,11 +276,11 @@ function base(server: WebPanelServer): string {
   return `http://127.0.0.1:${addr.port}${PANEL_PATH_PREFIX}`
 }
 
-async function login(server: WebPanelServer): Promise<string> {
+async function login(server: WebPanelServer, adminKey = ADMIN_KEY): Promise<string> {
   const res = await fetch(`${base(server)}/api/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Panel-Request': '1' },
-    body: JSON.stringify({ adminKey: ADMIN_KEY })
+    body: JSON.stringify({ adminKey })
   })
   const c = res.headers.get('set-cookie')
   if (!c) throw new Error(`login failed ${res.status}`)
@@ -261,6 +327,54 @@ describe('面板反代端点 · 鉴权闸门（启停是高影响操作）', () 
   })
 })
 
+describe('C6 · adminKey 轮换端点', () => {
+  it('统一 guard 拒绝未登录和缺 CSRF；成功只交付一次新 key 并失效旧会话与旧密钥', async () => {
+    const server = makeServer(makeProxyStub())
+    await server.start()
+
+    const anonymous = await fetch(`${base(server)}/api/admin-key/rotate`, {
+      method: 'POST',
+      headers: { 'X-Panel-Request': '1' }
+    })
+    expect(anonymous.status).toBe(401)
+
+    const oldCookie = await login(server)
+    const missingCsrf = await fetch(`${base(server)}/api/admin-key/rotate`, {
+      method: 'POST',
+      headers: { Cookie: oldCookie }
+    })
+    expect(missingCsrf.status).toBe(401)
+    expect(
+      (await fetch(`${base(server)}/api/accounts`, { headers: { Cookie: oldCookie } })).status
+    ).toBe(200)
+
+    const rotated = await fetch(`${base(server)}/api/admin-key/rotate`, {
+      method: 'POST',
+      headers: authed(oldCookie)
+    })
+    expect(rotated.status).toBe(200)
+    expect(rotated.headers.get('cache-control')).toBe('no-store')
+    const payload = (await rotated.json()) as Record<string, unknown>
+    expect(payload).not.toHaveProperty('adminKey')
+    expect(typeof payload.key).toBe('string')
+    expect((payload.key as string).length).toBeGreaterThanOrEqual(40)
+
+    expect(
+      (await fetch(`${base(server)}/api/accounts`, { headers: { Cookie: oldCookie } })).status
+    ).toBe(401)
+    const oldKeyLogin = await fetch(`${base(server)}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Panel-Request': '1' },
+      body: JSON.stringify({ adminKey: ADMIN_KEY })
+    })
+    expect(oldKeyLogin.status).toBe(401)
+    const newCookie = await login(server, payload.key as string)
+    expect(
+      (await fetch(`${base(server)}/api/accounts`, { headers: { Cookie: newCookie } })).status
+    ).toBe(200)
+  })
+})
+
 describe('面板反代端点 · 选号（单账号模式）', () => {
   it('选号后：池里有该账号 **且** selectedAccountIds[0] 是它（两条一起才排除已实证失效）', async () => {
     const stub = makeProxyStub({ enableMultiAccount: false })
@@ -269,7 +383,10 @@ describe('面板反代端点 · 选号（单账号模式）', () => {
     const cookie = await login(server)
 
     // 先启动（编排要求先同步池）
-    const startRes = await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
+    const startRes = await fetch(`${base(server)}/api/proxy/start`, {
+      method: 'POST',
+      headers: authed(cookie)
+    })
     expect(startRes.status).toBe(200)
     expect(stub.isRunning(), '反代必须真的在运行').toBe(true)
 
@@ -339,7 +456,10 @@ describe('面板反代端点 · 启停（真实状态，非乐观更新）', () 
     const cookie = await login(server)
     expect(stub.pool.size, '启动前池是空的').toBe(0)
 
-    const res = await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
+    const res = await fetch(`${base(server)}/api/proxy/start`, {
+      method: 'POST',
+      headers: authed(cookie)
+    })
     expect(res.status).toBe(200)
     // 只收有凭据且未被后端拒绝的两个，acc-dead（封禁）被过滤
     expect(stub.pool.size).toBe(2)
@@ -352,11 +472,15 @@ describe('面板反代端点 · 启停（真实状态，非乐观更新）', () 
     await server.start()
     const cookie = await login(server)
 
-    const before = await (await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })).json()
+    const before = await (
+      await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })
+    ).json()
     expect(before.running).toBe(false)
 
     await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
-    const after = await (await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })).json()
+    const after = await (
+      await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })
+    ).json()
     expect(after.running).toBe(true)
     expect(after.port).toBe(5580)
     expect(after.poolSize).toBe(2)
@@ -373,7 +497,9 @@ describe('面板反代端点 · 启停（真实状态，非乐观更新）', () 
       headers: authed(cookie),
       body: JSON.stringify({ accountId: 'acc-a' })
     })
-    const status = await (await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })).json()
+    const status = await (
+      await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })
+    ).json()
     expect(status.selectedAccountId).toBe('acc-a')
   })
 
@@ -385,10 +511,15 @@ describe('面板反代端点 · 启停（真实状态，非乐观更新）', () 
     await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
     expect(stub.isRunning()).toBe(true)
 
-    const res = await fetch(`${base(server)}/api/proxy/stop`, { method: 'POST', headers: authed(cookie) })
+    const res = await fetch(`${base(server)}/api/proxy/stop`, {
+      method: 'POST',
+      headers: authed(cookie)
+    })
     expect(res.status).toBe(200)
     expect(stub.isRunning()).toBe(false)
-    const status = await (await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })).json()
+    const status = await (
+      await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })
+    ).json()
     expect(status.running).toBe(false)
   })
 
@@ -469,8 +600,14 @@ describe('面板反代端点 · 手动放行挂起请求（决策卡 §3 手机�
     // 第二次是全新执行，`releaseCalls` 必然是 2。这个测试要证明的是
     // 「重叠时共享一次执行」，所以重叠必须真实存在（详见交付报告的评审发现）。
     stub.blockRelease()
-    const p1 = fetch(`${base(server)}/api/proxy/release-held`, { method: 'POST', headers: authed(cookie) })
-    const p2 = fetch(`${base(server)}/api/proxy/release-held`, { method: 'POST', headers: authed(cookie) })
+    const p1 = fetch(`${base(server)}/api/proxy/release-held`, {
+      method: 'POST',
+      headers: authed(cookie)
+    })
+    const p2 = fetch(`${base(server)}/api/proxy/release-held`, {
+      method: 'POST',
+      headers: authed(cookie)
+    })
     // 让两个请求都到达路由层并进入 singleFlight，再放开闸门
     await new Promise((r) => setTimeout(r, 30))
     stub.openRelease()
@@ -521,7 +658,9 @@ describe('面板反代端点 · 自动放行读数（倒计时靠绝对时间戳
     const cookie = await login(server)
     await fetch(`${base(server)}/api/proxy/start`, { method: 'POST', headers: authed(cookie) })
 
-    const status = await (await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })).json()
+    const status = await (
+      await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })
+    ).json()
     expect(status.autoReleaseEnabled).toBe(true)
     // 绝对 epoch ms —— 前端本地自减渲染倒计时,主进程不推倒计时数值
     expect(status.nextAutoReleaseAt).toBe(1_800_000_000_000)
@@ -534,7 +673,9 @@ describe('面板反代端点 · 自动放行读数（倒计时靠绝对时间戳
     await server.start()
     const cookie = await login(server)
 
-    const status = await (await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })).json()
+    const status = await (
+      await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })
+    ).json()
     expect(status.nextAutoReleaseAt).toBeNull()
     expect(status.nextAutoReleaseAt).not.toBe(0)
   })
@@ -552,12 +693,271 @@ describe('面板反代端点 · 输出脱敏（凭据绝不出网）', () => {
       headers: authed(cookie),
       body: JSON.stringify({ accountId: 'acc-a' })
     })
-    const statusText = await (await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })).text()
+    const statusText = await (
+      await fetch(`${base(server)}/api/proxy/status`, { headers: authed(cookie) })
+    ).text()
     const activateText = await activate.text()
     for (const body of [statusText, activateText]) {
       expect(body).not.toContain(TOKEN_A)
       expect(body).not.toContain(TOKEN_B)
       expect(body).not.toContain('rt-a')
     }
+  })
+})
+
+interface MemoryAccountStore extends AccountStorePort {
+  snapshot: () => Record<string, unknown>
+}
+
+function memoryAccountStore(initial: Record<string, unknown>): MemoryAccountStore {
+  let accountData = structuredClone(initial)
+  return {
+    path: 'F:\\test\\kiro-accounts.json',
+    get: (key: string, defaultValue?: unknown) =>
+      key === 'accountData' ? structuredClone(accountData) : defaultValue,
+    set: (key: string, value: unknown) => {
+      if (key === 'accountData') accountData = structuredClone(value) as Record<string, unknown>
+    },
+    snapshot: () => structuredClone(accountData)
+  }
+}
+
+function accountManagementFixture(): Record<string, unknown> {
+  return {
+    revision: 4,
+    groups: {
+      g1: { id: 'g1', name: '主力', color: '#10b981', order: 1, createdAt: 1 },
+      g2: { id: 'g2', name: '备用', color: '#64748b', order: 2, createdAt: 2 }
+    },
+    accounts: {
+      ...accountRecords(),
+      'acc-a': {
+        ...accountRecords()['acc-a'],
+        nickname: '旧备注',
+        groupId: 'g1',
+        isActive: true
+      }
+    },
+    activeAccountId: 'acc-a',
+    accountProxyBindings: { 'acc-a': 'proxy-1', 'acc-b': 'proxy-2' }
+  }
+}
+
+describe('面板账号管理端点 · 鉴权与 revision 仲裁', () => {
+  it('每条新增路由在未登录时都被统一 guard 拒绝，且没有副作用', async () => {
+    const store = memoryAccountStore(accountManagementFixture())
+    setStoreRef(store)
+    const stub = makeProxyStub()
+    const server = makeServer(stub, {}, async () => store.get('accountData'))
+    await server.start()
+    const before = store.snapshot()
+
+    for (const [method, path, body] of [
+      ['GET', '/api/account-groups', undefined],
+      [
+        'PATCH',
+        '/api/accounts/acc-a',
+        { expectedRevision: 4, nickname: '未授权修改', groupId: 'g2' }
+      ],
+      ['POST', '/api/accounts/acc-a/delete', { expectedRevision: 4 }],
+      ['POST', '/api/accounts/acc-a/restore', undefined]
+    ] as const) {
+      const res = await fetch(`${base(server)}${path}`, {
+        method,
+        headers: { 'X-Panel-Request': '1', 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      })
+      expect(res.status, `${method} ${path}`).toBe(401)
+    }
+    expect(store.snapshot()).toEqual(before)
+  })
+
+  it('每条新增写路由即使有会话，缺 CSRF 头也被统一 guard 拒绝', async () => {
+    const store = memoryAccountStore(accountManagementFixture())
+    setStoreRef(store)
+    const stub = makeProxyStub()
+    const server = makeServer(stub, {}, async () => store.get('accountData'))
+    await server.start()
+    const cookie = await login(server)
+    const before = store.snapshot()
+
+    for (const [method, path, body] of [
+      [
+        'PATCH',
+        '/api/accounts/acc-a',
+        { expectedRevision: 4, nickname: '绕过 CSRF', groupId: 'g2' }
+      ],
+      ['POST', '/api/accounts/acc-a/delete', { expectedRevision: 4 }],
+      ['POST', '/api/accounts/acc-a/restore', undefined]
+    ] as const) {
+      const res = await fetch(`${base(server)}${path}`, {
+        method,
+        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      })
+      expect(res.status, `${method} ${path}`).toBe(401)
+    }
+    expect(store.snapshot()).toEqual(before)
+  })
+
+  it('编辑只改备注和分组、保留凭据，并用 expectedRevision 拒绝陈旧覆盖', async () => {
+    const store = memoryAccountStore(accountManagementFixture())
+    setStoreRef(store)
+    const stub = makeProxyStub()
+    const server = makeServer(stub, {}, async () => store.get('accountData'))
+    await server.start()
+    const cookie = await login(server)
+
+    const edited = await fetch(`${base(server)}/api/accounts/acc-a`, {
+      method: 'PATCH',
+      headers: authed(cookie),
+      body: JSON.stringify({ expectedRevision: 4, nickname: '手机备注', groupId: 'g2' })
+    })
+    expect(edited.status).toBe(200)
+    expect(await edited.json()).toMatchObject({
+      success: true,
+      revision: 5,
+      account: { id: 'acc-a', nickname: '手机备注', groupId: 'g2' }
+    })
+
+    const afterEdit = store.snapshot()
+    const editedAccount = (afterEdit.accounts as Record<string, Record<string, unknown>>)['acc-a']
+    expect(editedAccount.nickname).toBe('手机备注')
+    expect(editedAccount.groupId).toBe('g2')
+    expect(editedAccount.credentials).toEqual({
+      accessToken: TOKEN_A,
+      refreshToken: 'rt-a',
+      authMethod: 'IdC'
+    })
+
+    const stale = await fetch(`${base(server)}/api/accounts/acc-a`, {
+      method: 'PATCH',
+      headers: authed(cookie),
+      body: JSON.stringify({ expectedRevision: 4, nickname: '陈旧覆盖' })
+    })
+    expect(stale.status).toBe(409)
+    expect(await stale.json()).toEqual({ code: 'STALE_REVISION' })
+    const afterStale = store.snapshot()
+    expect((afterStale.accounts as Record<string, Record<string, unknown>>)['acc-a'].nickname).toBe(
+      '手机备注'
+    )
+
+    const credentialEdit = await fetch(`${base(server)}/api/accounts/acc-a`, {
+      method: 'PATCH',
+      headers: authed(cookie),
+      body: JSON.stringify({
+        expectedRevision: 5,
+        credentials: { accessToken: 'attacker-controlled-token' }
+      })
+    })
+    expect(credentialEdit.status).toBe(400)
+    expect(
+      (
+        (store.snapshot().accounts as Record<string, Record<string, unknown>>)['acc-a']
+          .credentials as Record<string, unknown>
+      ).accessToken
+    ).toBe(TOKEN_A)
+  })
+
+  it('删除清理激活态和代理绑定，并可在当前服务进程的 10 分钟窗口内撤销', async () => {
+    const store = memoryAccountStore(accountManagementFixture())
+    setStoreRef(store)
+    const stub = makeProxyStub()
+    // 让反代替身与该用例的持久化端口读同一份真值。删除若只改盘、不重建运行中池，
+    // 旧 accessToken 仍会继续被反代选中，是「接口成功但最终消费者没变」的半接线。
+    stub.syncFromStore = () => {
+      const records = store.snapshot().accounts as Record<string, unknown>
+      return stub.pool.replaceAll(buildProxyAccountsFromStore(records))
+    }
+    stub.syncFromStore()
+    expect(stub.pool.getAccount('acc-a')).toBeDefined()
+    const server = makeServer(stub, {}, async () => store.get('accountData'))
+    await server.start()
+    const cookie = await login(server)
+
+    const deleted = await fetch(`${base(server)}/api/accounts/acc-a/delete`, {
+      method: 'POST',
+      headers: authed(cookie),
+      body: JSON.stringify({ expectedRevision: 4 })
+    })
+    expect(deleted.status).toBe(200)
+    const deletedBody = (await deleted.json()) as {
+      revision: number
+      undoUntil: number
+      proxyPoolSyncPending: boolean
+    }
+    expect(deletedBody.revision).toBe(5)
+    expect(deletedBody.undoUntil).toBeGreaterThan(Date.now())
+    expect(deletedBody.proxyPoolSyncPending).toBe(false)
+
+    const afterDelete = store.snapshot()
+    expect((afterDelete.accounts as Record<string, unknown>)['acc-a']).toBeUndefined()
+    expect(afterDelete.activeAccountId).toBeNull()
+    expect((afterDelete.accountProxyBindings as Record<string, unknown>)['acc-a']).toBeUndefined()
+    expect((afterDelete.accountProxyBindings as Record<string, unknown>)['acc-b']).toBe('proxy-2')
+    expect(stub.pool.getAccount('acc-a')).toBeNull()
+
+    const restored = await fetch(`${base(server)}/api/accounts/acc-a/restore`, {
+      method: 'POST',
+      headers: authed(cookie)
+    })
+    expect(restored.status).toBe(200)
+    expect(await restored.json()).toMatchObject({
+      success: true,
+      revision: 6,
+      account: { id: 'acc-a', nickname: '旧备注', groupId: 'g1', isActive: false },
+      proxyPoolSyncPending: false
+    })
+
+    const afterRestore = store.snapshot()
+    expect((afterRestore.accounts as Record<string, unknown>)['acc-a']).toBeDefined()
+    expect(afterRestore.activeAccountId).toBeNull()
+    expect((afterRestore.accountProxyBindings as Record<string, unknown>)['acc-a']).toBe('proxy-1')
+    expect(stub.pool.getAccount('acc-a')?.accessToken).toBe(TOKEN_A)
+  })
+
+  it('账号已落盘但运行池同步失败时仍如实返回成功，并标出待手动同步', async () => {
+    const store = memoryAccountStore(accountManagementFixture())
+    setStoreRef(store)
+    const stub = makeProxyStub()
+    stub.syncFromStore = () => {
+      throw new Error('synthetic pool rebuild failure')
+    }
+    const server = makeServer(stub, {}, async () => store.get('accountData'))
+    await server.start()
+    const cookie = await login(server)
+
+    const deleted = await fetch(`${base(server)}/api/accounts/acc-a/delete`, {
+      method: 'POST',
+      headers: authed(cookie),
+      body: JSON.stringify({ expectedRevision: 4 })
+    })
+    expect(deleted.status).toBe(200)
+    expect(await deleted.json()).toMatchObject({
+      success: true,
+      revision: 5,
+      proxyPoolSyncPending: true
+    })
+    expect((store.snapshot().accounts as Record<string, unknown>)['acc-a']).toBeUndefined()
+  })
+
+  it('分组选项只返回手机编辑所需白名单字段', async () => {
+    const store = memoryAccountStore(accountManagementFixture())
+    setStoreRef(store)
+    const stub = makeProxyStub()
+    const server = makeServer(stub, {}, async () => store.get('accountData'))
+    await server.start()
+    const cookie = await login(server)
+
+    const res = await fetch(`${base(server)}/api/account-groups`, {
+      headers: authed(cookie)
+    })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({
+      groups: [
+        { id: 'g1', name: '主力', color: '#10b981', order: 1 },
+        { id: 'g2', name: '备用', color: '#64748b', order: 2 }
+      ]
+    })
   })
 })

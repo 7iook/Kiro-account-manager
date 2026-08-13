@@ -1,9 +1,13 @@
 /**
  * webPanel 路由表 —— 桌面端操作到 HTTP 端点的一对一映射
  *
- * 决策卡 §1 不变量 1：**本文件不含任何业务逻辑**。每个 handler 只做三件事：
- *   ① 从 accountId 解析出账号（含内部取 token）② 调 `accountService` 的对应函数
+ * 决策卡 §1 不变量 1：**本文件不另建业务真源**。每个 handler 只做三件事：
+ *   ① 解析并校验 HTTP 入参 ② 调 `accountService` 的对应函数
  *   ③ 把结果经 `respond.ts` 出口写回，并把业务层的错误形状归一成稳定错误码。
+ *
+ * C2 的编辑 / 删除也遵守这条：字段补丁在这里由 HTTP 入参组装，但读改写、revision
+ * 仲裁、落盘与广播全部只走 `applyAccountDataMutation`。绕过它直接 `store.set` 才会
+ * 产生第二个写入真源，并让手机与桌面并发时互相覆盖。
  *
  * ## 为什么端点按 accountId 寻址（决策卡 §3 第二处照搬豁免）
  *
@@ -26,6 +30,7 @@ import type http from 'node:http'
 import { sendJson, sendError, type PanelErrorCode } from './respond'
 import { projectAccountsBlob, type AccountListPayload } from './dto'
 import type { ApiKeyImportInput, ApiKeyImportResult } from '../accountService/importApiKey'
+import { applyAccountDataMutation, type AccountsBlob } from '../accountService/state'
 
 /** 业务层的通用返回形状 —— 两种 error 形状都要能吃（见文件头说明） */
 type ServiceLike = {
@@ -35,8 +40,10 @@ type ServiceLike = {
 }
 
 /**
- * 路由层需要的账号能力。全部由 `index.ts` 注入实际实现（`accountService/*` 的函数
- * 加上已装配好的 deps），因此本文件**不 import electron、不碰 store**。
+ * 路由层需要的远端 / 宿主能力由装配层注入（`accountService/*` 的函数加上已装配好的
+ * deps），因此本文件**不 import electron、不碰 store**。C2 账号元数据写入直接调用
+ * 共享内核的 `applyAccountDataMutation`；它自身使用启动时已注入的持久化端口，桌面壳
+ * 与服务端壳仍是同一写入收口，不需要再给两个装配点各抄一层薄转发。
  *
  * 注意 identity 形状：调用方传的是 `AccountApiIdentity`（含 accessToken）——
  * token 是**主进程内部**从 store 取的，从未过网。
@@ -176,7 +183,11 @@ function findAccountRecord(blob: unknown, accountId: string): Record<string, unk
   if (!raw || typeof raw !== 'object') return null
   if (Array.isArray(raw)) {
     for (const entry of raw) {
-      if (entry && typeof entry === 'object' && (entry as Record<string, unknown>).id === accountId) {
+      if (
+        entry &&
+        typeof entry === 'object' &&
+        (entry as Record<string, unknown>).id === accountId
+      ) {
         return entry as Record<string, unknown>
       }
     }
@@ -184,6 +195,394 @@ function findAccountRecord(blob: unknown, accountId: string): Record<string, unk
   }
   const hit = (raw as Record<string, unknown>)[accountId]
   return hit && typeof hit === 'object' ? (hit as Record<string, unknown>) : null
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+/** 手机编辑分组时所需的最小 DTO。description/createdAt 等管理字段不出网。 */
+interface PanelAccountGroup {
+  id: string
+  name: string
+  color?: string
+  order: number
+}
+
+function projectAccountGroups(blob: unknown): PanelAccountGroup[] {
+  const raw = asRecord(blob)?.groups
+  const entries = Array.isArray(raw)
+    ? raw
+    : asRecord(raw)
+      ? Object.values(raw as Record<string, unknown>)
+      : []
+
+  const groups: PanelAccountGroup[] = []
+  for (const entry of entries) {
+    const group = asRecord(entry)
+    if (!group || typeof group.id !== 'string' || typeof group.name !== 'string') continue
+    const item: PanelAccountGroup = {
+      id: group.id,
+      name: group.name,
+      order: typeof group.order === 'number' && Number.isFinite(group.order) ? group.order : 0
+    }
+    if (typeof group.color === 'string') item.color = group.color
+    groups.push(item)
+  }
+  return groups.sort((a, b) => a.order - b.order || a.name.localeCompare(b.name))
+}
+
+function hasGroup(blob: unknown, groupId: string): boolean {
+  return projectAccountGroups(blob).some((group) => group.id === groupId)
+}
+
+function accountMutationSummary(accountId: string, account: Record<string, unknown>): ServiceLike {
+  const summary: Record<string, unknown> = {
+    id: accountId,
+    isActive: account.isActive === true
+  }
+  if (typeof account.nickname === 'string') summary.nickname = account.nickname
+  if (typeof account.groupId === 'string') summary.groupId = account.groupId
+  return summary
+}
+
+function readExpectedRevision(
+  res: http.ServerResponse,
+  body: Record<string, unknown> | undefined
+): number | undefined {
+  const value = body?.expectedRevision
+  if (!Number.isInteger(value) || (value as number) < 0) {
+    sendError(res, 400, 'INVALID_CREDENTIAL', '缺少有效的 expectedRevision，请刷新列表后重试')
+    return undefined
+  }
+  return value as number
+}
+
+function respondAccountMutation(res: http.ServerResponse, result: ServiceLike): void {
+  if (result.success !== false) {
+    sendJson(res, 200, result)
+    return
+  }
+  switch (result.error) {
+    case 'STALE_REVISION':
+      sendError(res, 409, 'STALE_REVISION')
+      return
+    case 'ACCOUNT_ALREADY_EXISTS':
+      sendError(res, 409, 'ACCOUNT_ALREADY_EXISTS')
+      return
+    case 'ACCOUNT_NOT_FOUND':
+      sendError(res, 404, 'ACCOUNT_NOT_FOUND')
+      return
+    default:
+      sendError(res, 500, 'INTERNAL_ERROR')
+  }
+}
+
+/**
+ * 账号集合写盘后，让已经初始化的反代池立刻重建。
+ *
+ * `PROXY_NOT_RUNNING` 表示根本没有内存池需要同步，不算待处理；其它失败不能把已经
+ * 成功落盘的删除/恢复翻转成 HTTP 失败（否则客户端重试会得到完全不同的语义），
+ * 因此用响应标志诚实交给 UI 提示手动同步。
+ */
+async function syncProxyPoolAfterAccountSetChange(deps: PanelRouteDeps): Promise<boolean> {
+  try {
+    const result = await deps.proxySyncPool()
+    if (result.success !== false || errorMessage(result) === 'PROXY_NOT_RUNNING') return false
+  } catch {
+    // 下方统一记不含账号/凭据的固定日志；异常原文可能夹上游敏感内容，不直接打印。
+  }
+  console.warn('[webPanel] account data changed, but live proxy pool refresh is pending')
+  return true
+}
+
+/**
+ * 在 object / 历史 array 两种账号容器里替换单条记录。
+ *
+ * 调用前已经用同一份 blob 验过账号存在，且 apply 带 expectedRevision；若执行时找不到，
+ * 说明盘面违反了 revision 契约，抛错比递增 revision 后假装成功更诚实。
+ */
+function replaceAccount(
+  prev: AccountsBlob,
+  accountId: string,
+  update: (account: Record<string, unknown>) => Record<string, unknown>
+): AccountsBlob {
+  const raw = prev.accounts
+  if (Array.isArray(raw)) {
+    const index = raw.findIndex((entry) => asRecord(entry)?.id === accountId)
+    if (index < 0) throw new Error(`account ${accountId} disappeared without a revision change`)
+    const current = asRecord(raw[index])
+    if (!current) throw new Error(`account ${accountId} is not an object`)
+    const accounts = [...raw]
+    accounts[index] = update(current)
+    return { ...prev, accounts }
+  }
+
+  const accountsRecord = asRecord(raw)
+  const current = accountsRecord ? asRecord(accountsRecord[accountId]) : null
+  if (!accountsRecord || !current) {
+    throw new Error(`account ${accountId} disappeared without a revision change`)
+  }
+  return {
+    ...prev,
+    accounts: { ...accountsRecord, [accountId]: update(current) }
+  }
+}
+
+function removeAccount(
+  prev: AccountsBlob,
+  accountId: string
+): {
+  next: AccountsBlob
+  account: Record<string, unknown>
+  container: 'array' | 'record'
+  proxyBinding?: unknown
+} {
+  const raw = prev.accounts
+  let account: Record<string, unknown> | null = null
+  let nextAccounts: unknown
+  let container: 'array' | 'record'
+
+  if (Array.isArray(raw)) {
+    const index = raw.findIndex((entry) => asRecord(entry)?.id === accountId)
+    if (index >= 0) account = asRecord(raw[index])
+    if (!account) throw new Error(`account ${accountId} disappeared without a revision change`)
+    nextAccounts = raw.filter((_, i) => i !== index)
+    container = 'array'
+  } else {
+    const accountsRecord = asRecord(raw)
+    account = accountsRecord ? asRecord(accountsRecord[accountId]) : null
+    if (!accountsRecord || !account) {
+      throw new Error(`account ${accountId} disappeared without a revision change`)
+    }
+    const copy = { ...accountsRecord }
+    delete copy[accountId]
+    nextAccounts = copy
+    container = 'record'
+  }
+
+  const bindings = asRecord(prev.accountProxyBindings)
+  const proxyBinding = bindings?.[accountId]
+  const nextBindings = bindings ? { ...bindings } : undefined
+  if (nextBindings) delete nextBindings[accountId]
+
+  return {
+    account,
+    container,
+    ...(proxyBinding !== undefined ? { proxyBinding } : {}),
+    next: {
+      ...prev,
+      accounts: nextAccounts,
+      ...(prev.activeAccountId === accountId ? { activeAccountId: null } : {}),
+      ...(nextBindings ? { accountProxyBindings: nextBindings } : {})
+    }
+  }
+}
+
+const DELETE_UNDO_WINDOW_MS = 10 * 60 * 1000
+
+interface DeletedAccountTombstone {
+  account: Record<string, unknown>
+  container: 'array' | 'record'
+  proxyBinding?: unknown
+  expiresAt: number
+  timer: ReturnType<typeof setTimeout>
+}
+
+/**
+ * 删除撤销只保存在主进程内存，不经网络回传凭据，也不另造第二份盘上账号库。
+ *
+ * 这是一道防手机误触的短期安全网，不是假装成永久回收站：服务重启或超过 10 分钟即失效，
+ * UI 会把这个边界写清楚。盘上另存 tombstone 会被桌面端下一次整表保存丢掉，反而制造
+ * 一个看似可靠、实际随机消失的恢复机制。
+ */
+const deletedAccounts = new Map<string, DeletedAccountTombstone>()
+
+function rememberDeletedAccount(
+  accountId: string,
+  deleted: Omit<DeletedAccountTombstone, 'expiresAt' | 'timer'>
+): number {
+  const previous = deletedAccounts.get(accountId)
+  if (previous) clearTimeout(previous.timer)
+  const expiresAt = Date.now() + DELETE_UNDO_WINDOW_MS
+  const timer = setTimeout(() => deletedAccounts.delete(accountId), DELETE_UNDO_WINDOW_MS)
+  timer.unref?.()
+  deletedAccounts.set(accountId, { ...deleted, expiresAt, timer })
+  return expiresAt
+}
+
+function takeValidTombstone(accountId: string): DeletedAccountTombstone | null {
+  const tombstone = deletedAccounts.get(accountId)
+  if (!tombstone) return null
+  if (tombstone.expiresAt <= Date.now()) {
+    clearTimeout(tombstone.timer)
+    deletedAccounts.delete(accountId)
+    return null
+  }
+  return tombstone
+}
+
+async function handleAccountEdit(
+  res: http.ServerResponse,
+  accountId: string,
+  blob: unknown,
+  body: Record<string, unknown> | undefined
+): Promise<void> {
+  const expectedRevision = readExpectedRevision(res, body)
+  if (expectedRevision === undefined) return
+
+  const allowed = new Set(['expectedRevision', 'nickname', 'groupId'])
+  const unknownKey = Object.keys(body ?? {}).find((key) => !allowed.has(key))
+  if (unknownKey) {
+    sendError(res, 400, 'INVALID_CREDENTIAL', `不支持修改字段 ${unknownKey}`)
+    return
+  }
+
+  const hasNickname = Object.prototype.hasOwnProperty.call(body, 'nickname')
+  const hasGroupId = Object.prototype.hasOwnProperty.call(body, 'groupId')
+  if (!hasNickname && !hasGroupId) {
+    sendError(res, 400, 'INVALID_CREDENTIAL', '请至少修改备注或分组')
+    return
+  }
+  const nickname = body?.nickname
+  const groupId = body?.groupId
+  if (hasNickname && nickname !== null && typeof nickname !== 'string') {
+    sendError(res, 400, 'INVALID_CREDENTIAL', 'nickname 必须是字符串或 null')
+    return
+  }
+  if (hasGroupId && groupId !== null && typeof groupId !== 'string') {
+    sendError(res, 400, 'INVALID_CREDENTIAL', 'groupId 必须是字符串或 null')
+    return
+  }
+  if (typeof groupId === 'string' && groupId.length > 0 && !hasGroup(blob, groupId)) {
+    sendError(res, 400, 'INVALID_CREDENTIAL', '所选分组不存在，请刷新后重试')
+    return
+  }
+
+  const key = `account-edit:${accountId}:${expectedRevision}:${JSON.stringify({
+    nickname,
+    groupId
+  })}`
+  const result = await singleFlight(key, async () => {
+    let updated: Record<string, unknown> | null = null
+    const applied = await applyAccountDataMutation(
+      (prev) =>
+        replaceAccount(prev, accountId, (current) => {
+          updated = { ...current }
+          if (hasNickname) {
+            if (nickname === null || nickname === '') delete updated.nickname
+            else updated.nickname = nickname
+          }
+          if (hasGroupId) {
+            if (groupId === null || groupId === '') delete updated.groupId
+            else updated.groupId = groupId
+          }
+          return updated
+        }),
+      { expectedRevision }
+    )
+    if (!applied.ok) return { success: false, error: applied.code }
+    if (!updated) return { success: false, error: 'ACCOUNT_NOT_FOUND' }
+    return {
+      success: true,
+      revision: applied.revision,
+      account: accountMutationSummary(accountId, updated)
+    }
+  })
+  respondAccountMutation(res, result)
+}
+
+async function handleAccountDelete(
+  res: http.ServerResponse,
+  deps: PanelRouteDeps,
+  accountId: string,
+  body: Record<string, unknown> | undefined
+): Promise<void> {
+  const expectedRevision = readExpectedRevision(res, body)
+  if (expectedRevision === undefined) return
+
+  const result = await singleFlight(`account-delete:${accountId}:${expectedRevision}`, async () => {
+    const capture: { deleted?: ReturnType<typeof removeAccount> } = {}
+    const applied = await applyAccountDataMutation(
+      (prev) => {
+        const deleted = removeAccount(prev, accountId)
+        capture.deleted = deleted
+        return deleted.next
+      },
+      { expectedRevision }
+    )
+    if (!applied.ok) return { success: false, error: applied.code }
+    const deleted = capture.deleted
+    if (!deleted) return { success: false, error: 'ACCOUNT_NOT_FOUND' }
+
+    const undoUntil = rememberDeletedAccount(accountId, {
+      account: deleted.account,
+      container: deleted.container,
+      ...(deleted.proxyBinding !== undefined ? { proxyBinding: deleted.proxyBinding } : {})
+    })
+    const proxyPoolSyncPending = await syncProxyPoolAfterAccountSetChange(deps)
+    return { success: true, revision: applied.revision, undoUntil, proxyPoolSyncPending }
+  })
+  respondAccountMutation(res, result)
+}
+
+async function handleAccountRestore(
+  res: http.ServerResponse,
+  deps: PanelRouteDeps,
+  accountId: string
+): Promise<void> {
+  const tombstone = takeValidTombstone(accountId)
+  if (!tombstone) {
+    sendError(res, 404, 'ACCOUNT_NOT_FOUND', '撤销窗口已结束，无法恢复该账号')
+    return
+  }
+
+  const blob = await deps.loadAccountsBlob()
+  if (findAccountRecord(blob, accountId)) {
+    sendError(res, 409, 'ACCOUNT_ALREADY_EXISTS')
+    return
+  }
+  const expectedRevision =
+    typeof asRecord(blob)?.revision === 'number' ? (asRecord(blob)?.revision as number) : 0
+
+  const result = await singleFlight(`account-restore:${accountId}`, async () => {
+    const restoredAccount = { ...tombstone.account, isActive: false }
+    const applied = await applyAccountDataMutation(
+      (prev) => {
+        const raw = prev.accounts
+        const accounts = Array.isArray(raw)
+          ? [...raw, restoredAccount]
+          : { ...(asRecord(raw) ?? {}), [accountId]: restoredAccount }
+        const bindings = asRecord(prev.accountProxyBindings)
+        return {
+          ...prev,
+          accounts,
+          ...(tombstone.proxyBinding !== undefined
+            ? {
+                accountProxyBindings: {
+                  ...(bindings ?? {}),
+                  [accountId]: tombstone.proxyBinding
+                }
+              }
+            : {})
+        }
+      },
+      { expectedRevision }
+    )
+    if (!applied.ok) return { success: false, error: applied.code }
+    clearTimeout(tombstone.timer)
+    deletedAccounts.delete(accountId)
+    const proxyPoolSyncPending = await syncProxyPoolAfterAccountSetChange(deps)
+    return {
+      success: true,
+      revision: applied.revision,
+      account: accountMutationSummary(accountId, restoredAccount),
+      proxyPoolSyncPending
+    }
+  })
+  respondAccountMutation(res, result)
 }
 
 /**
@@ -433,7 +832,9 @@ async function routeProxyApi(
       }
       respondProxy(
         res,
-        await singleFlight(`proxy-activate:${accountId}`, () => deps.proxyActivateAccount(accountId))
+        await singleFlight(`proxy-activate:${accountId}`, () =>
+          deps.proxyActivateAccount(accountId)
+        )
       )
       return true
     }
@@ -461,6 +862,13 @@ export async function routePanelApi(
     return true
   }
 
+  // 账号编辑用的分组下拉。只发 id/name/color/order 白名单，不把整个 accountData 出网。
+  if (path === '/api/account-groups' && method === 'GET') {
+    const blob = await deps.loadAccountsBlob()
+    sendJson(res, 200, { groups: projectAccountGroups(blob) })
+    return true
+  }
+
   // 导入 ksk_ 密钥（写）—— 必须在下面 parseAccountPath 之前判，
   // 否则 `/api/accounts` 会被当成 accountId 为空的子路径。
   if (path === '/api/accounts' && method === 'POST') {
@@ -485,10 +893,29 @@ export async function routePanelApi(
   if (!parsed) return false
 
   const { accountId, action } = parsed
+
+  // 撤销发生在账号已经从当前列表消失之后，必须先于 findAccountRecord 判定。
+  if (method === 'POST' && action === 'restore') {
+    await handleAccountRestore(res, deps, accountId)
+    return true
+  }
+
   const blob = await deps.loadAccountsBlob()
   const account = findAccountRecord(blob, accountId)
   if (!account) {
     sendError(res, 404, 'ACCOUNT_NOT_FOUND')
+    return true
+  }
+
+  // C2 只开放桌面端已有的账号备注（nickname）与分组（groupId）语义。
+  // 凭据编辑刻意不开放：手机误填 token 的损失远高于收益，且 ksk_ 账号已有导入路径。
+  if (method === 'PATCH' && action === '') {
+    await handleAccountEdit(res, accountId, blob, ctx.body)
+    return true
+  }
+
+  if (method === 'POST' && action === 'delete') {
+    await handleAccountDelete(res, deps, accountId, ctx.body)
     return true
   }
 

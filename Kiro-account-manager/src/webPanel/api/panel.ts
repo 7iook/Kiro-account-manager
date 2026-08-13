@@ -60,6 +60,83 @@ export async function fetchAccounts(): Promise<AccountListPayload> {
   return panelRequest<AccountListPayload>('GET', '/accounts')
 }
 
+/** 手机编辑账号时的分组选项；服务端只返回这四个白名单字段。 */
+export interface PanelAccountGroup {
+  id: string
+  name: string
+  color?: string
+  order: number
+}
+
+export async function fetchAccountGroups(): Promise<{ groups: PanelAccountGroup[] }> {
+  return panelRequest('GET', '/account-groups')
+}
+
+export interface AccountMutationSummary {
+  id: string
+  nickname?: string
+  groupId?: string
+  isActive: boolean
+}
+
+export interface AccountMutationResponse {
+  success: true
+  revision: number
+  account: AccountMutationSummary
+  /** 写盘成功，但已初始化的运行中反代池未能重建；UI 应提示手动同步。 */
+  proxyPoolSyncPending?: boolean
+}
+
+/**
+ * 编辑账号元数据。
+ *
+ * 刻意只开放 nickname/groupId；凭据不从手机编辑，避免误填 token 后把唯一可用账号
+ * 覆盖掉。expectedRevision 来自操作前新拉的 `/accounts` 快照，桌面端同时改动时服务端
+ * 返回 STALE_REVISION，而不是让后到的手机请求静默覆盖。
+ */
+export async function updateAccountMetadata(
+  id: string,
+  expectedRevision: number,
+  patch: { nickname?: string | null; groupId?: string | null }
+): Promise<AccountMutationResponse> {
+  return panelRequest('PATCH', `/accounts/${encodeURIComponent(id)}`, {
+    expectedRevision,
+    ...patch
+  })
+}
+
+export interface AccountDeleteResponse {
+  success: true
+  revision: number
+  /** 当前服务进程内可撤销到何时（epoch ms）。服务重启会提前失效。 */
+  undoUntil: number
+  /** 写盘成功，但已初始化的运行中反代池未能重建；UI 应提示手动同步。 */
+  proxyPoolSyncPending: boolean
+}
+
+export async function deleteAccount(
+  id: string,
+  expectedRevision: number
+): Promise<AccountDeleteResponse> {
+  return panelRequest('POST', `/accounts/${encodeURIComponent(id)}/delete`, {
+    expectedRevision
+  })
+}
+
+export async function restoreDeletedAccount(id: string): Promise<AccountMutationResponse> {
+  return panelRequest('POST', `/accounts/${encodeURIComponent(id)}/restore`)
+}
+
+/**
+ * 轮换唯一 adminKey。
+ *
+ * 成功响应后当前会话已经失效；`key` 只交付这一次。调用方必须先让用户保存新值，
+ * 再切回登录页，不能收到响应就立刻卸载界面（那会把用户永久锁在门外）。
+ */
+export async function rotateAdminKey(): Promise<{ key: string }> {
+  return panelRequest('POST', '/admin-key/rotate')
+}
+
 /**
  * 导入 ksk_ 密钥。
  *
@@ -321,7 +398,11 @@ export async function fetchProxyStatus(): Promise<ProxyStatus> {
  * 服务端内部会先同步账号池再启动；池为空时返回 `EMPTY_POOL` 而**不是**启动成功
  * （空池启动会「起来了、状态正常、每个请求都失败」）。
  */
-export async function startProxy(): Promise<{ running?: boolean; port?: number; poolSize?: number }> {
+export async function startProxy(): Promise<{
+  running?: boolean
+  port?: number
+  poolSize?: number
+}> {
   return panelRequest('POST', '/proxy/start')
 }
 

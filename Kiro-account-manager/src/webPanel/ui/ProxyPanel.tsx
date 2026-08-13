@@ -19,8 +19,10 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  fetchAccounts,
   fetchProxyStatus,
   releaseHeldRequests,
+  rotateAdminKey,
   setProxyActiveAccount,
   startProxy,
   stopProxy,
@@ -31,6 +33,7 @@ import {
   type PanelHoldRelease
 } from '../api/panel'
 import { PanelApiError } from '../api/client'
+import { PANEL_ACCOUNTS_INVALIDATED_EVENT } from './accountDataEvents'
 import { formatCountdown, formatPercent } from './format'
 
 interface ProxyPanelProps {
@@ -87,8 +90,14 @@ export function ProxyPanel({
   onError
 }: ProxyPanelProps): React.JSX.Element {
   const [status, setStatus] = useState<ProxyStatus | null>(null)
+  const [accountSnapshot, setAccountSnapshot] = useState<AccountListItem[] | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [picking, setPicking] = useState(false)
+  const [rotateOpen, setRotateOpen] = useState(false)
+  const [rotateConfirmation, setRotateConfirmation] = useState('')
+  const [rotatedAdminKey, setRotatedAdminKey] = useState<string | null>(null)
+  const [rotatingAdminKey, setRotatingAdminKey] = useState(false)
+  const [rotateError, setRotateError] = useState<string | null>(null)
   /**
    * 本地时钟，仅用于渲染倒计时。
    *
@@ -114,6 +123,37 @@ export function ProxyPanel({
   useEffect(() => {
     void refresh()
   }, [refresh])
+
+  // App 正常重拉列表（例如导入成功）时回到 props；局部快照只用于跨兄弟组件的
+  // 删除/恢复窗口，不能长期压住父组件更新。
+  useEffect(() => {
+    setAccountSnapshot(null)
+  }, [accounts])
+
+  useEffect(() => {
+    let mounted = true
+    const refreshAccountCandidates = (): void => {
+      void fetchAccounts()
+        .then((payload) => {
+          if (mounted) setAccountSnapshot(payload.accounts)
+        })
+        .catch((err: unknown) => {
+          if (!mounted) return
+          if (err instanceof PanelApiError && err.isUnauthorized) {
+            onSessionLost()
+            return
+          }
+          onError(describeError(err))
+        })
+      // 删除/恢复还会重建运行中的池，状态数字也必须跟服务端重新对齐。
+      void refresh()
+    }
+    window.addEventListener(PANEL_ACCOUNTS_INVALIDATED_EVENT, refreshAccountCandidates)
+    return () => {
+      mounted = false
+      window.removeEventListener(PANEL_ACCOUNTS_INVALIDATED_EVENT, refreshAccountCandidates)
+    }
+  }, [onError, onSessionLost, refresh])
 
   /**
    * 最新的 `refresh`，供下面两个「按时机重新对齐」的效应调用。
@@ -217,10 +257,40 @@ export function ProxyPanel({
     [busy, onSessionLost, refresh, onError]
   )
 
+  const confirmAdminKeyRotation = async (): Promise<void> => {
+    if (rotateConfirmation !== '轮换' || rotatingAdminKey || rotatedAdminKey !== null) return
+
+    setRotatingAdminKey(true)
+    setRotateError(null)
+    try {
+      const response = await rotateAdminKey()
+      // 轮换已经让当前会话失效，但不能立刻通知 App 卸载本组件：
+      // 新 key 只交付这一次，必须留在当前视图直到用户明确表示已经保存。
+      setRotatedAdminKey(response.key)
+    } catch (err) {
+      if (err instanceof PanelApiError && err.isUnauthorized) {
+        onSessionLost()
+        return
+      }
+      setRotateError(describeError(err))
+    } finally {
+      setRotatingAdminKey(false)
+    }
+  }
+
+  const finishAdminKeyDelivery = (): void => {
+    // 先从 React 状态丢弃一次性交付值，再返回登录页，缩短明文留在内存中的时间。
+    setRotatedAdminKey(null)
+    setRotateConfirmation('')
+    setRotateOpen(false)
+    onSessionLost()
+  }
+
   const running = status?.running === true
+  const accountCandidates = accountSnapshot ?? accounts
   const selectedEmail =
     status?.selectedAccountEmail ??
-    accounts?.find((a) => a.id === status?.selectedAccountId)?.email ??
+    accountCandidates?.find((a) => a.id === status?.selectedAccountId)?.email ??
     status?.selectedAccountId
 
   return (
@@ -239,7 +309,11 @@ export function ProxyPanel({
               }`}
             />
             <span className={running ? 'text-emerald-700 dark:text-emerald-400' : 'text-slate-500'}>
-              {status === null ? '读取中…' : running ? `运行中 · 端口 ${status.port ?? '—'}` : '未运行'}
+              {status === null
+                ? '读取中…'
+                : running
+                  ? `运行中 · 端口 ${status.port ?? '—'}`
+                  : '未运行'}
             </span>
           </p>
         </div>
@@ -396,7 +470,11 @@ export function ProxyPanel({
         )}
         {/* Hold timeline: why it started, when, and what each release led to.
             A run of "又挂回" means those releases did not deliver content to the client. */}
-        <HoldTimelineBlock current={status?.currentEpisode ?? null} recent={status?.recentEpisodes ?? []} now={now} />
+        <HoldTimelineBlock
+          current={status?.currentEpisode ?? null}
+          recent={status?.recentEpisodes ?? []}
+          now={now}
+        />
       </div>
 
       <button
@@ -413,9 +491,28 @@ export function ProxyPanel({
         {busy === 'sync' ? '同步中…' : '重新同步账号池'}
       </button>
 
+      <div className="mt-3 border-t border-slate-100 pt-3 dark:border-slate-800">
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          管理密钥用于手机登录。轮换会立即注销所有已登录设备。
+        </p>
+        <button
+          type="button"
+          onClick={() => {
+            setRotateConfirmation('')
+            setRotatedAdminKey(null)
+            setRotateError(null)
+            setRotateOpen(true)
+          }}
+          disabled={busy !== null || rotatingAdminKey}
+          className="mt-2 h-11 w-full rounded-xl border border-amber-300 text-sm font-medium text-amber-800 active:bg-amber-50 disabled:opacity-60 dark:border-amber-800 dark:text-amber-300 dark:active:bg-amber-950"
+        >
+          轮换管理密钥
+        </button>
+      </div>
+
       {picking && (
         <AccountPicker
-          accounts={accounts}
+          accounts={accountCandidates}
           selectedId={status?.selectedAccountId}
           onClose={() => setPicking(false)}
           onPick={(id) => {
@@ -426,6 +523,98 @@ export function ProxyPanel({
             })
           }}
         />
+      )}
+
+      {rotateOpen && rotatedAdminKey === null && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center">
+          <button
+            type="button"
+            aria-label="取消轮换"
+            onClick={() => {
+              if (rotatingAdminKey) return
+              setRotateOpen(false)
+              setRotateConfirmation('')
+              setRotateError(null)
+            }}
+            disabled={rotatingAdminKey}
+            className="absolute inset-0 bg-black/50"
+          />
+          <section
+            role="dialog"
+            aria-label="轮换管理密钥"
+            className="relative w-full max-w-md rounded-t-2xl bg-white p-4 sm:rounded-2xl dark:bg-slate-900"
+          >
+            <h3 className="text-lg font-semibold text-amber-800 dark:text-amber-300">
+              轮换管理密钥
+            </h3>
+            <p className="mt-2 text-sm text-slate-700 dark:text-slate-200">
+              所有现有会话会立即失效。新密钥只显示一次，请先准备好安全的保存位置。
+            </p>
+            <label className="mt-4 block text-sm text-slate-700 dark:text-slate-200">
+              <span className="mb-1 block">输入“轮换”以确认</span>
+              <input
+                value={rotateConfirmation}
+                onChange={(event) => setRotateConfirmation(event.target.value)}
+                autoComplete="off"
+                className="h-11 w-full rounded-xl border border-amber-300 bg-white px-3 text-base text-slate-900 outline-none focus:border-amber-500 dark:border-amber-800 dark:bg-slate-950 dark:text-slate-100"
+              />
+            </label>
+            {rotateError !== null && (
+              <p role="status" className="mt-3 text-sm text-red-700 dark:text-red-300">
+                {rotateError}
+              </p>
+            )}
+            <div className="mt-5 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setRotateOpen(false)
+                  setRotateConfirmation('')
+                  setRotateError(null)
+                }}
+                disabled={rotatingAdminKey}
+                className="h-11 rounded-xl border border-slate-300 text-sm text-slate-700 disabled:opacity-50 dark:border-slate-600 dark:text-slate-200"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmAdminKeyRotation()}
+                disabled={rotatingAdminKey || rotateConfirmation !== '轮换'}
+                className="h-11 rounded-xl bg-amber-600 text-sm font-medium text-white active:bg-amber-700 disabled:opacity-50"
+              >
+                {rotatingAdminKey ? '轮换中…' : '确认轮换'}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {rotateOpen && rotatedAdminKey !== null && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 sm:items-center">
+          <section
+            role="dialog"
+            aria-label="保存新的管理密钥"
+            className="w-full max-w-md rounded-t-2xl bg-white p-4 sm:rounded-2xl dark:bg-slate-900"
+          >
+            <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
+              保存新的管理密钥
+            </h3>
+            <p className="mt-2 text-sm text-red-700 dark:text-red-300">
+              这是唯一一次显示。离开后无法再次查看，只能再次轮换。
+            </p>
+            <code className="mt-3 block select-all break-all rounded-xl bg-slate-100 p-3 text-sm text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+              {rotatedAdminKey}
+            </code>
+            <button
+              type="button"
+              onClick={finishAdminKeyDelivery}
+              className="mt-5 h-11 w-full rounded-xl bg-blue-600 text-sm font-medium text-white active:bg-blue-700"
+            >
+              我已保存，重新登录
+            </button>
+          </section>
+        </div>
       )}
     </section>
   )
@@ -453,7 +642,12 @@ interface AccountPickerProps {
  * 做筛选。选了不可用的号失败是一次可恢复的报错,而看不到号、无法选是死路。两端候选范围
  * 必须一致,否则同一个号在桌面能选、在手机上凭空消失。
  */
-function AccountPicker({ accounts, selectedId, onClose, onPick }: AccountPickerProps): React.JSX.Element {
+function AccountPicker({
+  accounts,
+  selectedId,
+  onClose,
+  onPick
+}: AccountPickerProps): React.JSX.Element {
   const usable = accounts ?? []
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center">
@@ -504,7 +698,9 @@ function AccountPicker({ accounts, selectedId, onClose, onPick }: AccountPickerP
                     )}
                   </span>
                   {a.id === selectedId && (
-                    <span className="shrink-0 text-xs text-emerald-700 dark:text-emerald-400">当前</span>
+                    <span className="shrink-0 text-xs text-emerald-700 dark:text-emerald-400">
+                      当前
+                    </span>
                   )}
                 </button>
               </li>
@@ -552,10 +748,7 @@ const HOLD_TRIGGER_TEXT: Record<PanelHoldRelease['trigger'], string> = {
  *
  * 所以连续几行「又挂回」意味着「已放行 N 次」这个数字并不代表请求能一直活着。
  */
-const HOLD_OUTCOME_STYLE: Record<
-  PanelHoldRelease['outcome'],
-  { text: string; cls: string }
-> = {
+const HOLD_OUTCOME_STYLE: Record<PanelHoldRelease['outcome'], { text: string; cls: string }> = {
   'resumed-and-served': { text: '已续接', cls: 'text-emerald-700 dark:text-emerald-400' },
   're-held': { text: '又挂回', cls: 'text-amber-700 dark:text-amber-400' },
   ended: { text: '已结束', cls: 'text-rose-700 dark:text-rose-400' },
