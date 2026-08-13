@@ -243,7 +243,9 @@ describe('C1 · 手机反代配置', () => {
     )
 
     const section = await screen.findByRole('region', { name: '反代配置' })
-    await userEvent.click(within(section).getByRole('checkbox', { name: '记录反代请求日志' }))
+    await userEvent.click(
+      await within(section).findByRole('checkbox', { name: '记录反代请求日志' })
+    )
     await userEvent.click(within(section).getByRole('button', { name: '保存请求日志设置' }))
 
     expect(await screen.findByText(/反代配置暂时无法显示.*其他功能仍可使用/)).toBeInTheDocument()
@@ -265,7 +267,9 @@ describe('C1 · 手机反代配置', () => {
     )
 
     expect(await screen.findByRole('heading', { name: '反代配置' })).toBeInTheDocument()
-    expect(screen.getByRole('checkbox', { name: '记录反代请求日志' })).toBeChecked()
+    expect(
+      await screen.findByRole('checkbox', { name: '记录反代请求日志' })
+    ).toBeChecked()
 
     expect(screen.getByText('logStreamEvents')).toBeInTheDocument()
     expect(screen.getByText(/流式事件日志可能产生大量内容/)).toBeInTheDocument()
@@ -315,7 +319,7 @@ describe('C1 · 手机反代配置', () => {
     )
 
     const section = await screen.findByRole('region', { name: '反代配置' })
-    const toggle = within(section).getByRole('checkbox', { name: '记录反代请求日志' })
+    const toggle = await within(section).findByRole('checkbox', { name: '记录反代请求日志' })
     expect(toggle).not.toBeChecked()
     await userEvent.click(toggle)
     expect(toggle).toBeChecked()
@@ -360,7 +364,9 @@ describe('C1 · 手机反代配置', () => {
     )
 
     const section = await screen.findByRole('region', { name: '反代配置' })
-    await userEvent.click(within(section).getByRole('checkbox', { name: '记录反代请求日志' }))
+    await userEvent.click(
+      await within(section).findByRole('checkbox', { name: '记录反代请求日志' })
+    )
     await userEvent.click(within(section).getByRole('button', { name: '保存请求日志设置' }))
 
     await waitFor(() =>
@@ -388,10 +394,10 @@ describe('C1 · 手机反代配置', () => {
       <ProxyPanel accounts={[]} onNotice={vi.fn()} onError={vi.fn()} onSessionLost={vi.fn()} />
     )
 
-    await screen.findByRole('region', { name: '反代配置' })
-    expect(screen.getAllByText('apiKey').length).toBeGreaterThan(0)
-    expect(screen.getByText(/密钥只能通过专用二次确认动作修改/)).toBeInTheDocument()
-    expect(screen.getByText(/敏感值不在面板显示/)).toBeInTheDocument()
+    const section = await screen.findByRole('region', { name: '反代配置' })
+    expect((await within(section).findAllByText('apiKey')).length).toBeGreaterThan(0)
+    expect(within(section).getByText(/密钥只能通过专用二次确认动作修改/)).toBeInTheDocument()
+    expect(within(section).getByText(/敏感值不在面板显示/)).toBeInTheDocument()
     expect(document.body.textContent).not.toContain(originalSecret)
   })
 
@@ -409,7 +415,7 @@ describe('C1 · 手机反代配置', () => {
     )
 
     const section = await screen.findByRole('region', { name: '反代配置' })
-    const toggle = within(section).getByRole('checkbox', { name: '记录反代请求日志' })
+    const toggle = await within(section).findByRole('checkbox', { name: '记录反代请求日志' })
     await userEvent.click(toggle)
     await userEvent.click(within(section).getByRole('button', { name: '保存请求日志设置' }))
 
@@ -483,7 +489,7 @@ describe('C1 · 手机反代配置', () => {
     )
 
     const section = await screen.findByRole('region', { name: '更改反代端口' })
-    const port = within(section).getByRole('spinbutton', { name: '新端口' })
+    const port = await within(section).findByRole('spinbutton', { name: '新端口' })
     await userEvent.clear(port)
     await userEvent.type(port, '5599')
     await userEvent.click(within(section).getByRole('button', { name: '更改反代端口' }))
@@ -539,7 +545,7 @@ describe('C1 · 手机反代配置', () => {
     )
 
     const section = await screen.findByRole('region', { name: '更改反代端口' })
-    const port = within(section).getByRole('spinbutton', { name: '新端口' })
+    const port = await within(section).findByRole('spinbutton', { name: '新端口' })
     await userEvent.clear(port)
     await userEvent.type(port, '5599')
     await userEvent.click(within(section).getByRole('button', { name: '更改反代端口' }))
@@ -576,7 +582,7 @@ describe('C1 · 手机反代配置', () => {
     )
 
     const section = await screen.findByRole('region', { name: '更改反代端口' })
-    const port = within(section).getByRole('spinbutton', { name: '新端口' })
+    const port = await within(section).findByRole('spinbutton', { name: '新端口' })
     await userEvent.clear(port)
     await userEvent.type(port, '5599')
     await userEvent.click(within(section).getByRole('button', { name: '更改反代端口' }))
@@ -664,7 +670,7 @@ describe('C1 · 手机反代配置', () => {
 
     const section = await screen.findByRole('region', { name: 'API Key 生命周期' })
     expect(within(section).getByText(/新增.*真实请求.*验证.*吊销旧 Key/)).toBeInTheDocument()
-    await userEvent.click(within(section).getByRole('button', { name: '新增 API Key' }))
+    await userEvent.click(await within(section).findByRole('button', { name: '新增 API Key' }))
     const createDialog = screen.getByRole('dialog', { name: '新增 API Key' })
     await userEvent.type(
       within(createDialog).getByRole('textbox', { name: '输入“新增”以确认' }),
