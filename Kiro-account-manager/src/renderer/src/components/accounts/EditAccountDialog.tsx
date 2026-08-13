@@ -11,6 +11,16 @@ interface EditAccountDialogProps {
   account: Account | null
 }
 
+function credentialFormSignature(input: {
+  refreshToken: string
+  clientId: string
+  clientSecret: string
+  region: string
+}): string {
+  // 仅在当前 renderer 内存中比较，不写日志/磁盘；数组序列化避免分隔符碰撞。
+  return JSON.stringify([input.refreshToken, input.clientId, input.clientSecret, input.region])
+}
+
 export function EditAccountDialog({
   open,
   onOpenChange,
@@ -58,6 +68,8 @@ export function EditAccountDialog({
   const [isVerifying, setIsVerifying] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [copiedToken, setCopiedToken] = useState(false)
+  /** 最近一次已确认属于 accountInfo 的凭据表单快照；凭据改动后必须重新验证。 */
+  const [verifiedCredentialSignature, setVerifiedCredentialSignature] = useState('')
 
   const handleCopyAccessToken = (): void => {
     if (accountInfo?.accessToken) {
@@ -74,6 +86,12 @@ export function EditAccountDialog({
       setClientId(account.credentials.clientId || '')
       setClientSecret(account.credentials.clientSecret || '')
       setRegion(account.credentials.region || 'us-east-1')
+      setVerifiedCredentialSignature(credentialFormSignature({
+        refreshToken: account.credentials.refreshToken || '',
+        clientId: account.credentials.clientId || '',
+        clientSecret: account.credentials.clientSecret || '',
+        region: account.credentials.region || 'us-east-1'
+      }))
       setNickname(account.nickname || '')
       // v1.7.6 加载权重(缺省 100)
       setWeight(typeof account.weight === 'number' ? account.weight : 100)
@@ -148,6 +166,7 @@ export function EditAccountDialog({
       })
 
       if (result.success && result.data) {
+        const verifiedRefreshToken = result.data.refreshToken || refreshToken
         setAccountInfo({
           email: result.data.email,
           userId: result.data.userId,
@@ -162,6 +181,12 @@ export function EditAccountDialog({
         if (result.data.refreshToken) {
           setRefreshToken(result.data.refreshToken)
         }
+        setVerifiedCredentialSignature(credentialFormSignature({
+          refreshToken: verifiedRefreshToken,
+          clientId,
+          clientSecret,
+          region
+        }))
       } else {
         setError(result.error || '验证失败')
       }
@@ -176,9 +201,22 @@ export function EditAccountDialog({
   const handleSave = () => {
     if (!account || !accountInfo) return
 
+    const currentCredentialSignature = credentialFormSignature({
+      refreshToken,
+      clientId,
+      clientSecret,
+      region
+    })
+    if (currentCredentialSignature !== verifiedCredentialSignature) {
+      setError(isEn
+        ? 'Credentials changed. Verify them before saving.'
+        : '凭据已修改，请先验证再保存')
+      return
+    }
+
     const now = Date.now()
 
-    updateAccount(account.id, {
+    const updateResult = updateAccount(account.id, {
       email: accountInfo.email,
       userId: accountInfo.userId,
       nickname: nickname || undefined,
@@ -217,6 +255,19 @@ export function EditAccountDialog({
       },
       status: 'active'
     })
+
+    if (!updateResult.ok) {
+      setError(
+        updateResult.code === 'ACCOUNT_IDENTITY_DRIFT'
+          ? isEn
+            ? 'These credentials belong to another account. Please add it as a new account.'
+            : '这是另一个账号，请改用新增'
+          : isEn
+            ? 'This account no longer exists. Please refresh and try again.'
+            : '账号已不存在，请刷新后重试'
+      )
+      return
+    }
 
     onOpenChange(false)
   }

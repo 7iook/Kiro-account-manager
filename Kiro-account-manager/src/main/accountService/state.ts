@@ -23,6 +23,7 @@
  * 保留 `StoreRef` 这个本地名字是为了不动本文件其余引用点（纯别名，零行为变化）。
  */
 import type { AccountStorePort } from '../persistence/accountStorePort'
+import { assertAccountIdentityInvariant } from '../../shared/accountIdentity'
 
 type StoreRef = AccountStorePort
 
@@ -198,6 +199,9 @@ export async function applyAccountDataMutation(
     }
 
     const next = await mutate(prev)
+    // 所有桌面 IPC、手机面板与 main 后台写入最终都经过这里。
+    // 在真正 set 之前比较同一记录键的旧/新身份，拒绝 A 的 id 原地变成 B。
+    assertAccountIdentityInvariant(prev, next)
     const nextRevision = prev.revision + 1
     const toPersist: AccountsBlob = { ...next, revision: nextRevision }
 

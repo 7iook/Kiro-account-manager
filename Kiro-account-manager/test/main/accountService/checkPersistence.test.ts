@@ -63,7 +63,8 @@ function initialBlob(): Record<string, unknown> {
     accounts: {
       'acc-1': {
         id: 'acc-1',
-        email: 'old@example.com',
+        email: 'new@example.com',
+        userId: 'uid-9',
         idp: 'Google',
         note: '桌面端写的备注',
         groupId: 'g1',
@@ -226,7 +227,7 @@ describe('手机端刷新额度后重载页面 · 数字必须还是新的', () 
     const after = (await getList(server, cookie))[0]
     expect(after.usage).toMatchObject({ current: 42, limit: 500 })
     expect(after.usage?.percentUsed).toBeCloseTo(42 / 500)
-    // 订阅与邮箱也跟着更新（renderer 基线同样会写这两处）
+    // 订阅更新；身份字段与上游一致但不会被换成另一个账号
     expect(after.subscription).toMatchObject({ type: 'Pro', title: 'Kiro Pro' })
     expect(after.email).toBe('new@example.com')
     // 刷新成功即清掉上次的错误（基线 store/accounts.ts:2071）
@@ -363,6 +364,14 @@ describe('批量刷新额度 · 中途失败不能让已成功的部分全丢', 
     }))
   }
 
+  const matchingBatchUserInfo = async (accessToken: string): Promise<{
+    email: string
+    status: string
+  }> => ({
+    email: `${accessToken.replace(/^tok-/, '')}@example.com`,
+    status: 'Active'
+  })
+
   beforeEach(() => {
     store = makeStore({ accountData: threeAccountsBlob() })
     broadcasts = []
@@ -379,7 +388,7 @@ describe('批量刷新额度 · 中途失败不能让已成功的部分全丢', 
 
   it('批量刷完 · 三个账号的新额度都在盘上（不再只靠 30 秒自动保存兜底）', async () => {
     const deps = runtimeDeps(upstreamUsageResponse(55, 200))
-    deps.api.getUserInfo = async () => ({ email: 'x@example.com', status: 'Active' })
+    deps.api.getUserInfo = matchingBatchUserInfo
 
     const summary = await backgroundBatchCheck(deps, batchAccounts(['a', 'b', 'c']), 10)
 
@@ -392,7 +401,7 @@ describe('批量刷新额度 · 中途失败不能让已成功的部分全丢', 
   it('第二片上游全挂 · 第一片已落盘的结果必须还在（不是全丢）', async () => {
     let call = 0
     const deps = runtimeDeps(null)
-    deps.api.getUserInfo = async () => ({ email: 'x@example.com', status: 'Active' })
+    deps.api.getUserInfo = matchingBatchUserInfo
     // concurrency=1 ⇒ 每个账号一片。第 1 个成功，之后全挂。
     deps.api.getUsageAndLimits = async () => {
       call++
@@ -411,7 +420,7 @@ describe('批量刷新额度 · 中途失败不能让已成功的部分全丢', 
 
   it('每切片只广播一次 · 1000 账号不会变成 1000 条广播打爆桌面端', async () => {
     const deps = runtimeDeps(upstreamUsageResponse(55, 200))
-    deps.api.getUserInfo = async () => ({ email: 'x@example.com', status: 'Active' })
+    deps.api.getUserInfo = matchingBatchUserInfo
 
     // 3 个账号 / concurrency=2 ⇒ 2 片 ⇒ 2 次写入 ⇒ 2 条广播
     await backgroundBatchCheck(deps, batchAccounts(['a', 'b', 'c']), 2)
@@ -422,7 +431,7 @@ describe('批量刷新额度 · 中途失败不能让已成功的部分全丢', 
 
   it('批量落盘同样不覆盖桌面端并发写的备注', async () => {
     const deps = runtimeDeps(upstreamUsageResponse(55, 200))
-    deps.api.getUserInfo = async () => ({ email: 'x@example.com', status: 'Active' })
+    deps.api.getUserInfo = matchingBatchUserInfo
 
     await backgroundBatchCheck(deps, batchAccounts(['a', 'b', 'c']), 10)
 
@@ -435,7 +444,7 @@ describe('批量刷新额度 · 中途失败不能让已成功的部分全丢', 
 
   it('切片内账号已被另一端删除 · 跳过它，其余照常落盘且不复活它', async () => {
     const deps = runtimeDeps(upstreamUsageResponse(55, 200))
-    deps.api.getUserInfo = async () => ({ email: 'x@example.com', status: 'Active' })
+    deps.api.getUserInfo = matchingBatchUserInfo
 
     // 用真实写入路径删掉 b
     await applyAccountDataMutation((prev) => {

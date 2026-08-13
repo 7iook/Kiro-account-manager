@@ -317,4 +317,79 @@ describe('applyAccountDataMutation · 决策卡 §1 不变量 2/3 收口', () =>
     expect(warnSpy).toHaveBeenCalled()
     warnSpy.mockRestore()
   })
+
+  it('任一壳层把同一记录 ID 写成另一个身份时，统一收口拒绝且零落盘副作用', async () => {
+    store = makeStore({
+      accountData: {
+        accounts: {
+          A: { id: 'A', email: 'a@example.com', userId: 'user-A' }
+        },
+        revision: 5
+      }
+    })
+    setStoreRef(store)
+
+    await expect(
+      applyAccountDataMutation(
+        () => ({
+          accounts: {
+            A: { id: 'A', email: 'b@example.com', userId: 'user-B' }
+          }
+        }),
+        { expectedRevision: 5 }
+      )
+    ).rejects.toMatchObject({ code: 'ACCOUNT_IDENTITY_DRIFT' })
+
+    expect(store.get('accountData')).toEqual({
+      accounts: {
+        A: { id: 'A', email: 'a@example.com', userId: 'user-A' }
+      },
+      revision: 5
+    })
+    expect(broadcasts).toHaveLength(0)
+  })
+
+  it('旧记录缺少身份字段时允许首次补齐，不把历史兼容数据锁死', async () => {
+    const result = await applyAccountDataMutation((prev) => ({
+      ...prev,
+      accounts: {
+        A: {
+          ...(prev.accounts as Record<string, Record<string, unknown>>).A,
+          email: 'a@example.com',
+          userId: 'user-A'
+        }
+      }
+    }))
+
+    expect(result).toEqual({ ok: true, revision: 6 })
+    expect(
+      (store.get('accountData') as { accounts: Record<string, Record<string, unknown>> })
+        .accounts.A
+    ).toMatchObject({ id: 'A', email: 'a@example.com', userId: 'user-A' })
+  })
+
+  it('删除旧记录后以新 ID 重加同一身份属于正常新增，不误判为身份漂移', async () => {
+    store = makeStore({
+      accountData: {
+        accounts: {
+          A: { id: 'A', email: 'same@example.com', userId: 'same-user' }
+        },
+        revision: 5
+      }
+    })
+    setStoreRef(store)
+
+    const result = await applyAccountDataMutation(() => ({
+      accounts: {
+        B: { id: 'B', email: 'same@example.com', userId: 'same-user' }
+      }
+    }))
+
+    expect(result).toEqual({ ok: true, revision: 6 })
+    expect(
+      Object.keys(
+        (store.get('accountData') as { accounts: Record<string, unknown> }).accounts
+      )
+    ).toEqual(['B'])
+  })
 })

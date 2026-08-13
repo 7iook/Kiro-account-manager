@@ -25,6 +25,10 @@ import { DEFAULT_PROXY_POOL_CONFIG } from '../types/proxy'
 import { useWebhookStore, type WebhookEvent, type WebhookMessage } from './webhooks'
 import { mergeSyncBlob, type SyncBlob } from './syncMerge'
 import { isAccountSuspensionError } from '@shared/accountSuspension'
+import {
+  findAccountIdentityTransitionViolation,
+  type AccountIdentityField
+} from '@shared/accountIdentity'
 
 // ============================================
 // 账号管理 Store
@@ -60,6 +64,11 @@ export type FlushSaveResult =
   | { ok: true; revision: number }
   | { ok: false; code: 'SYNC_CONFLICT_UNRESOLVED'; attempts: number }
   | { ok: false; code: 'SAVE_FAILED'; error: string }
+
+export type UpdateAccountResult =
+  | { ok: true }
+  | { ok: false; code: 'ACCOUNT_NOT_FOUND' }
+  | { ok: false; code: 'ACCOUNT_IDENTITY_DRIFT'; fields: AccountIdentityField[] }
 
 let saveInFlight: Promise<FlushSaveResult> | null = null
 /** 等待本轮防抖窗口落盘的所有调用方 resolver；批量唤醒，避免风暴时 Promise 永久挂起 */
@@ -788,7 +797,7 @@ interface AccountsState {
 interface AccountsActions {
   // 账号 CRUD
   addAccount: (account: Omit<Account, 'id' | 'createdAt' | 'isActive'>) => string
-  updateAccount: (id: string, updates: Partial<Account>) => void
+  updateAccount: (id: string, updates: Partial<Account>) => UpdateAccountResult
   removeAccount: (id: string) => void
   removeAccounts: (ids: string[]) => BatchOperationResult
 
@@ -1194,15 +1203,30 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   },
 
   updateAccount: (id, updates) => {
+    const account = get().accounts.get(id)
+    if (!account) return { ok: false, code: 'ACCOUNT_NOT_FOUND' }
+
+    const updated = { ...account, ...updates }
+    const identityViolation = findAccountIdentityTransitionViolation(id, account, updated)
+    if (identityViolation) {
+      console.warn(
+        `[AccountIdentityGuard] rejected in-place identity change for "${id}" ` +
+          `(fields=${identityViolation.fields.join(',')})`
+      )
+      return {
+        ok: false,
+        code: 'ACCOUNT_IDENTITY_DRIFT',
+        fields: identityViolation.fields
+      }
+    }
+
     set((state) => {
       const accounts = new Map(state.accounts)
-      const account = accounts.get(id)
-      if (account) {
-        accounts.set(id, { ...account, ...updates })
-      }
+      accounts.set(id, updated)
       return { accounts }
     })
     get().saveToStorage()
+    return { ok: true }
   },
 
   removeAccount: (id) => {
@@ -1849,15 +1873,41 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     // 收集所有变更，一次性 set，避免 N 次 new Map（O(n²)）
     let skipped = 0
     const accountsToAdd: Account[] = []
+    // 既有 ID 与本批已接纳 ID 都占位；保留对应记录，先判 ID 冲突再走普通身份判重。
+    // 否则「userId 相同但 email 已漂移」会被旧判重逻辑当成普通 skip，失去明确告警。
+    const reservedAccounts = new Map(existingAccounts)
 
     for (const accountData of uniqueAccounts) {
+      const reservedAccount = reservedAccounts.get(accountData.id)
+      if (reservedAccount) {
+        const identityConflict = findAccountIdentityTransitionViolation(
+          accountData.id,
+          reservedAccount,
+          accountData
+        )
+        if (identityConflict) {
+          result.failed++
+          result.errors.push({
+            id: accountData.id,
+            error:
+              `导入项 ID 与现有其他账号身份冲突（${identityConflict.fields.join(', ')}），` +
+              '已拒绝；请改用新增账号'
+          })
+        } else {
+          // 同 ID、同身份也不覆盖凭据；沿用既有「账号已存在」语义。
+          skipped++
+        }
+        continue
+      }
       // 检查本地是否已存在（传入 provider + profileArn,§三元组副键）
       if (isAccountExists(accountData.email, accountData.userId, accountData.credentials?.provider, accountData.credentials?.profileArn)) {
         skipped++
         continue
       }
       try {
-        accountsToAdd.push({ ...accountData, isActive: false })
+        const accountToAdd = { ...accountData, isActive: false }
+        accountsToAdd.push(accountToAdd)
+        reservedAccounts.set(accountData.id, accountToAdd)
         result.success++
       } catch (error) {
         result.failed++

@@ -12,6 +12,96 @@
  */
 import { applyAccountDataMutation, type AccountsBlob, type ApplyResult } from './state'
 import type { AccountStoreDeps } from './types'
+import {
+  inspectAccountIdentityAudit,
+  type AccountIdentityAuditIssue
+} from '../../shared/accountIdentity'
+import { proxyLogStore } from '../proxy/logger'
+
+/** 同一个已装配 store 每个进程只做一次启动审计；HTTP 轮询 loadAccounts 不重复刷屏。 */
+const identityAuditedStores = new WeakSet<object>()
+
+function persistAuditLogForServer(
+  level: 'INFO' | 'WARN' | 'ERROR',
+  message: string,
+  data?: unknown
+): void {
+  // Electron 壳的 console 已由 interceptConsole 转入 proxyLogStore；裸 Node 服务端没有该拦截，
+  // 因而只在服务端补写持久通道，避免桌面日志出现两份完全相同的记录。
+  if (
+    typeof process.versions.electron === 'string' ||
+    process.env.NODE_ENV === 'test' ||
+    process.env.VITEST === 'true'
+  ) {
+    return
+  }
+  try {
+    proxyLogStore.add({
+      timestamp: new Date().toISOString(),
+      level,
+      category: 'AccountIdentityAudit',
+      message,
+      data
+    })
+  } catch (error) {
+    // 审计日志落盘失败不能阻塞账号加载，但不能静默；固定前缀便于服务端运维检索。
+    console.error('[AccountIdentityAudit] failed to persist server audit log:', error)
+  }
+}
+
+function emitAuditLog(
+  level: 'INFO' | 'WARN' | 'ERROR',
+  message: string,
+  data?: unknown
+): void {
+  if (level === 'ERROR') console.error(message)
+  else if (level === 'WARN') console.warn(message)
+  else console.log(message)
+  persistAuditLogForServer(level, message, data)
+}
+
+function describeAuditIssue(issue: AccountIdentityAuditIssue): string {
+  return (
+    `[AccountIdentityAudit] suspicious account record "${issue.accountId}": ` +
+    `${issue.code}; fields=${issue.fields.join(',')}; sources=${issue.sources.join(',')}; ` +
+    'report-only, no data changed'
+  )
+}
+
+async function auditAccountDataOnce(deps: AccountStoreDeps, data: unknown): Promise<void> {
+  const store = deps.getStore()
+  if (identityAuditedStores.has(store)) return
+  identityAuditedStores.add(store)
+
+  let historicalBlobs: readonly unknown[] = []
+  if (deps.loadAccountIdentityHistory) {
+    try {
+      historicalBlobs = await deps.loadAccountIdentityHistory()
+    } catch (error) {
+      emitAuditLog(
+        'WARN',
+        '[AccountIdentityAudit] historical identity source unavailable; current data was not changed',
+        { error: error instanceof Error ? error.message : String(error) }
+      )
+    }
+  }
+
+  const issues = inspectAccountIdentityAudit(data, historicalBlobs)
+  for (const issue of issues) {
+    emitAuditLog('WARN', describeAuditIssue(issue), {
+      code: issue.code,
+      accountId: issue.accountId,
+      fields: issue.fields,
+      sources: issue.sources,
+      relatedIds: issue.relatedIds
+    })
+  }
+  emitAuditLog(
+    'INFO',
+    `[AccountIdentityAudit] startup scan complete: ${issues.length} suspicious record(s); ` +
+      'report-only, no data changed'
+  )
+}
 
 /**
  * 读取账号数据 blob。
@@ -20,7 +110,16 @@ import type { AccountStoreDeps } from './types'
 export async function loadAccounts(deps: AccountStoreDeps): Promise<unknown> {
   try {
     await deps.ensureStore()
-    return deps.getStore().get('accountData', null)
+    const data = deps.getStore().get('accountData', null)
+    try {
+      await auditAccountDataOnce(deps, data)
+    } catch (error) {
+      // 检测通道是旁路：自身失败只留痕，绝不能把可读的账号数据变成 null。
+      emitAuditLog('ERROR', '[AccountIdentityAudit] startup scan failed; account data was not changed', {
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+    return data
   } catch (error) {
     // 保留既有容错：读盘失败不能让前端崩溃，返回 null 走空列表分支。
     // 不是"吞异常返回成功"—— null 本身就是「无数据」的合法返回值，且已记录日志。

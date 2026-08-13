@@ -67,7 +67,7 @@ function initialBlob(ids: string[]): Record<string, unknown> {
 /** 上游 GetUsageLimits 真实响应形状(ksk_ 分支只调这一个 API) */
 function upstreamUsage(current: number, limit: number): unknown {
   return {
-    userInfo: { email: 'a@example.com', userId: 'uid-1' },
+    userInfo: { email: 'acc-1@example.com', userId: 'uid-1' },
     subscriptionInfo: { type: 'PRO', subscriptionTitle: 'Kiro Pro' },
     usageBreakdownList: [
       {

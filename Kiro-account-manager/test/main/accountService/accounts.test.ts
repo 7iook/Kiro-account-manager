@@ -130,4 +130,107 @@ describe('loadAccounts / saveAccounts · 账号数据读写', () => {
     await saveAccounts(deps, payload)
     expect(JSON.stringify(payload)).toBe(snapshot)
   })
+
+  it('启动加载发现记录身份与既有机器码历史不符时点名报告，且绝不改数据', async () => {
+    store = makeStore({
+      accountData: {
+        accounts: {
+          A: { id: 'A', email: 'b@example.com', userId: 'user-B' }
+        },
+        machineIdHistory: [
+          {
+            id: 'machine-history-1',
+            machineId: 'a'.repeat(64),
+            timestamp: 1,
+            action: 'bind',
+            accountId: 'A',
+            accountEmail: 'a@example.com'
+          }
+        ],
+        revision: 3
+      }
+    })
+    deps.getStore = () => store
+    setStoreRef(store)
+    const before = JSON.stringify(store.data.accountData)
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      await loadAccounts(deps)
+      await loadAccounts(deps)
+
+      const auditCalls = warnSpy.mock.calls.filter((call) =>
+        String(call[0]).includes('[AccountIdentityAudit]')
+      )
+      expect(auditCalls).toHaveLength(1)
+      expect(String(auditCalls[0][0])).toContain('A')
+      expect(String(auditCalls[0][0])).toContain('report-only')
+      expect(JSON.stringify(store.data.accountData)).toBe(before)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('历史已记录 email 而当前记录将其清空时同样报告，不让“先清空”逃过审计', async () => {
+    store = makeStore({
+      accountData: {
+        accounts: {
+          A: { id: 'A', userId: 'user-A' }
+        },
+        machineIdHistory: [
+          {
+            accountId: 'A',
+            accountEmail: 'a@example.com'
+          }
+        ],
+        revision: 3
+      }
+    })
+    deps.getStore = () => store
+    setStoreRef(store)
+    const before = JSON.stringify(store.data.accountData)
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      await loadAccounts(deps)
+
+      const auditCalls = warnSpy.mock.calls.filter((call) =>
+        String(call[0]).includes('HISTORICAL_IDENTITY_MISMATCH')
+      )
+      expect(auditCalls).toHaveLength(1)
+      expect(String(auditCalls[0][0])).toContain('fields=email')
+      expect(JSON.stringify(store.data.accountData)).toBe(before)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('启动加载发现多条记录指向同一 id 时点名报告，且不按 id 外形猜测或清理', async () => {
+    store = makeStore({
+      accountData: {
+        accounts: {
+          slot1: { id: 'shared-record-id', email: 'a@example.com', userId: 'user-A' },
+          slot2: { id: 'shared-record-id', email: 'b@example.com', userId: 'user-B' }
+        },
+        revision: 3
+      }
+    })
+    deps.getStore = () => store
+    setStoreRef(store)
+    const before = JSON.stringify(store.data.accountData)
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      await loadAccounts(deps)
+
+      const duplicateCalls = warnSpy.mock.calls.filter((call) =>
+        String(call[0]).includes('DUPLICATE_RECORD_ID')
+      )
+      expect(duplicateCalls).toHaveLength(1)
+      expect(String(duplicateCalls[0][0])).toContain('shared-record-id')
+      expect(JSON.stringify(store.data.accountData)).toBe(before)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
 })

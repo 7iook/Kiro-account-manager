@@ -198,6 +198,11 @@ export interface AccountStoreDeps {
   createBackup: (data: unknown) => Promise<void>
   /** 记录「最后成功写盘的 blob」，供崩溃恢复读取（index.ts 模块级 lastSavedData 的 setter） */
   setLastSavedData: (data: unknown) => void
+  /**
+   * 启动身份审计可选的只读历史来源（例如装配层已解密的安全备份）。
+   * 不提供时仍会检查当前容器结构与 accountData.machineIdHistory；审计绝不写数据。
+   */
+  loadAccountIdentityHistory?: () => Promise<readonly unknown[]>
 }
 
 /** 账号凭证(各字段均可缺失,由 authMethod 决定哪些必需) */
