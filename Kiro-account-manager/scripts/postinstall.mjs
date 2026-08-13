@@ -57,6 +57,28 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const binDir = join(repoRoot, 'node_modules', '.bin')
 
 /**
+ * 开发 checkout 顺手安装提交钩子；服务端发布目录没有该脚本，故保持原安装路径不变。
+ *
+ * 不把安装器写进 package.json 的独立 lifecycle：服务端制品会复制 package.json，
+ * 却有意只带运行必需的 postinstall.mjs。独立 lifecycle 会在目标机引用一个不存在
+ * 的开发脚本，直接弄坏 `npm ci --omit=dev`。
+ */
+const hookInstaller = join(repoRoot, 'scripts', 'install-git-hooks.mjs')
+if (existsSync(hookInstaller)) {
+  const hookInstall = spawnSync(process.execPath, [hookInstaller], {
+    cwd: repoRoot,
+    stdio: 'inherit'
+  })
+  if (hookInstall.error) {
+    console.error('[postinstall] 启动 Git hook 安装器失败：', hookInstall.error.message)
+    process.exit(1)
+  }
+  if (hookInstall.status !== 0) {
+    process.exit(hookInstall.status ?? 1)
+  }
+}
+
+/**
  * 三个平台形态全查：POSIX 无扩展名 / Windows 的 cmd 与 ps1。
  * 任一存在即认为 shell 能解析到这条命令。
  */
