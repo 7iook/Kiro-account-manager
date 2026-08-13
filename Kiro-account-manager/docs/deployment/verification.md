@@ -95,11 +95,17 @@ npx vitest run \
 - `unverified: 本次使用空账号库且默认反代禁用`：readyz 的 503 路径已真跑，真实账号
   加载、代理端口监听后的 200 路径和实际流式请求不在本任务可用数据内。
 - `unverified: 没有执行手机经公网 TLS 访问`：依赖
-  [`../security/network-exposure.md`](../security/network-exposure.md)。
+  [`../security/network-exposure.md`](../security/network-exposure.md)。本记录也没有验证
+  `KIRO_TRUSTED_TLS_PROXY_IPS` 经真实 Caddy/nginx hop 后的客户端 IP allow/deny、非法
+  转发链 400 或 session cookie `Secure` 属性。
 - `unverified: 没有桌面真实数据样本`：未执行
   [`../operations/data-migration.md`](../operations/data-migration.md) 的复制、解密、回退。
 - `unverified: 没有真做主机重启、应用升级、软链接回滚和数据恢复演练`。
-- `unverified: 并行 owner 的数据目录单实例锁尚未在本验证中出现`：本文假设其最终接入
-  `entry.ts`，未编辑或抢占该文件。
+- `unverified: 没有在 Linux/systemd 下长时间运行无头自动换号或做崩溃窗口故障注入`：
+  当前记录不能证明决定提交后重启重放和停机等待 scheduler 的真实主机行为；运行合同见
+  [`../operations/account-management.md`](../operations/account-management.md)。
+- `unverified: 本次容器验证没有制造第二实例争锁`：当前 `entry.ts` 已在数据读取前获取锁
+  并把冲突分类为退出 69（`src/main/server/entry.ts:80-101`），但本记录没有真跑并发
+  systemd 实例、崩溃释放和 StartLimit 组合行为。
 
 这些未验证项通过前，不能把“发布目录可安装并能优雅退出”扩大成题述整句最终成功状态。

@@ -20,15 +20,15 @@ Node 包根目录。
 
 发布目录包含：
 
-| 路径 | 用途 |
-|---|---|
-| `out/server/index.js`、`.map` | Node 服务和可读生产栈 |
-| `out/webPanel/` | 手机管理面板静态资源 |
-| `package.json`、`package-lock.json` | 锁定目标机生产依赖 |
-| `scripts/postinstall.mjs` | 使 `npm ci --omit=dev` 不依赖 Electron 工具 |
-| `deploy/systemd/` | unit 与环境变量模板 |
-| `RELEASE.json` | 包版本、Git 提交、构建 Node、是否 dirty |
-| `SHA256SUMS` | 传输完整性校验 |
+| 路径                                | 用途                                        |
+| ----------------------------------- | ------------------------------------------- |
+| `out/server/index.js`、`.map`       | Node 服务和可读生产栈                       |
+| `out/webPanel/`                     | 手机管理面板静态资源                        |
+| `package.json`、`package-lock.json` | 锁定目标机生产依赖                          |
+| `scripts/postinstall.mjs`           | 使 `npm ci --omit=dev` 不依赖 Electron 工具 |
+| `deploy/systemd/`                   | unit 与环境变量模板                         |
+| `RELEASE.json`                      | 包版本、Git 提交、构建 Node、是否 dirty     |
+| `SHA256SUMS`                        | 传输完整性校验                              |
 
 构建必须发生在构建机，不在生产目标机：TypeScript、Vite 和类型定义都在
 `devDependencies`，目标机刻意只安装生产依赖。发布目录记录 `sourceTreeDirty`；正式发布
@@ -103,14 +103,19 @@ editor /etc/kiro-account-manager/server.env
 
 实际可设变量以源码为准：
 
-| 变量 | 必需 | 默认/语义 |
-|---|---:|---|
-| `KIRO_DATA_DIR` | 是 | 无默认值；unit 模板使用 `/var/lib/kiro-account-manager` |
-| `KIRO_PANEL_HOST` | 否 | 盘上配置，最终兜底 `127.0.0.1` |
-| `KIRO_PANEL_PORT` | 否 | 盘上配置，最终兜底 `5590`；只接受 0–65535 整数 |
-| `KIRO_LOG_FULL` | 否 | 默认日志截断；`1/true/yes/on` 临时启用完整日志 |
-| `KIRO_ADMIN_KEY` | 否 | 预置至少 32 字符的密钥；不写日志、不落 `adminKey` 文件 |
-| `KIRO_ALLOW_UNPROTECTED_KEY_FILE` | 否 | 仅开发逃生门；Linux 生产禁止设置 |
+| 变量                              | 必需 | 默认/语义                                                               |
+| --------------------------------- | ---: | ----------------------------------------------------------------------- |
+| `KIRO_DATA_DIR`                   |   是 | 无默认值；unit 模板使用 `/var/lib/kiro-account-manager`                 |
+| `KIRO_PANEL_HOST`                 |   否 | 盘上配置，最终兜底 `127.0.0.1`                                          |
+| `KIRO_PANEL_PORT`                 |   否 | 盘上配置，最终兜底 `5590`；只接受 0–65535 整数                          |
+| `KIRO_TRUSTED_TLS_PROXY_IPS`      |   否 | 默认关闭；逗号分隔的受控代理 hop IP/CIDR，不是客户端网段；非法值退出 64 |
+| `KIRO_LOG_FULL`                   |   否 | 默认日志截断；`1/true/yes/on` 临时启用完整日志                          |
+| `KIRO_ADMIN_KEY`                  |   否 | 预置至少 32 字符的密钥；不写日志、不落 `adminKey` 文件                  |
+| `KIRO_ALLOW_UNPROTECTED_KEY_FILE` |   否 | 仅开发逃生门；Linux 生产禁止设置                                        |
+
+`KIRO_TRUSTED_TLS_PROXY_IPS` 同时授权应用读取该 peer 写入的 `X-Forwarded-For`，并把经该 peer 到达的面板请求视为 TLS 上下文；声明、默认值和非法输入处理见 `src/main/server/config.ts:67-85,112-125,143-183`。同机 Caddy 常见值是后端实际看到的 `127.0.0.1`，但若 upstream 走 IPv6、容器 bridge 或异机/SNAT，必须按 socket 实测调整；多级代理还要列出右向左剥链所需的每个受控 hop，不能填写客户端网段。
+
+生产装配会把该环境值作为只读覆盖注入面板与数据反代，并在持久化配置前剥离同名字段，盘上/UI 配置不能自行扩大信任边界（`src/main/server/assembly.ts:380-431,519-580`）。完整风险与验收见 [`../security/network-exposure.md`](../security/network-exposure.md)。
 
 首次部署保持 `KIRO_PANEL_HOST=127.0.0.1`。不要为了“让手机能访问”直接改成
 `0.0.0.0`：adminKey 经公网明文 HTTP 传输等同公开。公网/局域网访问必须先完成
@@ -120,7 +125,8 @@ editor /etc/kiro-account-manager/server.env
 数据从桌面迁移前，按 [`../operations/data-migration.md`](../operations/data-migration.md)
 操作；本文不重复那份合同。密钥引导与轮换见
 [`../operations/key-handling.md`](../operations/key-handling.md)，备份恢复与升级回滚见
-[`../operations/backup-restore-upgrade.md`](../operations/backup-restore-upgrade.md)。若先空库启动，服务会明确告警但允许面板运行。
+[`../operations/backup-restore-upgrade.md`](../operations/backup-restore-upgrade.md)。面板账号编辑/删除和无头自动换号的运行边界见
+[`../operations/account-management.md`](../operations/account-management.md)。若先空库启动，服务会明确告警但允许面板运行。
 
 ### 3.4 安装并启动 unit
 
@@ -152,7 +158,9 @@ journalctl -u kiro-account-manager.service -b --no-pager
 
 轮换后的密钥不会写日志。若使用 `KIRO_ADMIN_KEY`，不要调用运行时轮换；更新环境配置。
 
-本机验证：
+验证方式取决于是否启用了受信 TLS 前置代理。
+
+尚未启用 `KIRO_TRUSTED_TLS_PROXY_IPS` 的隔离安装可本机直连诊断：
 
 ```bash
 curl --fail-with-body http://127.0.0.1:5590/panel/
@@ -161,14 +169,28 @@ curl --silent --show-error --output /tmp/ready.json \
 cat /tmp/ready.json
 ```
 
+启用受信 loopback peer 后，backend 直连请求没有 `X-Forwarded-For`，返回 400 才是 fail-closed 的正确结果；此时只用 `ss` 确认 5590/5580 仍绑定 loopback，成功验收必须走外部 HTTPS front：
+
+```bash
+ss -ltnp | grep -E ':(443|5580|5590)\b'
+curl --silent --show-error --output /tmp/ready.json \
+  --write-out '%{http_code}\n' https://panel.example.com/panel/readyz
+cat /tmp/ready.json
+```
+
 - `200 {"status":"ready"}`：反代真实监听，可由前置代理导入业务流量。
 - `503 {"status":"not_ready"}`：进程和管理面板仍活着，但反代未监听。此时应在面板修复，
   **不得重启服务**。常见原因包括反代端口冲突或盘上配置未启用/未自启。
+- `400`：受信代理没有提供合法 `X-Forwarded-For`；这是代理元数据配置错误，不是数据面未就绪（面板拒绝路径 `src/main/webPanel/server.ts:266-280`）。
+
+首次验收还必须通过浏览器确认 session cookie 带 `Secure`，并从允许与拒绝来源各测一次 IP policy；只测 readiness 不能证明客户端地址解析正确。
 
 ## 5. 监督合同（不可“简化”）
 
 systemd 只监督进程存活。`/panel/readyz` 只供前置代理做流量 gating，绝不能用于
 `ExecStartPost`、systemd watchdog、容器 restart probe 或外部“失败即重启”脚本。
+
+启用受信代理后，前置代理对 `/panel/readyz` 的请求也必须携带其正常生成的合法 `X-Forwarded-For`。503 仍只表示数据面未就绪；400 表示受信代理元数据错误，二者都不能接成 systemd 重启条件。
 
 原因：反代端口冲突时，服务刻意保持面板在线并让 readyz 返回 503。若按 readiness
 重启，就会形成循环，同时杀掉手机上唯一能修复问题的管理入口。
@@ -196,14 +218,14 @@ systemctl show kiro-account-manager.service \
 
 退出码含义：
 
-| 码 | 类别 | 首要检查 |
-|---:|---|---|
-| 0 | 正常停止 | 无 |
-| 64 | 环境变量非法 | `server.env`、端口格式、`KIRO_DATA_DIR` |
-| 65 | 数据不可解/版本过新 | 先备份，再按迁移 runbook 检查 |
-| 69 | 服务不可用/运行时致命错误 | journal 中端口或异常栈；systemd 会退避重启 |
-| 73 | 数据目录/密钥文件权限 | owner、mode、只读挂载 |
-| 78 | adminKey 来源冲突等配置矛盾 | env 与 `adminKey` 文件是否不一致 |
+|  码 | 类别                        | 首要检查                                                                              |
+| --: | --------------------------- | ------------------------------------------------------------------------------------- |
+|   0 | 正常停止                    | 无                                                                                    |
+|  64 | 环境变量非法                | `server.env`、端口格式、`KIRO_DATA_DIR`、`KIRO_TRUSTED_TLS_PROXY_IPS` 的 IP/CIDR 列表 |
+|  65 | 数据不可解/版本过新         | 先备份，再按迁移 runbook 检查                                                         |
+|  69 | 服务不可用/运行时致命错误   | journal 中端口或异常栈；systemd 会退避重启                                            |
+|  73 | 数据目录/密钥文件权限       | owner、mode、只读挂载                                                                 |
+|  78 | adminKey 来源冲突等配置矛盾 | env 与 `adminKey` 文件是否不一致                                                      |
 
 ## 7. 更新与回滚边界
 
@@ -211,16 +233,13 @@ systemctl show kiro-account-manager.service \
 和 `npm ci --omit=dev` 后，停服务、切换 `current` 软链接、再启动。应用回滚同理切回上一
 目录。涉及数据格式变化时不得只切应用；必须遵守迁移文档中的兼容与备份规则。
 
-## 8. 本文依赖的并行文档假设
+## 8. 本文依赖的运行合同
 
-以下文件由同批工作的其他 owner 编写，本文只引用，不定义其内容：
+本文依赖以下已存在的运行合同，不在此复制第二份：
 
-- `docs/deployment/data-migration.md`：桌面数据定位、复制而非移动、owner/mode、解密验证、
-  失败回退、备份恢复；
-- `docs/deployment/tls-front-proxy.md`：同机 TLS 终止、转发 `/panel/`、轮询 readyz 只做
-  流量 gating、不得把 503 接成 restart；
-- `docs/deployment/firewall-exposure.md`：面板/代理端口暴露矩阵、只开放必要入口、禁止
-  adminKey 明文公网传输。
+- [`../operations/data-migration.md`](../operations/data-migration.md)：桌面数据定位、复制而非移动、owner/mode、解密验证和失败回退；
+- [`../security/network-exposure.md`](../security/network-exposure.md)：TLS 终止、受信代理 opt-in、转发头、防火墙、readiness gating 和公网暴露判据；
+- [`../operations/backup-restore-upgrade.md`](../operations/backup-restore-upgrade.md)：整目录冷备、恢复、升级与回滚；
+- [`../operations/account-management.md`](../operations/account-management.md)：手机面板账号变更、限时撤销和服务器自动换号生命周期。
 
-还假设服务器入口在占用 `KIRO_DATA_DIR` 时持有跨进程单实例锁，并在第二实例启动时以已
-分类的非零退出码失败；该模块和 `entry.ts` 由并行 owner 实现，本文未修改。
+服务器入口在读取业务数据前获取规范化数据目录的跨进程锁；冲突映射为退出 69，成功启动后锁随完整 shutdown 生命周期释放（`src/main/server/entry.ts:80-101,224-230`）。unit 刻意允许 69 退避重试，并由启动频率限制阻止永久循环（`deploy/systemd/kiro-account-manager.service:26-33`）。

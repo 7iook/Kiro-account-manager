@@ -38,7 +38,7 @@ RELEASE_ROOT=/opt/kiro-account-manager
 
 ## 2. 创建一致的冷备
 
-账号/token/统计会在运行时写回。为了得到可证明的一致点，先停服务；停机流程会停止面板与反代、drain 持久化队列并 flush 统计（`src/main/server/assembly.ts:399-418`）。
+账号/token/统计会在运行时写回。为了得到可证明的一致点，先停服务；停机流程会停止面板与反代、停止自动换号调度器、drain 持久化队列并 flush 日志（`src/main/server/assembly.ts:447-475`）。
 
 ```sh
 set -eu
@@ -113,7 +113,7 @@ NODE
 1. 不连接生产域名，不开放公网端口；
 2. 注入备份时对应的 `KIRO_BACKUP_KEY`/环境管理 `KIRO_ADMIN_KEY`；
 3. 启动并确认没有退出 65/73/78；
-4. 经 SSH tunnel 登录面板，核对账号数；
+4. 若未配置 `KIRO_TRUSTED_TLS_PROXY_IPS`，可经 SSH tunnel 直连面板；若已配置，必须启动与生产相同的隔离 TLS front 并经它登录，因为缺少 `X-Forwarded-For` 的 backend 直连应返回 400；
 5. 确认 `/panel/readyz` 的 200/503 与反代真实状态一致；
 6. 停止、再次启动，确认数据仍在。
 
@@ -158,14 +158,17 @@ sudo stat -c '%U:%G %a %n' "$DATA_DIR/adminKey"
 sudo systemctl start "$SERVICE"
 sudo systemctl status "$SERVICE" --no-pager
 sudo journalctl -u "$SERVICE" -b --no-pager
-curl -fsS http://127.0.0.1:5590/panel/readyz || true
+ss -ltnp | grep -E ':(443|5580|5590)\b'
+curl --silent --show-error --output /tmp/ready.json \
+  --write-out '%{http_code}\n' https://panel.example.com/panel/readyz
+cat /tmp/ready.json
 ```
 
-再经 SSH tunnel 登录核对账号数和抽样状态。失败时停止服务，移走失败恢复目录，把 `before-restore.*` 原样移回，再检查 owner/mode 后启动。
+启用受信 loopback proxy 时，backend 直连缺少转发元数据并返回 400 是正确行为；恢复验收必须经 HTTPS front。未启用该模式的隔离恢复才可经 SSH tunnel 直连。登录后核对账号数和抽样状态。失败时停止服务，移走失败恢复目录，把 `before-restore.*` 原样移回，再检查 owner/mode 后启动。
 
 ## 5. 应用级 `.backup.enc` 的边界
 
-服务端在账号保存路径上用 `KIRO_BACKUP_KEY` 写 AES-GCM 的 `kiro-accounts.backup.enc`；缺 key 默认拒绝写明文，只有显式 `KIRO_BACKUP_ALLOW_PLAINTEXT=1` 才退回明文（`src/main/secureBackupCipher.aesGcm.ts:69-104`；`src/main/server/assembly.ts:507-532`）。
+服务端在账号保存路径上用 `KIRO_BACKUP_KEY` 写 AES-GCM 的 `kiro-accounts.backup.enc`；缺 key 默认拒绝写明文，只有显式 `KIRO_BACKUP_ALLOW_PLAINTEXT=1` 才退回明文（`src/main/secureBackupCipher.aesGcm.ts:69-104`；`src/main/server/assembly.ts:658-674`）。
 
 它是补充副本，不替代上面的冷备：
 
@@ -189,7 +192,7 @@ curl -fsS http://127.0.0.1:5590/panel/readyz || true
 
 数据文件包含可选 `schemaVersion`；当前支持版本为 1，无字段视为兼容，更新版本会拒绝启动而不向下猜（`src/main/persistence/accountStorePort.ts:85-101,255-279`）。
 
-不要把“进程 active”当升级成功。`/panel/readyz` 返回 503 时是降级态：管理面板可能正常，但数据面未监听（`src/main/server/entry.ts:304-314`）。
+不要把“进程 active”当升级成功。面板 readiness 动态读取反代真实句柄；反代启动失败时面板保持在线并明确进入 503 降级态（`src/main/server/entry.ts:138-140,204-214`；`src/main/webPanel/server.ts:313-322`）。
 
 ## 7. 回滚
 
@@ -206,13 +209,13 @@ sudo mv -Tf "$RELEASE_ROOT/current.new" "$RELEASE_ROOT/current"
 sudo systemctl start "$SERVICE"
 ```
 
-unverified: symlink 原子替换、release 布局及实际安装命令虽已与 `docs/deployment/linux-systemd.md:206-210` 的合同对齐，但尚未在真实 Linux 目标执行；不能把本节示例当成已验证。
+unverified: symlink 原子替换、release 布局及实际安装命令虽已与 `docs/deployment/linux-systemd.md` §7 的合同对齐，但尚未在真实 Linux 目标执行；不能把本节示例当成已验证。
 
 ## 8. 日志位置和轮转
 
 ### systemd
 
-官方 unit 将应用 stdout/stderr 写入 journal，标识为 `kiro-account-manager`（`deploy/systemd/kiro-account-manager.service:35-37`）：
+官方 unit 将应用 stdout/stderr 写入 journal，标识为 `kiro-account-manager`（`deploy/systemd/kiro-account-manager.service:40-42`）：
 
 ```sh
 sudo journalctl -u kiro-account-manager -b
@@ -241,8 +244,8 @@ sudo journalctl --disk-usage
 
 ### 应用自身日志
 
-服务器默认把 proxy 日志写到 console；日志 data 默认截断，`KIRO_LOG_FULL=1` 仅临时关闭截断，可能增加凭据和磁盘风险（`src/main/server/config.ts:73-80`；`src/main/proxy/logger.ts:54-84,194-226`）。
+服务器默认把 proxy 日志写到 console；日志 data 默认截断，`KIRO_LOG_FULL=1` 仅临时关闭截断，可能增加凭据和磁盘风险（`src/main/server/config.ts:80-85,155-159`；`src/main/proxy/logger.ts:54-84,194-226`）。
 
 不要宣称服务器会自动轮转应用文件日志：`ProxyLogger` 的文件 sink 默认关闭，且启用时必须显式提供 `logDir`（`src/main/proxy/logger.ts:47-52,96-129`）。它内部虽有 10 MiB/5 文件逻辑，但当前生产装配没有启用该 sink（`src/main/proxy/logger.ts:159-191`）。运营真源是 journald/容器日志驱动。
 
-已知缺陷：服务端装配没有调用 `proxyLogStore.initialize(dataDir)`；该 store 的默认路径初始为空，但每次日志仍会调度异步保存，可能周期性打印写空路径失败，且不会得到预期的 `proxy-logs.json`（`src/main/proxy/logger.ts:325-342,370-450`；桌面初始化仅见 `src/main/index.ts:466-470`）。本 runbook 不把该文件列为可靠日志源，也未修改 `src/**`。
+服务端装配现在会在业务启动前以 `KIRO_DATA_DIR` 初始化 `proxyLogStore`，并在所有请求入口和自动换号调度器停止后执行最终 flush（`src/main/server/assembly.ts:328-338,447-475`）。因此 `$KIRO_DATA_DIR/proxy-logs.json` 不再使用空路径；store 自身以 10,000 条为上限、30 秒节流写盘，退出时强制保存（`src/main/proxy/logger.ts:317-342,366-459`）。它仍不是 systemd 的进程日志替代品：启动失败、stderr 和 unit 生命周期继续以 journal 为运营真源。

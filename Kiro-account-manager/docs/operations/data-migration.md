@@ -138,7 +138,9 @@ unverified: 上述 `chmod/chown/test -w` 与 systemd `User=kiro` 的真实行为
 
 ## 6. 隔离验收后再导流
 
-保持 Caddy/nginx 停止，防火墙只开放 SSH；确认 `KIRO_PANEL_HOST=127.0.0.1`。注意反代 host 来自复制文件中的 `proxyConfig`，没有环境变量覆盖（`src/main/server/assembly.ts:480-503`）。先用上一节的离线脚本打印 `proxyConfig.host/port/enabled/autoStart`；若 host 不是 loopback，先在**目标副本**上改为 `127.0.0.1`，不得改桌面源文件：
+保持 Caddy/nginx 停止，防火墙只开放 SSH；确认 `KIRO_PANEL_HOST=127.0.0.1`。这一阶段还没有 front proxy，因此 `KIRO_TRUSTED_TLS_PROXY_IPS` 必须保持未设置；否则 backend 直连和 SSH tunnel 会因缺少代理生成的 `X-Forwarded-For` 而按设计返回 400。启用 TLS front 时再按 [`../security/network-exposure.md`](../security/network-exposure.md) 同步设置并验收。
+
+注意反代 host 来自复制文件中的 `proxyConfig`，没有环境变量覆盖（`src/main/server/assembly.ts:380-388,555-580`）。还要检查迁移数据中的自动换号开关：无头服务装配后会立即启动共享 scheduler，而不是等桌面 renderer 在线（`src/main/server/assembly.ts:395-420`）。先用上一节的离线脚本打印 `proxyConfig.host/port/enabled/autoStart` 和非敏感的自动换号设置；若 host 不是 loopback，先在**目标副本**上改为 `127.0.0.1`，不得改桌面源文件：
 
 ```sh
 cd /opt/kiro-account-manager/current
@@ -150,7 +152,9 @@ const store = new Conf({
   encryptionKey: 'kiro-account-manager-secret-key'
 })
 const p = store.get('proxyConfig', {})
+const a = store.get('accountData', {})
 console.log(`before host=${p.host ?? 'default'} port=${p.port ?? 'default'} autoStart=${p.autoStart === true}`)
+console.log(`autoSwitch enabled=${a.autoSwitchEnabled === true} interval=${a.autoSwitchInterval ?? 'default'} threshold=${a.autoSwitchThreshold ?? 'default'}`)
 if (p.host && !['127.0.0.1', '::1', 'localhost'].includes(String(p.host))) {
   store.set('proxyConfig', { ...p, host: '127.0.0.1' })
   console.log('target copy changed: proxyConfig.host=127.0.0.1')
@@ -158,7 +162,9 @@ if (p.host && !['127.0.0.1', '::1', 'localhost'].includes(String(p.host))) {
 NODE
 ```
 
-这一步会修改服务器副本，因此先前源哈希不再适合作为目标文件最终哈希；保留迁移前哈希和变更日志即可。它不触碰桌面源数据。
+这一步可能修改服务器副本的 `proxyConfig`，因此先前源哈希不再适合作为目标文件最终哈希；保留迁移前哈希和变更日志即可。它不触碰桌面源数据。
+
+若输出 `autoSwitch enabled=true`，首次启动会立即检查当前账号，满足阈值时可能在操作员首次登录前切换 active 账号并推进服务器反代。若这不是预期，停止迁移，在桌面源应用中关闭自动换号后重新复制；不要把“关掉桌面电脑”当作暂停服务器 scheduler 的方法。运行语义见 [`account-management.md`](account-management.md)。
 
 启动并检查：
 
@@ -176,7 +182,7 @@ curl -fsS http://127.0.0.1:5590/panel/readyz || true
 - 无法解密/解析：打印“拒绝以空库启动”，提示先备份，退出 65（`src/main/server/config.ts:236-243`）。
 - 版本过新：打印盘上版本与支持版本，拒绝启动，退出 65（`src/main/persistence/accountStorePort.ts:260-277`）。
 
-`/panel/readyz` 返回 200 只代表反代真实监听；反代未启动时返回 503，但面板仍应可管理（`src/main/webPanel/server.ts:289-298`；`src/main/server/entry.ts:304-314`）。通过 SSH 端口转发打开面板，登录后核对账号数和几个非敏感标识：
+`/panel/readyz` 返回 200 只代表反代真实监听；反代未启动时返回 503，但面板仍应可管理（`src/main/webPanel/server.ts:313-322`）。在尚未启用受信代理的本节隔离阶段，通过 SSH 端口转发打开面板，登录后核对账号数和几个非敏感标识：
 
 ```sh
 ssh -L 5590:127.0.0.1:5590 server.example

@@ -49,7 +49,7 @@ sudo systemctl start kiro-account-manager
 3. 验证文件权限；
 4. **把有效 key 完整打印到 stdout 一次**（`src/main/server/adminKeyStore.ts:397-415`）。
 
-systemd unit 把 stdout/stderr 写入 journal（`deploy/systemd/kiro-account-manager.service:35-37`），容器则通常进入 `docker logs`。因此“只打印一次”不等于“没有副本”：journal、容器日志、终端回滚缓冲、集中日志和其备份都可能永久保留这把仍有效的凭据；启动文案也明确警告这一点（`src/main/server/adminKeyStore.ts:809-829`）。
+systemd unit 把 stdout/stderr 写入 journal（`deploy/systemd/kiro-account-manager.service:40-42`），容器则通常进入 `docker logs`。因此“只打印一次”不等于“没有副本”：journal、容器日志、终端回滚缓冲、集中日志和其备份都可能永久保留这把仍有效的凭据；启动文案也明确警告这一点（`src/main/server/adminKeyStore.ts:809-829`）。
 
 如果已走这条路径：
 
@@ -59,7 +59,9 @@ sudo journalctl -u kiro-account-manager -b --no-pager
 
 取出 key 后立即登录，并在 TLS 面板里轮换。轮换后再按组织的留存政策清理或缩短旧日志；仅清本机 journal 不能撤回已经进入集中日志、备份或他人终端的副本。
 
-## 在线轮换
+## 在线轮换（无头服务器已支持）
+
+计划内轮换不再需要停止无头服务或删除密钥文件。已登录管理员可在手机面板的反代区域选择“轮换管理密钥”，输入“轮换”确认；页面会先显示一次新 key，只有用户点击“我已保存，重新登录”后才返回登录页（`src/webPanel/ui/ProxyPanel.tsx:494-615`）。
 
 端点：
 
@@ -75,7 +77,9 @@ X-Panel-Request: 1
 - 失效所有已有会话（包括当前会话）；
 - 清当前 cookie；
 - 以 `{ "key": "..." }` 返回新 key 一次；
-- 响应带 `Cache-Control: no-store`（`src/main/webPanel/server.ts:345-380`；测试证据 `test/main/webPanel/adminKeyRotation.server.test.ts:59-101`）。
+- 响应带 `Cache-Control: no-store`。
+
+统一会话/CSRF 闸门和路由见 `src/main/webPanel/server.ts:369-405`；“先持久化，再失效会话”的实现见 `src/main/webPanel/auth.ts:138-150`；真实 HTTP 契约覆盖匿名、缺 CSRF、清 cookie、`no-store`、旧会话/旧 key 失效和新 key 登录（`test/main/webPanel/adminKeyRotation.server.test.ts:59-121`）。
 
 浏览器面板是首选，因为它会维护会话与 CSRF 头。若自动化调用，先登录并保存 cookie，再轮换；绝不要把新 key 输出到 CI 日志：
 
@@ -101,11 +105,11 @@ curl --fail --silent --show-error \
 
 从权限为 0600 的 `$RESPONSE` 导入密码管理器，核对新 key 可登录后安全删除临时文件。不要使用 `curl -v`、`set -x` 或把响应交给日志采集器。
 
-写盘失败时端点返回 500，旧 key 和旧会话保持有效，不会半轮换把管理员锁在门外（`src/main/webPanel/server.ts:369-380`；`test/main/webPanel/adminKeyRotation.server.test.ts:104-120`）。
+写盘失败时端点返回 500，`keyStore.set()` 在会话失效之前抛出，因此旧 key 和旧会话保持有效，不会半轮换把管理员锁在门外（`src/main/webPanel/auth.ts:146-150`；`test/main/webPanel/adminKeyRotation.server.test.ts:104-121`）。
 
 ### 环境管理模式拒绝在线轮换
 
-若 key 来自 `KIRO_ADMIN_KEY`，运行时轮换会返回 500。服务故意拒绝写 `adminKey` 文件，因为那会制造两个不一致的真源并导致下次启动拒绝（`src/main/server/adminKeyStore.ts:872-880`）。
+若 key 来自 `KIRO_ADMIN_KEY`，运行时轮换会返回 500。服务故意拒绝写 `adminKey` 文件，因为那会制造两个不一致的真源并导致下次启动拒绝（`src/main/server/adminKeyStore.ts:864-880`）。
 
 正确流程：
 
