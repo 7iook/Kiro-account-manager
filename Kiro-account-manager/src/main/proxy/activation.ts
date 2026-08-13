@@ -45,37 +45,14 @@
  */
 import type { AccountPool } from './accountPool'
 import type { ProxyAccount, ProxyConfig } from './types'
+import { isAccountSuspensionError } from '../../shared/accountSuspension'
 
 /** 未分组账号在分组过滤里的哨兵值（与 renderer 侧同一约定） */
 export const UNGROUPED_SENTINEL = '__ungrouped__'
 
-/**
- * 后端侧封禁信号识别 —— 池准入的排除判据（主进程侧唯一真源）。
- *
- * 关键词集合是三份既有实现的并集：`index.ts:2476 isBannedAccountErrorMain`（主进程）、
- * `renderer/components/accounts/_helpers.ts:167 isBannedError`、
- * `webPanel/ui/format.ts:66 isBannedError`（后两份是浏览器侧渲染用，无法被主进程 import）。
- *
- * 判 `lastError` 文本而不是判 `status`：`status` 是显示字段，
- * `persistCheckResult.ts:325` 的失败分支把**网络错误也写成 `'error'`**，
- * 而封禁与否只有 `lastError` 里的上游原文能区分。
- */
+/** 兼容既有调用名；实际规则统一由 shared 的权威分类器给出。 */
 export function isBackendRejectedError(lastError: unknown): boolean {
-  if (typeof lastError !== 'string' || lastError.length === 0) return false
-  const e = lastError.toLowerCase()
-  return (
-    e.includes('accountsuspendedexception') ||
-    e.includes('account suspended') ||
-    e.includes('temporarily_suspended') ||
-    e.includes('temporarily suspended') ||
-    e.includes('permanently_suspended') ||
-    e.includes('account_locked') ||
-    (e.includes('user id is') && e.includes('suspended')) ||
-    e.includes('已封禁') ||
-    // check.ts:601 在上游 userStatus 非 Active/Stale 时写下这条（Suspended / Disabled 等）
-    e.includes('用户状态异常') ||
-    /\b423\b/.test(e)
-  )
+  return isAccountSuspensionError(lastError)
 }
 
 /** 一条被挡在池外的记录 —— 静默缩池是这个缺陷最贵的部分，必须能自证 */

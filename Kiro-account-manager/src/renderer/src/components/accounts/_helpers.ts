@@ -4,6 +4,7 @@
  */
 import type { CSSProperties } from 'react'
 import type { Account } from '@/types/account'
+import { isAccountSuspensionError } from '@shared/accountSuspension'
 
 // ============ 颜色解析 ============
 
@@ -165,18 +166,7 @@ export function formatTokenExpiry(expiresAt: number, isEn: boolean): string {
 // ============ 封禁错误识别 ============
 
 export function isBannedError(error: string | undefined): boolean {
-  if (!error) return false
-  const lower = error.toLowerCase()
-  return (
-    lower.includes('accountsuspendedexception') ||
-    lower.includes('account suspended') ||
-    lower.includes('temporarily_suspended') ||
-    lower.includes('temporarily suspended') ||
-    (lower.includes('user id is') && lower.includes('suspended')) ||
-    lower.includes('账户已封禁') ||
-    lower.includes('已封禁') ||
-    /\b423\b/.test(lower)
-  )
+  return isAccountSuspensionError(error)
 }
 
 // ============ 日期格式化 ============

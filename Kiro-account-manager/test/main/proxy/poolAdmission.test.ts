@@ -54,8 +54,12 @@ describe('池准入：真被后端封禁的号仍然排除（保住原过滤器�
     ['AccountSuspendedException', 'AccountSuspendedException: account is suspended'],
     ['423 Locked', 'HTTP 423 account locked'],
     ['TEMPORARILY_SUSPENDED', '{"reason":"TEMPORARILY_SUSPENDED"}'],
+    ['ACCOUNT_SUSPENDED 持久化信封', '[ACCOUNT_SUSPENDED] Account blocked by upstream'],
+    ['PERMANENTLY_SUSPENDED', '[PERMANENTLY_SUSPENDED] account disabled'],
+    ['ACCOUNT_LOCKED', '[ACCOUNT_LOCKED] account locked'],
     ['temporarily suspended', 'User ID is temporarily suspended'],
     ['中文封禁', '账户已封禁'],
+    ['既有裸中文封禁文案', '已封禁'],
     ['用户状态异常', '用户状态异常: Suspended']
   ])('封禁信号 %s → 排除在池外', (_label, lastError) => {
     const records = {
@@ -63,6 +67,16 @@ describe('池准入：真被后端封禁的号仍然排除（保住原过滤器�
       ok: rec('ok', { status: 'active' })
     }
     expect(buildProxyAccountsFromStore(records).map((a) => a.id)).toEqual(['ok'])
+  })
+
+  it.each([
+    ['载荷大小', 'Payload size: 423 bytes'],
+    ['耗时', 'Upstream request completed in 423 ms']
+  ])('裸 423（%s）没有 locked/suspended 语义 → 不得误判封禁', (_label, lastError) => {
+    const records = {
+      healthy: rec('healthy', { status: 'error', lastError })
+    }
+    expect(buildProxyAccountsFromStore(records).map((a) => a.id)).toEqual(['healthy'])
   })
 
   it('无 accessToken → 仍然排除（半个账号进池只会在首次请求时远端失败）', () => {

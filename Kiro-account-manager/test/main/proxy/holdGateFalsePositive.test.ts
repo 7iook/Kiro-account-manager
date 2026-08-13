@@ -18,6 +18,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Readable } from 'node:stream'
 import type { ProxyAccount } from '@main/proxy/types'
+import { buildProxyAccountsFromStore } from '@main/proxy/activation'
 
 const callKiroApiStreamMock = vi.fn()
 vi.mock('@main/proxy/kiroApi', async (importOriginal) => {
@@ -282,6 +283,49 @@ describe('HoldGate 误伤防护(端到端 · 单账号模式)', () => {
     expect(res.writes.join('')).not.toContain('event: message_start')
 
     server.releaseHeldRequests()
+  })
+
+  it('ACCOUNT_SUSPENDED 运行期锁定 → 模拟重启水合后不得重新入池', async () => {
+    let persistedLastError: string | undefined
+    const server = new ProxyServer(
+      {
+        holdWhenNoAccount: false,
+        enableMultiAccount: false
+      },
+      {
+        onAccountSuspended: ({ reason, message }) => {
+          // 桌面与服务器持久化入口都使用这份既有扁平格式。
+          persistedLastError = `[${reason}] ${message}`
+        }
+      }
+    )
+    const pool = server.getAccountPool()
+    pool.addAccount(mkAccount('SOLO'))
+    mockPreBodyError(
+      'Auth error 403: {"message":"Account blocked by upstream","reason":"ACCOUNT_SUSPENDED"}'
+    )
+
+    await fireClaudeStream(server)
+
+    const runtimeAccount = pool.getAccount('SOLO')
+    expect(runtimeAccount).not.toBeNull()
+    expect(pool.isSuspended(runtimeAccount!)).toBe(true)
+    expect(runtimeAccount?.suspendReason).toBe('ACCOUNT_SUSPENDED')
+    expect(persistedLastError).toBe('[ACCOUNT_SUSPENDED] Account blocked by upstream')
+
+    const restartedPoolAccounts = buildProxyAccountsFromStore({
+      SOLO: {
+        id: 'SOLO',
+        email: 'SOLO@example.com',
+        status: 'error',
+        lastError: persistedLastError,
+        credentials: {
+          accessToken: 'token-SOLO',
+          refreshToken: 'refresh-SOLO'
+        }
+      }
+    })
+    expect(restartedPoolAccounts).toEqual([])
   })
 
   it('✅ 额度耗尽 → 仍然挂起', async () => {

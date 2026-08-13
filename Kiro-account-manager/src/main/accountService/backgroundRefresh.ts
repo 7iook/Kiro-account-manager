@@ -33,6 +33,7 @@ import {
 } from './persistRefreshBatchResults'
 import { syncDesktopAutoSwitchScheduler } from './autoSwitch'
 import type { AccountRuntimeDeps, BatchSummary, UserInfoLike } from './types'
+import { isAccountSuspensionError } from '../../shared/accountSuspension'
 
 /** background-batch-refresh 的入参形状(镜像原 index.ts 的同名类型) */
 export type BackgroundRefreshAccount = {
@@ -350,7 +351,7 @@ export async function backgroundBatchRefresh(
             } catch (apiError) {
               const errMsg = apiError instanceof Error ? apiError.message : String(apiError)
               console.log(`[BackgroundRefresh] Usage API error for ${account.id}:`, errMsg)
-              if (errMsg.includes('AccountSuspendedException') || errMsg.includes('423')) {
+              if (isAccountSuspensionError(errMsg)) {
                 status = 'error'
                 errorMessage = errMsg
               }
@@ -361,7 +362,7 @@ export async function backgroundBatchRefresh(
               userInfoData = await deps.api.getUserInfo(newAccessToken, idp, account.machineId)
             } catch (apiError) {
               const errMsg = apiError instanceof Error ? apiError.message : String(apiError)
-              if (errMsg.includes('AccountSuspendedException') || errMsg.includes('423')) {
+              if (isAccountSuspensionError(errMsg)) {
                 status = 'error'
                 errorMessage = errMsg
               }

@@ -12,6 +12,7 @@ import {
   type KiroProfileForSelect
 } from './profileImportHelpers'
 import { apiKeyImportCodeText } from './apiKeyImportText'
+import { isBannedError } from './_helpers'
 
 interface AddAccountDialogProps {
   isOpen: boolean
@@ -1404,8 +1405,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             results.push({ key: label, status: 'alive', latencyMs: probe.latencyMs ?? ms, credits: probe.usage?.credits })
           } else {
             const err = probe.error || 'unknown'
-            // 推理端错误仍需正则分类(不同层的错误 · state 只覆盖凭据探测层)
-            const isSuspend = /TEMPORARILY_SUSPENDED|AccountSuspended|423 Locked|suspended/i.test(err)
+            // 推理端仍只返回错误文本（state 只覆盖凭据探测层），统一交给共享分类器。
+            const isSuspend = isBannedError(err)
             const isQuota = /402|429|quota|Throttling|rate limit|limit exceeded|MONTHLY_REQUEST_COUNT/i.test(err)
             const isAuth = /401|Unauthorized|Invalid.*token/i.test(err)
             results.push({

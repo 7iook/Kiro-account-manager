@@ -4,7 +4,7 @@ import { Card, CardContent, Badge, Button } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account, AccountTag, AccountGroup } from '@/types/account'
-import { formatUsagePercent } from './_helpers'
+import { formatUsagePercent, isBannedError } from './_helpers'
 import {
   Check,
   RefreshCw,
@@ -373,18 +373,7 @@ export const AccountCard = memo(function AccountCard({
   const isHighUsage = account.usage.percentUsed > 0.8
   const isCritical = account.usage.percentUsed > 1
 
-  // 检测账号是否被封禁/暂停（多种错误格式）
-  const lowerError = account.lastError?.toLowerCase()
-  const isUnauthorized = !!lowerError && (
-    lowerError.includes('accountsuspendedexception') ||
-    lowerError.includes('account suspended') ||
-    lowerError.includes('temporarily_suspended') ||
-    lowerError.includes('temporarily suspended') ||
-    (lowerError.includes('user id is') && lowerError.includes('suspended')) ||
-    lowerError.includes('账户已封禁') ||
-    lowerError.includes('已封禁') ||
-    /\b423\b/.test(lowerError)
-  )
+  const isUnauthorized = isBannedError(account.lastError)
   
   // 封禁详情弹窗状态
   const [showBanDialog, setShowBanDialog] = useState(false)

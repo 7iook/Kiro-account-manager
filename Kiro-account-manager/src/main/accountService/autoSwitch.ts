@@ -13,6 +13,7 @@ import {
   type AccountsBlob
 } from './state'
 import type { AccountLike, AccountRuntimeDeps } from './types'
+import { isAccountSuspensionError } from '../../shared/accountSuspension'
 
 export type AutoSwitchTarget = 'ide' | 'cli' | 'both'
 
@@ -94,25 +95,12 @@ function remainingCredits(account: Record<string, unknown>): number {
 }
 
 /**
- * 自动换号专用的封禁判据。
+ * 自动换号保留既有函数名，封禁语义委托给跨进程共享分类器。
  *
- * 这是从旧 renderer 决策逐字迁入的最小判据；刻意不引用/改写 proxy pool 的
- * isQuotaExhausted。低于用户阈值与长期不可用是两种不同状态，不能互相污染。
- * 429 也刻意不在这里：它是瞬时限流，不是额度或封禁信号。
+ * 额度阈值仍由本模块单独判断；429 是瞬时限流，不属于封禁信号。
  */
 export function isAutoSwitchBannedError(error?: unknown): boolean {
-  if (typeof error !== 'string' || error.length === 0) return false
-  const lowerError = error.toLowerCase()
-  return (
-    lowerError.includes('accountsuspendedexception') ||
-    lowerError.includes('account suspended') ||
-    lowerError.includes('temporarily_suspended') ||
-    lowerError.includes('temporarily suspended') ||
-    (lowerError.includes('user id is') && lowerError.includes('suspended')) ||
-    lowerError.includes('账户已封禁') ||
-    lowerError.includes('已封禁') ||
-    /\b423\b/.test(lowerError)
-  )
+  return isAccountSuspensionError(error)
 }
 
 /**

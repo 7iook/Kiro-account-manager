@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react'
 import { X, Search, Check, User, CreditCard, Zap, Mail, AlertCircle, Ban } from 'lucide-react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Input, Badge } from '../ui'
-import { usagePercentValue } from '../accounts/_helpers'
+import { isBannedError, usagePercentValue } from '../accounts/_helpers'
 import type { Account } from '../../types/account'
 
 interface AccountSelectDialogProps {
@@ -72,32 +72,7 @@ export function AccountSelectDialog({
     return 'bg-gray-500 text-white'
   }
 
-  // 检测是否为封禁账号（通过 lastError 判断）
-  const isBannedAccount = (acc: Account): boolean => {
-    const lowerError = acc.lastError?.toLowerCase()
-    if (!lowerError) return false
-    const hasSuspendedSignal =
-      lowerError.includes('accountsuspendedexception') ||
-      lowerError.includes('account suspended') ||
-      lowerError.includes('temporarily_suspended') ||
-      lowerError.includes('temporarily suspended') ||
-      (lowerError.includes('user id is') && lowerError.includes('suspended')) ||
-      lowerError.includes('账户已封禁') ||
-      lowerError.includes('已封禁') ||
-      /\b423\b/.test(lowerError)
-    if (hasSuspendedSignal) return true
-    if (
-      lowerError.includes('fetch failed') ||
-      lowerError.includes('network') ||
-      lowerError.includes('token expired') ||
-      lowerError.includes('token 过期') ||
-      lowerError.includes('刷新失败') ||
-      lowerError.includes('unauthorizedexception')
-    ) {
-      return false
-    }
-    return false
-  }
+  const isBannedAccount = (acc: Account): boolean => isBannedError(acc.lastError)
 
   const getStatusInfo = (acc: Account): { icon: React.ReactNode; text: string; color: string } | null => {
     // 优先检测封禁状态

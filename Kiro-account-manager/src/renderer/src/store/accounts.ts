@@ -24,6 +24,7 @@ import type {
 import { DEFAULT_PROXY_POOL_CONFIG } from '../types/proxy'
 import { useWebhookStore, type WebhookEvent, type WebhookMessage } from './webhooks'
 import { mergeSyncBlob, type SyncBlob } from './syncMerge'
+import { isAccountSuspensionError } from '@shared/accountSuspension'
 
 // ============================================
 // 账号管理 Store
@@ -656,29 +657,7 @@ async function syncLocalSsoAccountAsync(
 }
 
 export function isBannedAccountError(error?: string): boolean {
-  if (!error) return false
-  const lowerError = error.toLowerCase()
-  const hasSuspendedSignal =
-    lowerError.includes('accountsuspendedexception') ||
-    lowerError.includes('account suspended') ||
-    lowerError.includes('temporarily_suspended') ||
-    lowerError.includes('temporarily suspended') ||
-    (lowerError.includes('user id is') && lowerError.includes('suspended')) ||
-    lowerError.includes('账户已封禁') ||
-    lowerError.includes('已封禁') ||
-    /\b423\b/.test(lowerError)
-  if (hasSuspendedSignal) return true
-  if (
-    lowerError.includes('fetch failed') ||
-    lowerError.includes('network') ||
-    lowerError.includes('token expired') ||
-    lowerError.includes('token 过期') ||
-    lowerError.includes('刷新失败') ||
-    lowerError.includes('unauthorizedexception')
-  ) {
-    return false
-  }
-  return false
+  return isAccountSuspensionError(error)
 }
 
 // 批量测活中止标志：stopLivenessCheck 置 true，worker 循环检测后停止取新账号

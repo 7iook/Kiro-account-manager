@@ -26,6 +26,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
+import { isBannedError } from '../accounts/_helpers'
 
 /**
  * 订阅升级前预检：从一个账号视角判断它是否可参与批量升级
@@ -48,11 +49,7 @@ function checkUpgradeEligibility(account: ReturnType<typeof useAccountsStore.get
     return { eligible: false, reason: 'unknown-status', detail: account.subscription?.title || account.subscription?.type || '未检测' }
   }
 
-  // 封禁检测
-  const lastError = (account.lastError || '').toLowerCase()
-  const isBanned = account.status === 'error' && (
-    lastError.includes('suspended') || lastError.includes('封禁') || lastError.includes('temporarily')
-  )
+  const isBanned = account.status === 'error' && isBannedError(account.lastError)
   if (isBanned) {
     return { eligible: false, reason: 'banned', detail: account.lastError }
   }

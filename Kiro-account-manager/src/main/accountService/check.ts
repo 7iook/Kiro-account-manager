@@ -32,6 +32,7 @@ import type {
   UserInfoLike
 } from './types'
 import { nextObservationVersion } from '../utils/observationClock'
+import { isAccountSuspensionError } from '../../shared/accountSuspension'
 
 /** check-account-status 成功返回的 data 形状(与原 handler 逐字段一致) */
 export interface CheckAccountStatusData {
@@ -288,7 +289,7 @@ async function performAccountStatusCheck(
           .getUserInfo(accessToken, idp, accountMachineId, account?.email)
           .catch((err: Error) => {
             // 封禁错误不能吞掉，必须向上抛出
-            if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
+            if (isAccountSuspensionError(err.message)) {
               throw err
             }
             return undefined
@@ -311,7 +312,7 @@ async function performAccountStatusCheck(
       const errorMsg = apiError instanceof Error ? apiError.message : ''
 
       // 检查是否是明确封禁错误（423 或 AccountSuspendedException）
-      if (errorMsg.includes('AccountSuspendedException') || errorMsg.includes('423')) {
+      if (isAccountSuspensionError(errorMsg)) {
         console.log('[IPC] Account suspended/banned')
         return { success: false, error: { message: errorMsg, isBanned: true } }
       }
@@ -348,7 +349,7 @@ async function performAccountStatusCheck(
           // 用新 token 并行调用 GetUserInfo 和 getUsageAndLimits
           const [userInfoResult, usageResult] = await Promise.all([
             deps.api.getUserInfo(refreshResult.accessToken, idp, accountMachineId).catch((err: Error) => {
-              if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
+              if (isAccountSuspensionError(err.message)) {
                 throw err
               }
               return undefined
@@ -489,7 +490,7 @@ export async function backgroundBatchCheck(
             // getUserInfo 就是该调用的具名封装(index.ts:1762),逐参数等价
             deps.api.getUserInfo(accessToken, idp, undefined, account.email).catch((err: Error) => {
               // 封禁错误不能吞掉，需要在后续逻辑中检测
-              if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
+              if (isAccountSuspensionError(err.message)) {
                 throw err
               }
               return null as unknown as UserInfoLike
@@ -578,7 +579,7 @@ export async function backgroundBatchCheck(
             // API 调用失败（可能是封禁或 Token 过期）
             const errorMsg = usageRes.reason?.message || String(usageRes.reason)
             console.log(`[BackgroundCheck] Usage API failed for ${account.email}:`, errorMsg)
-            if (errorMsg.includes('AccountSuspendedException') || errorMsg.includes('423')) {
+            if (isAccountSuspensionError(errorMsg)) {
               status = 'error'
               errorMessage = errorMsg
             } else if (errorMsg.includes('401') || errorMsg.includes('403')) {
@@ -612,7 +613,7 @@ export async function backgroundBatchCheck(
           } else if (userInfoRes.status === 'rejected') {
             // GetUserInfo 失败（封禁错误会到这里）
             const errMsg = userInfoRes.reason?.message || String(userInfoRes.reason)
-            if (errMsg.includes('423') || errMsg.includes('AccountSuspended')) {
+            if (isAccountSuspensionError(errMsg)) {
               status = 'error'
               errorMessage = errMsg
             }
