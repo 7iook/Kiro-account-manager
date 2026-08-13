@@ -14,7 +14,12 @@ import * as crypto from 'node:crypto'
 import { safeStringEq } from '../utils/netGuard'
 import { PanelSessionStore, ABSOLUTE_TTL_MS } from './session'
 import { LoginThrottle, type ThrottleDecision } from './loginThrottle'
-import { SESSION_COOKIE_NAME, readCookie, buildSessionCookie, buildClearedSessionCookie } from './cookie'
+import {
+  SESSION_COOKIE_NAME,
+  readCookie,
+  buildSessionCookie,
+  buildClearedSessionCookie
+} from './cookie'
 
 /** adminKey 字节数（32B → base64url 43 字符，256 bit 熵） */
 const ADMIN_KEY_BYTES = 32
@@ -59,10 +64,18 @@ export interface LoginResult {
 }
 
 export interface PanelAuthOptions {
-  /** 是否走 TLS —— 决定 cookie 是否带 `Secure` */
+  /** 本进程是否直接终止 TLS（桌面/测试注入）；前置 TLS 代理由每次请求上下文声明 */
   isHttps?: () => boolean
   sessions?: PanelSessionStore
   throttle?: LoginThrottle
+}
+
+export interface PanelAuthRequestSecurity {
+  /**
+   * 请求是否来自已显式信任的 TLS 终止代理。
+   * 该值只能由 HTTP 边界在校验 socket peer 后提供，不能直接来自 forwarded header。
+   */
+  viaTrustedTlsProxy?: boolean
 }
 
 /** 写操作必须携带的自定义头（CSRF 第二道；跨源简单请求无法伪造自定义头） */
@@ -142,7 +155,11 @@ export class PanelAuth {
    *
    * 顺序不可调换：限流必须在比较**之前**，否则攻击者仍能无限次触发比较。
    */
-  login(providedKey: string | undefined, clientIP: string): LoginResult {
+  login(
+    providedKey: string | undefined,
+    clientIP: string,
+    requestSecurity: PanelAuthRequestSecurity = {}
+  ): LoginResult {
     const gate: ThrottleDecision = this.throttle.check(clientIP)
     if (!gate.allowed) {
       return { ok: false, reason: 'RATE_LIMITED', retryAfterMs: gate.retryAfterMs }
@@ -167,7 +184,7 @@ export class PanelAuth {
     return {
       ok: true,
       setCookie: buildSessionCookie(sid, {
-        isHttps: this.isHttps(),
+        isHttps: this.isHttps() || requestSecurity.viaTrustedTlsProxy === true,
         maxAgeSec: ABSOLUTE_TTL_MS / 1000
       })
     }
@@ -203,10 +220,18 @@ export class PanelAuth {
    * 登出：服务端销毁会话 + 返回清除 cookie 头。
    * 服务端销毁是关键 —— 只清浏览器 cookie 的话，已泄漏的 sid 仍然有效。
    */
-  logout(req: GuardedRequest): { setCookie: string; destroyed: boolean } {
+  logout(
+    req: GuardedRequest,
+    requestSecurity: PanelAuthRequestSecurity = {}
+  ): { setCookie: string; destroyed: boolean } {
     const sid = readCookie(req.headers?.cookie, SESSION_COOKIE_NAME)
     const destroyed = this.sessions.destroy(sid)
-    return { setCookie: buildClearedSessionCookie({ isHttps: this.isHttps() }), destroyed }
+    return {
+      setCookie: buildClearedSessionCookie({
+        isHttps: this.isHttps() || requestSecurity.viaTrustedTlsProxy === true
+      }),
+      destroyed
+    }
   }
 }
 

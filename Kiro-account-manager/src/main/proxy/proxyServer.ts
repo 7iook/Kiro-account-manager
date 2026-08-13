@@ -4,7 +4,12 @@ import https from 'https'
 import fs from 'fs'
 import * as path from 'path'
 import { v4 as uuidv4 } from 'uuid'
-import { safeStringEq, isBindingExternal, isIPAllowed } from '../utils/netGuard'
+import {
+  safeStringEq,
+  isBindingExternal,
+  isIPAllowed,
+  resolveClientIP
+} from '../utils/netGuard'
 import type { Socket } from 'net'
 import type {
   OpenAIChatRequest,
@@ -2243,9 +2248,19 @@ export class ProxyServer {
   // CIDR 匹配（ipInCidr / ipv4ToInt / ipv6ToBytes）已随 isIPAllowed 一并抽至
   // `utils/netGuard.ts`；类内已无调用点，故不保留 wrapper。
 
-  /** 取客户端真实 IP（不信任 X-Forwarded-For，仅取 socket address） */
-  private getClientIP(req: http.IncomingMessage): string {
-    return req.socket.remoteAddress || ''
+  /**
+   * 取客户端真实 IP。默认仍完全忽略 X-Forwarded-For；只有 socket peer 命中显式的
+   * trustedTlsProxyIPs 才从右向左解析转发链，缺失/非法链由请求入口 fail closed。
+   */
+  private getClientIP(req: http.IncomingMessage): ReturnType<typeof resolveClientIP> {
+    const trustedTlsProxyIPs = (
+      this.config as ProxyConfig & { trustedTlsProxyIPs?: string[] }
+    ).trustedTlsProxyIPs
+    return resolveClientIP(
+      req.socket.remoteAddress,
+      req.headers['x-forwarded-for'],
+      trustedTlsProxyIPs
+    )
   }
 
   // 记录 API Key 用量
@@ -2370,7 +2385,8 @@ export class ProxyServer {
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const path = req.url || '/'
     const method = req.method || 'GET'
-    const clientIP = this.getClientIP(req)
+    const clientResolution = this.getClientIP(req)
+    const clientIP = clientResolution.ok ? clientResolution.clientIP : clientResolution.peerIP
     const controller = new AbortController()
     const abortRequest = () => {
       if (!this.isStopping && res.writableEnded) return
@@ -2395,6 +2411,20 @@ export class ProxyServer {
 
     try {
       this.setCorsHeaders(res)
+
+      if (!clientResolution.ok) {
+        proxyLogger.warn(
+          'ProxyServer',
+          `Rejected request from trusted TLS proxy ${clientResolution.peerIP}: ${clientResolution.reason}`
+        )
+        this.appendAuditLog('ip_blocked', {
+          ip: clientResolution.peerIP,
+          path,
+          reason: clientResolution.reason
+        })
+        this.sendError(res, 400, 'Bad Request')
+        return
+      }
 
       // P0-4 IP 访问控制（健康检查也走，防止扫描器）
       const ipCheck = this.isClientIPAllowed(clientIP)

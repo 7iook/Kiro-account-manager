@@ -13,6 +13,7 @@
 // 本文件内所有函数必须保持纯：不读全局状态、不读 config 单例、不产生副作用。
 // 一旦某个函数需要「知道自己服务于谁」，那它就是策略，不属于这里。
 import crypto from 'node:crypto'
+import { isIP } from 'node:net'
 
 /** IP 准入策略：调用方各自持有一份，本模块不关心它从哪来 */
 export interface IPAccessPolicy {
@@ -29,6 +30,114 @@ export interface IPAccessResult {
 }
 
 /**
+ * 从 socket peer 与 X-Forwarded-For 得出的客户端地址。
+ *
+ * `viaTrustedTlsProxy=true` 同时表达两个由同一显式声明授权的事实：
+ * ① 可以使用该 peer 写入的转发链；② 浏览器面对的是 TLS，session cookie 必须带 Secure。
+ */
+export type ClientIPResolution =
+  | {
+      ok: true
+      clientIP: string
+      peerIP: string
+      viaTrustedTlsProxy: boolean
+    }
+  | {
+      ok: false
+      peerIP: string
+      viaTrustedTlsProxy: boolean
+      reason: string
+    }
+
+const MAX_FORWARDED_HOPS = 32
+
+/** 归一化 Node 常见的 IPv4-mapped IPv6 socket 地址。 */
+export function normalizeIPAddress(address: string | undefined): string {
+  const value = (address ?? '').trim()
+  if (value.toLowerCase().startsWith('::ffff:')) {
+    const mapped = value.slice('::ffff:'.length)
+    if (isIP(mapped) === 4) return mapped
+  }
+  return value
+}
+
+/** 配置边界用的严格校验：只接受 IP 或带合法前缀长度的 CIDR。 */
+export function isValidIPOrCidr(value: string): boolean {
+  const entry = value.trim()
+  const slash = entry.indexOf('/')
+  if (slash < 0) return isIP(normalizeIPAddress(entry)) !== 0
+  if (slash !== entry.lastIndexOf('/')) return false
+
+  const address = normalizeIPAddress(entry.slice(0, slash))
+  const bitsText = entry.slice(slash + 1)
+  if (!/^\d+$/.test(bitsText)) return false
+  const family = isIP(address)
+  if (family === 0) return false
+  const bits = Number(bitsText)
+  return Number.isInteger(bits) && bits >= 0 && bits <= (family === 4 ? 32 : 128)
+}
+
+function addressMatchesList(address: string, entries: readonly string[]): boolean {
+  const normalized = normalizeIPAddress(address)
+  if (!normalized || isIP(normalized) === 0) return false
+  return entries.some((raw) => {
+    const entry = raw.trim()
+    if (!isValidIPOrCidr(entry)) return false
+    return entry.includes('/')
+      ? ipInCidr(normalized, entry)
+      : ipInCidr(normalized, `${normalizeIPAddress(entry)}/${isIP(normalized) === 4 ? 32 : 128}`)
+  })
+}
+
+/**
+ * 解析受信代理转发的客户端地址。
+ *
+ * 默认完全忽略 X-Forwarded-For。只有 socket peer 命中显式的 trustedTlsProxyIPs
+ * 才读取转发链；随后从右向左剥离已知代理，停在第一个不受信 hop，避免取最左值时
+ * 被客户端预置的伪造内容骗过。受信 peer 缺失/发送非法链时 fail closed。
+ */
+export function resolveClientIP(
+  remoteAddress: string | undefined,
+  forwardedFor: string | string[] | undefined,
+  trustedTlsProxyIPs: readonly string[] | undefined
+): ClientIPResolution {
+  const peerIP = normalizeIPAddress(remoteAddress)
+  const trusted = (trustedTlsProxyIPs ?? []).map((entry) => entry.trim()).filter(Boolean)
+  const viaTrustedTlsProxy = addressMatchesList(peerIP, trusted)
+
+  // 未显式信任当前 socket peer：头即使存在也不参与任何安全判定。
+  if (!viaTrustedTlsProxy) {
+    return { ok: true, clientIP: peerIP, peerIP, viaTrustedTlsProxy: false }
+  }
+
+  const raw = Array.isArray(forwardedFor) ? forwardedFor.join(',') : (forwardedFor ?? '')
+  if (raw.trim() === '') {
+    return {
+      ok: false,
+      peerIP,
+      viaTrustedTlsProxy: true,
+      reason: 'trusted TLS proxy did not provide X-Forwarded-For'
+    }
+  }
+  const hops = raw.split(',').map((part) => normalizeIPAddress(part))
+  if (hops.length > MAX_FORWARDED_HOPS || hops.some((hop) => isIP(hop) === 0)) {
+    return {
+      ok: false,
+      peerIP,
+      viaTrustedTlsProxy: true,
+      reason: 'trusted TLS proxy provided an invalid X-Forwarded-For chain'
+    }
+  }
+
+  let clientIP = peerIP
+  for (let index = hops.length - 1; index >= 0; index--) {
+    if (!addressMatchesList(clientIP, trusted)) break
+    clientIP = hops[index]
+  }
+  return { ok: true, clientIP, peerIP, viaTrustedTlsProxy: true }
+}
+
+/**
  * 常数时间字符串比较（防时序攻击）
  * 长度不同时返回 false 但仍走一次 timingSafeEqual 防止旁路
  *
@@ -42,7 +151,11 @@ export function safeStringEq(a: string, b: string): boolean {
   const bb = Buffer.from(b, 'utf8')
   if (ab.length !== bb.length) {
     // 仍执行一次比较保证常数时间（用 a 自身比，结果不影响）
-    try { crypto.timingSafeEqual(ab, ab) } catch { /* ignore */ }
+    try {
+      crypto.timingSafeEqual(ab, ab)
+    } catch {
+      /* ignore */
+    }
     return false
   }
   try {
@@ -63,8 +176,11 @@ export function safeStringEq(a: string, b: string): boolean {
 export function isBindingExternal(host?: string): boolean {
   if (!host) return false
   const h = host.toLowerCase().trim()
-  return h === '0.0.0.0' || h === '::' || h === '*' || (
-    h !== '127.0.0.1' && h !== '::1' && h !== 'localhost'
+  return (
+    h === '0.0.0.0' ||
+    h === '::' ||
+    h === '*' ||
+    (h !== '127.0.0.1' && h !== '::1' && h !== 'localhost')
   )
 }
 
@@ -105,8 +221,8 @@ export function ipInCidr(ip: string, cidr: string): boolean {
 
 /** IPv4 点分十进制 → 无符号 32 位整数；非法输入返回 -1 */
 export function ipv4ToInt(ip: string): number {
-  const parts = ip.split('.').map(p => parseInt(p, 10))
-  if (parts.length !== 4 || parts.some(p => !Number.isFinite(p) || p < 0 || p > 255)) return -1
+  const parts = ip.split('.').map((p) => parseInt(p, 10))
+  if (parts.length !== 4 || parts.some((p) => !Number.isFinite(p) || p < 0 || p > 255)) return -1
   return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
 }
 

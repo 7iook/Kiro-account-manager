@@ -26,7 +26,9 @@ export const PANEL_PATH_PREFIX = '/panel'
  * 构造 `Set-Cookie` 头值。
  *
  * @param sid 会话 id（base64url，无需 encodeURIComponent）
- * @param opts.isHttps 走 TLS 时追加 `Secure`（HTTP 下加 `Secure` 会让 cookie 直接失效）
+ * @param opts.isHttps 浏览器到服务边界走 TLS 时追加 `Secure`。既包括本进程直接终止 TLS，
+ *   也包括请求来自已校验 socket peer 的显式受信 TLS 代理；普通 HTTP 仍必须为 false，
+ *   否则 cookie 会直接失效
  * @param opts.maxAgeSec cookie 存活秒数，应与会话绝对过期一致
  */
 export function buildSessionCookie(

@@ -6,6 +6,7 @@
  * 传输层才暴露的问题(决策卡 §3:`Path=/panel` 与路由前缀不一致 → 静默 401)。
  */
 import { describe, it, expect, afterEach } from 'vitest'
+import http from 'node:http'
 import { networkInterfaces } from 'node:os'
 import { WebPanelServer, type WebPanelConfig } from '../../../src/main/webPanel/server'
 import { PanelAuth, type AdminKeyStore } from '../../../src/main/webPanel/auth'
@@ -83,6 +84,7 @@ function stubRouteDeps(overrides: Partial<PanelRouteDeps> = {}): PanelRouteDeps 
 }
 
 const servers: WebPanelServer[] = []
+const frontServers: http.Server[] = []
 
 function makeServer(
   config: Partial<WebPanelConfig> = {},
@@ -105,6 +107,11 @@ function makeServer(
 }
 
 afterEach(async () => {
+  while (frontServers.length) {
+    const front = frontServers.pop()
+    front?.closeAllConnections?.()
+    await new Promise<void>((resolve) => front?.close(() => resolve()) ?? resolve())
+  }
   while (servers.length) {
     const s = servers.pop()
     await s?.stop().catch(() => undefined)
@@ -126,6 +133,44 @@ async function login(server: WebPanelServer, key = ADMIN_KEY): Promise<string> {
   const setCookie = res.headers.get('set-cookie')
   if (!res.ok || !setCookie) throw new Error(`login failed: ${res.status}`)
   return setCookie.split(';')[0]
+}
+
+/**
+ * 模拟 TLS 终止后的 HTTP 代理 hop。测试不伪造后端 socket：请求先进入一个真实
+ * http.Server，再由它连接面板，因此面板实际看到的 peer 确实是 127.0.0.1。
+ */
+async function startFrontProxy(server: WebPanelServer, clientIP: string): Promise<string> {
+  const backend = server.getListeningAddress()
+  if (!backend) throw new Error('backend not listening')
+
+  const front = http.createServer((incoming, outgoing) => {
+    const upstream = http.request(
+      {
+        host: '127.0.0.1',
+        port: backend.port,
+        method: incoming.method,
+        path: incoming.url,
+        headers: { ...incoming.headers, 'x-forwarded-for': clientIP }
+      },
+      (response) => {
+        outgoing.writeHead(response.statusCode ?? 502, response.headers)
+        response.pipe(outgoing)
+      }
+    )
+    upstream.on('error', (error) => outgoing.destroy(error))
+    incoming.pipe(upstream)
+  })
+  frontServers.push(front)
+  await new Promise<void>((resolve, reject) => {
+    front.once('error', reject)
+    front.listen(0, '127.0.0.1', () => {
+      front.removeListener('error', reject)
+      resolve()
+    })
+  })
+  const address = front.address()
+  if (!address || typeof address === 'string') throw new Error('front proxy not listening')
+  return `http://127.0.0.1:${address.port}`
 }
 
 describe('WebPanelServer · 外网绑定护栏(安全红线)', () => {
@@ -218,6 +263,54 @@ describe('WebPanelServer · 鉴权闸门', () => {
     expect(setCookie).toContain(SESSION_COOKIE_NAME)
     expect(setCookie).toContain('HttpOnly')
     expect(setCookie).toContain('SameSite=Strict')
+  })
+
+  it('经显式受信的 TLS 前置代理登录 → 会话 cookie 带 Secure', async () => {
+    const { server } = makeServer({
+      trustedTlsProxyIPs: ['127.0.0.1']
+    } as Partial<WebPanelConfig>)
+    await server.start()
+    const front = await startFrontProxy(server, '203.0.113.42')
+
+    const res = await fetch(`${front}${PANEL_PATH_PREFIX}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Panel-Request': '1' },
+      body: JSON.stringify({ adminKey: ADMIN_KEY })
+    })
+
+    expect(res.status).toBe(200)
+    const setCookie = res.headers.get('set-cookie') ?? ''
+    expect(setCookie).toContain('Secure')
+
+    const logout = await fetch(`${front}${PANEL_PATH_PREFIX}/api/logout`, {
+      method: 'POST',
+      headers: {
+        cookie: setCookie.split(';')[0],
+        'X-Panel-Request': '1'
+      }
+    })
+    expect(logout.status).toBe(200)
+    expect(logout.headers.get('set-cookie')).toContain('Secure')
+    expect(logout.headers.get('set-cookie')).toContain('Max-Age=0')
+  })
+
+  it('未 opt-in 时伪造 X-Forwarded-For/Proto 不能令 cookie 获得 Secure', async () => {
+    const { server } = makeServer()
+    await server.start()
+
+    const res = await fetch(`${base(server)}/api/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Panel-Request': '1',
+        'X-Forwarded-For': '203.0.113.42',
+        'X-Forwarded-Proto': 'https'
+      },
+      body: JSON.stringify({ adminKey: ADMIN_KEY })
+    })
+
+    expect(res.status).toBe(200)
+    expect(res.headers.get('set-cookie')).not.toContain('Secure')
   })
 
   it('adminKey 轮换后旧会话立即失效', async () => {
@@ -343,6 +436,23 @@ describe('WebPanelServer · IP 门禁与生命周期', () => {
     expect(res.status).toBe(403)
   })
 
+  it('经受信代理转发时按真实客户端 IP 应用 allowedIPs', async () => {
+    const { server } = makeServer({
+      trustedTlsProxyIPs: ['127.0.0.1'],
+      allowedIPs: ['203.0.113.42']
+    } as Partial<WebPanelConfig>)
+    await server.start()
+    const front = await startFrontProxy(server, '203.0.113.42')
+
+    const res = await fetch(`${front}${PANEL_PATH_PREFIX}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Panel-Request': '1' },
+      body: JSON.stringify({ adminKey: ADMIN_KEY })
+    })
+
+    expect(res.status).toBe(200)
+  })
+
   it('开→关→再开一轮:端口正确释放并重新监听(决策卡 §5 生命周期)', async () => {
     const { server } = makeServer()
     await server.start()
@@ -402,9 +512,7 @@ describe('WebPanelServer · 局域网可达性由 host 决定(受控对照)', ()
         const ip = e.address
         if (ip.startsWith('169.254.')) continue
         const isPrivate =
-          ip.startsWith('192.168.') ||
-          ip.startsWith('10.') ||
-          /^172\.(1[6-9]|2\d|3[01])\./.test(ip)
+          ip.startsWith('192.168.') || ip.startsWith('10.') || /^172\.(1[6-9]|2\d|3[01])\./.test(ip)
         if (isPrivate) return ip
       }
     }

@@ -46,6 +46,7 @@ import {
   ACCOUNT_STORE_ENCRYPTION_KEY
 } from '../persistence/accountStorePort'
 import { readFileSync } from 'node:fs'
+import { isValidIPOrCidr } from '../utils/netGuard'
 
 /** 退出码（BSD sysexits 惯例，见文件头「退出码」节） */
 export const EXIT = {
@@ -70,6 +71,11 @@ export const ENV = {
   PANEL_HOST: 'KIRO_PANEL_HOST',
   /** 面板监听端口覆盖（默认取盘上 webPanelConfig.port） */
   PANEL_PORT: 'KIRO_PANEL_PORT',
+  /**
+   * 显式声明会终止 TLS、并覆盖 X-Forwarded-For 的受信代理 socket 地址。
+   * 未设置 = 不信任任何 forwarded header（升级与桌面默认行为不变）。
+   */
+  TRUSTED_TLS_PROXY_IPS: 'KIRO_TRUSTED_TLS_PROXY_IPS',
   /**
    * 日志截断开关。桌面端是 `setLogTruncationEnabled(app.isPackaged)`（`index.ts:3191`），
    * 即「打包态截断、开发态全量」。服务端没有 `isPackaged` 这个概念，故默认**开启截断**
@@ -112,6 +118,11 @@ export interface ServerConfig {
   panelPort?: number
   /** 是否截断日志（true = 截断，同桌面打包态） */
   truncateLogs: boolean
+  /**
+   * 受信 TLS 代理的精确 IP/CIDR。该声明同时授权读取其 X-Forwarded-For，
+   * 并要求经它签发的面板 session cookie 带 Secure。
+   */
+  trustedTlsProxyIPs: string[]
 }
 
 /**
@@ -143,7 +154,8 @@ export function readServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
 
   const config: ServerConfig = {
     dataDir: rawDataDir,
-    truncateLogs: !isTruthyFlag(env[ENV.LOG_FULL])
+    truncateLogs: !isTruthyFlag(env[ENV.LOG_FULL]),
+    trustedTlsProxyIPs: parseTrustedTlsProxyIPs(env[ENV.TRUSTED_TLS_PROXY_IPS])
   }
 
   const rawHost = (env[ENV.PANEL_HOST] ?? '').trim()
@@ -153,6 +165,22 @@ export function readServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   if (rawPort) config.panelPort = parsePort(rawPort, ENV.PANEL_PORT)
 
   return config
+}
+
+function parseTrustedTlsProxyIPs(raw: string | undefined): string[] {
+  if (raw === undefined || raw.trim() === '') return []
+
+  const entries = raw.split(',').map((entry) => entry.trim())
+  const invalid = entries.find((entry) => !entry || !isValidIPOrCidr(entry))
+  if (invalid !== undefined) {
+    throw new ServerConfigError(
+      `环境变量 ${ENV.TRUSTED_TLS_PROXY_IPS} 含非法地址 ${JSON.stringify(invalid)}。` +
+        `只接受逗号分隔的 IP 或 CIDR；必须填写后端 socket 实际看到的代理源地址，` +
+        `不能填写域名或客户端网段。`,
+      EXIT.USAGE
+    )
+  }
+  return [...new Set(entries)]
 }
 
 /**

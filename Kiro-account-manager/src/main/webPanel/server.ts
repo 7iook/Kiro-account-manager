@@ -19,7 +19,12 @@
  */
 import http from 'node:http'
 import type { Socket } from 'node:net'
-import { isBindingExternal, isIPAllowed, type IPAccessPolicy } from '../utils/netGuard'
+import {
+  isBindingExternal,
+  isIPAllowed,
+  resolveClientIP,
+  type IPAccessPolicy
+} from '../utils/netGuard'
 import { PANEL_PATH_PREFIX } from './cookie'
 import { sendJson, sendError } from './respond'
 import { serveStaticAsset } from './staticAssets'
@@ -52,6 +57,11 @@ export interface WebPanelConfig {
   autoStart?: boolean
   allowedIPs?: string[]
   deniedIPs?: string[]
+  /**
+   * 显式声明的 TLS 终止代理 socket 地址。只有 peer 命中时才读取 X-Forwarded-For，
+   * 且该请求签发/清除的 session cookie 会带 Secure。
+   */
+  trustedTlsProxyIPs?: string[]
   /**
    * 外网绑定且无 adminKey 时的逃生门。默认 `undefined` = 关闭。
    * 与代理侧 `allowExternalWithoutApiKey` 同一语义（NOT RECOMMENDED）。
@@ -162,9 +172,7 @@ export class WebPanelServer {
         // 监听失败时不能留下半初始化的 server 引用，否则 isRunning() 会骗人
         this.server = null
         const err =
-          error.code === 'EADDRINUSE'
-            ? new Error(`Port ${config.port} is already in use`)
-            : error
+          error.code === 'EADDRINUSE' ? new Error(`Port ${config.port} is already in use`) : error
         console.error('[WebPanel] Server error:', err.message)
         this.onError?.(err)
         reject(err)
@@ -257,8 +265,24 @@ export class WebPanelServer {
    */
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     try {
-      const clientIP = normalizeClientIP(req.socket.remoteAddress)
       const config = this.getConfig()
+      const resolvedClient = resolveClientIP(
+        req.socket.remoteAddress,
+        req.headers['x-forwarded-for'],
+        config.trustedTlsProxyIPs
+      )
+      if (!resolvedClient.ok) {
+        console.error(
+          `[WebPanel] [Security] Rejected request from trusted TLS proxy ${resolvedClient.peerIP}: ` +
+            resolvedClient.reason
+        )
+        sendError(res, 400, 'INVALID_CREDENTIAL', 'Invalid proxy forwarding metadata')
+        return
+      }
+      const clientIP = resolvedClient.clientIP
+      const requestSecurity = {
+        viaTrustedTlsProxy: resolvedClient.viaTrustedTlsProxy
+      }
 
       // ===== IP 门禁（复用代理侧同一实现）=====
       const policy: IPAccessPolicy = {
@@ -324,7 +348,7 @@ export class WebPanelServer {
         const body = await this.readJsonBody(req, res)
         if (body === undefined) return
         const provided = typeof body?.adminKey === 'string' ? body.adminKey : undefined
-        const result = this.auth.login(provided, clientIP)
+        const result = this.auth.login(provided, clientIP, requestSecurity)
         if (result.ok && result.setCookie) {
           res.setHeader('Set-Cookie', result.setCookie)
           sendJson(res, 200, { ok: true })
@@ -354,7 +378,7 @@ export class WebPanelServer {
 
       // ===== 登出（需要有效会话才有意义）=====
       if (path === '/api/logout' && method === 'POST') {
-        const { setCookie } = this.auth.logout(req)
+        const { setCookie } = this.auth.logout(req, requestSecurity)
         res.setHeader('Set-Cookie', setCookie)
         sendJson(res, 200, { ok: true })
         return
@@ -372,7 +396,7 @@ export class WebPanelServer {
         // 写盘失败会抛到统一 500 出口，旧密钥与旧会话继续有效，不会把运维锁在门外。
         const next = this.auth.rotateAdminKey()
         // 当前会话也已失效；同时清浏览器 cookie，避免客户端继续携带一个确定无效的 sid。
-        const { setCookie } = this.auth.logout(req)
+        const { setCookie } = this.auth.logout(req, requestSecurity)
         res.setHeader('Set-Cookie', setCookie)
         res.setHeader('Cache-Control', 'no-store')
         // 不叫 `adminKey`：sendJson 的安全兜底会按敏感键名遮盖它。`key` 是这个
@@ -469,15 +493,6 @@ export class WebPanelServer {
   ): void {
     console.warn(`[WebPanel] Denied ${method} ${path} from ${clientIP} (${reason ?? 'UNKNOWN'})`)
   }
-}
-
-/**
- * 归一化客户端 IP：Node 对 IPv4 连接可能给出 IPv4-mapped IPv6 形式（`::ffff:127.0.0.1`），
- * 直接拿去比 CIDR 会全部落空 —— 是 IP 白名单最常见的静默失效原因。
- */
-function normalizeClientIP(remote: string | undefined): string {
-  if (!remote) return ''
-  return remote.startsWith('::ffff:') ? remote.slice('::ffff:'.length) : remote
 }
 
 /** 取单值头（Node 对重复头会给数组；`if-none-match` 理论上可重复出现） */
