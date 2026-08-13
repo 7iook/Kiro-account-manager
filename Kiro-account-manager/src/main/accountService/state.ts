@@ -79,6 +79,22 @@ export function setStoreRef(s: StoreRef): void {
   storeRef = s
 }
 
+/**
+ * main 侧后台调度器读取账号盘面。
+ *
+ * 返回 store 当前值而非缓存：自动换号必须看见 renderer / 手机面板刚写入的阈值与账号。
+ * 未装配时抛错，与写入收口一致地把启动顺序错误暴露出来。
+ */
+export function getAccountDataSnapshot(): AccountsBlob | null {
+  if (!storeRef) {
+    throw new Error(
+      '[accountService/state] store not initialized. ' +
+        'Call setStoreRef(store) after initStore() completes.'
+    )
+  }
+  return (storeRef.get('accountData') as AccountsBlob | null | undefined) ?? null
+}
+
 /** 供 index.ts 收口后同步 lastSavedData 使用（避免 state.ts 反向依赖 index.ts）。 */
 let lastSavedDataSetter: ((data: unknown) => void) | null = null
 

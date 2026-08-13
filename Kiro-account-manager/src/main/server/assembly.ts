@@ -53,10 +53,17 @@ import { createConfAccountStore } from '../persistence/accountStore.conf'
 import type { AccountStorePort } from '../persistence/accountStorePort'
 import {
   applyAccountDataMutation,
+  getAccountDataSnapshot,
   setBroadcaster,
   setLastSavedDataSetter,
   setStoreRef
 } from '../accountService/state'
+import {
+  createAutoSwitchScheduler,
+  getCurrentAutoSwitchDecision,
+  persistAutoSwitchDecision,
+  type AutoSwitchDecision
+} from '../accountService/autoSwitch'
 import { loadAccounts } from '../accountService/accounts'
 import { checkAccountStatus } from '../accountService/check'
 import { refreshAccountToken } from '../accountService/refresh'
@@ -84,10 +91,16 @@ import {
 } from '../proxy/activation'
 import { ProxyServer } from '../proxy/proxyServer'
 import type { ProxyConfig, ProxySessionRecord } from '../proxy/types'
-import { setLogTruncationEnabled } from '../proxy/logger'
+import { proxyLogStore, setLogTruncationEnabled } from '../proxy/logger'
 import { initKProxyService } from '../kproxy/index'
 import { generateDeviceId } from '../kproxy/index'
-import { fetchKiroModels, fetchAvailableSubscriptions, fetchSubscriptionToken, setUserPreference, fetchEnterpriseProfileArn } from '../proxy/kiroApi'
+import {
+  fetchKiroModels,
+  fetchAvailableSubscriptions,
+  fetchSubscriptionToken,
+  setUserPreference,
+  fetchEnterpriseProfileArn
+} from '../proxy/kiroApi'
 import {
   readKiroAuthTokenFile,
   writeKiroAuthTokenFile,
@@ -297,8 +310,13 @@ const DEFAULT_PROXY_CONFIG: ProxyConfig = {
   tokenBufferReserve: 20000
 }
 
+/** 服务端壳已执行到哪个决定；与决定信封分键，形成可重放的 outbox 确认。 */
+const AUTO_SWITCH_APPLIED_DECISION_KEY = 'autoSwitchAppliedDecisionId'
+
 /**
- * 组装一台服务端。**不启动任何东西** —— 启动顺序与失败处置属 `entry.ts`。
+ * 组装一台服务端。控制面与数据面仍不在这里启动 —— 启动顺序与失败处置属 `entry.ts`。
+ * 唯一例外是无监听端口、timer 已 unref 的账号自动换号调度器：它属于 accountService
+ * 的后台业务生命周期，必须与 store 同生，并由本对象的 shutdown 先停止。
  *
  * 拆成「组装」与「启动」两步的理由：组装可以在测试里完整跑一遍并断言契约
  * （面板拿到的是哪个 auth、反代配置合并对不对、deps 有没有装齐），而不需要
@@ -319,6 +337,12 @@ export function assembleServer(options: AssembleOptions): AssembledServer {
   // 这里再过一次是构造函数自己的守卫（它是零 caller 的服务端端口，不该依赖调用者记得先验）。
   const store = createConfAccountStore({ dataDir: config.dataDir })
 
+  // 代理请求日志与账号 store 共用服务端明确配置的数据目录。initialize(userDataPath)
+  // 是 logger 内核已有的运行时路径端口；这里传 dataDir，不从共享内核反向读取 Electron。
+  // 放在 store 前置校验成功之后、任何 ProxyServer 构造之前，避免拒启路径留下日志文件，
+  // 同时保证第一条代理日志已经有确定落点。
+  proxyLogStore.initialize(config.dataDir)
+
   // accountData 写入收口注入。**必须在任何业务函数被调用之前** ——
   // `applyAccountDataMutation` 在未注入时抛错（刻意不静默 no-op）。
   setStoreRef(store)
@@ -330,17 +354,24 @@ export function assembleServer(options: AssembleOptions): AssembledServer {
     lastSavedData = data
   })
 
-  // 广播：桌面是 `BrowserWindow.getAllWindows()` 逐个 send。服务端**显式 no-op**，
-  // 并在此注明「桌面专属」—— 决策卡点名反对笼统的「无操作」实现（孤儿产出）。
+  // 广播：桌面是 `BrowserWindow.getAllWindows()` 逐个 send。服务端没有 renderer，
+  // 但账号/设置写入要唤醒 main 侧自动换号调度器；面板本身仍通过 HTTP 轮询。
   // 面板不需要推送：它通过 HTTP 轮询 `loadAccountsBlob` 拿最新数据（附录 B 已核实
-  // 面板前端只 setInterval 轮询）。故这里不是「还没做」，是「确实没有消费者」。
+  // 面板前端只 setInterval 轮询）。wake 在调度器 in-flight 时会忽略，故它自己的
+  // 刷新/决定落盘广播不会造成重入循环。
+  let wakeAutoSwitchScheduler = (): void => {}
   setBroadcaster(() => {
-    /* 桌面专属：服务端无 renderer 窗口可广播，面板走 HTTP 轮询 */
+    wakeAutoSwitchScheduler()
   })
 
-  const storeDeps = buildStoreDeps(store, config, () => lastSavedData, (d) => {
-    lastSavedData = d
-  })
+  const storeDeps = buildStoreDeps(
+    store,
+    config,
+    () => lastSavedData,
+    (d) => {
+      lastSavedData = d
+    }
+  )
 
   // ===== K-Proxy =====
   // 加载但**不 start()**。已核实的两条理由：
@@ -348,7 +379,11 @@ export function assembleServer(options: AssembleOptions): AssembledServer {
   //      （`proxy/proxyServer.ts:1842`），所以映射表不需要桌面的 IPC 也能工作；
   //   ② 服务器上没有本地 Kiro IDE，MITM 拦截没有消费方。
   // 装 service 实例的意义是让反代读得到那张表；start() 会去监听一个没人连的端口。
-  initKProxyService((store.get('kproxyConfig') as Record<string, unknown>) ?? {}, {}, config.dataDir)
+  initKProxyService(
+    (store.get('kproxyConfig') as Record<string, unknown>) ?? {},
+    {},
+    config.dataDir
+  )
 
   // ===== 反代 =====
   // orphan 回收必须在**任何新会话开始写 orphan 之前**（即反代构造之前）——
@@ -360,8 +395,14 @@ export function assembleServer(options: AssembleOptions): AssembledServer {
   const initProxyServer = (): ProxyServer => {
     if (proxyServer) return proxyServer
     proxyServer = new ProxyServer(
-      readProxyConfig(store),
-      buildProxyEvents(store, accountApi, options.persistence, debouncedStoreSet, () => proxyServer),
+      readProxyRuntimeConfig(store, config),
+      buildProxyEvents(
+        store,
+        accountApi,
+        options.persistence,
+        debouncedStoreSet,
+        () => proxyServer
+      ),
       // 自签证书落盘目录（K-2）：装配层注入，内核不自己 require('electron')
       config.dataDir
     )
@@ -371,6 +412,34 @@ export function assembleServer(options: AssembleOptions): AssembledServer {
   // ===== 面板 =====
   const auth = new PanelAuth(adminKeyStore)
   const runtimeDeps = buildRuntimeDeps(accountApi, () => proxyServer)
+
+  // ===== 自动换号 =====
+  // 两种壳共享同一个 accountService 决策/单飞/timer；这里只注入「服务端如何推进反代」。
+  // per-API-key 的账号授权仍由 ProxyServer.getAvailableAccount 的 isAllowed 二次过滤，
+  // 此处只更新全局偏好/指针，不直接替任何 API key 选号，因而不会越过绑定边界。
+  const autoSwitchScheduler = createAutoSwitchScheduler({
+    readAccountData: getAccountDataSnapshot,
+    refreshActiveAccount: async (account) => {
+      await checkAccountStatus(runtimeDeps, account as never)
+    },
+    applySwitch: async (decision: AutoSwitchDecision) =>
+      applyServerAutoSwitchDecision(store, proxyServer, decision),
+    commitDecision: persistAutoSwitchDecision
+  })
+  wakeAutoSwitchScheduler = () => autoSwitchScheduler.wake()
+
+  // accountData 决定与 proxyConfig 是两个持久化键，进程可能恰好死在“决定已提交、
+  // 壳副作用未执行”之间。启动时只重放仍与 activeAccountId 一致的最新信封；
+  // 用户后来手动换号会使其失效，绝不会被旧决定覆盖。
+  const persistedDecision = getCurrentAutoSwitchDecision(
+    getAccountDataSnapshot(),
+    store.get(AUTO_SWITCH_APPLIED_DECISION_KEY)
+  )
+  if (persistedDecision) {
+    applyServerAutoSwitchDecision(store, proxyServer, persistedDecision)
+  }
+  autoSwitchScheduler.start()
+
   const panel = new WebPanelServer({
     auth,
     routeDeps: buildServerRouteDeps({
@@ -382,7 +451,10 @@ export function assembleServer(options: AssembleOptions): AssembledServer {
     }),
     getConfig: () => readPanelConfig(store, config),
     onStatusChange: (running, port) => {
-      if (running) console.log(`[server] 面板已启动: http://${readPanelConfig(store, config).host}:${port}/panel`)
+      if (running)
+        console.log(
+          `[server] 面板已启动: http://${readPanelConfig(store, config).host}:${port}/panel`
+        )
     },
     onError: (error) => {
       console.error('[server] 面板错误:', error.message)
@@ -408,6 +480,8 @@ export function assembleServer(options: AssembleOptions): AssembledServer {
         })
       }
 
+      // 先清 timer 并等待在途额度检查/决定写完，随后 persistence.drain 才有固定终点。
+      await autoSwitchScheduler.stop()
       await options.persistence?.drain().catch((e) => {
         console.error('[server] 等待账号持久化队列失败，部分凭据可能尚未落盘:', e)
       })
@@ -416,6 +490,13 @@ export function assembleServer(options: AssembleOptions): AssembledServer {
 
       // `panel.stop()` 内部已停会话清扫；再显式停一次覆盖「面板从未启动但 sweeper 已起」
       auth.sessionStore.stopSweeping()
+
+      // 所有请求入口、后台决定与会话清扫都已静止后再刷日志：这样既收进停机阶段的
+      // 最后一批日志，也不会在 flush 后又被 timer 排出一批。数据目录锁会等 shutdown
+      // 整体 settle 后才释放，因此这次最终写盘仍处于单实例保护内。
+      await proxyLogStore.flushSaveNow().catch((e) => {
+        console.error('[server] 强制落盘代理日志失败:', e)
+      })
     }
   }
 }
@@ -474,6 +555,9 @@ export function readPanelConfig(
 
   if (serverConfig.panelHost !== undefined) merged.host = serverConfig.panelHost
   if (serverConfig.panelPort !== undefined) merged.port = serverConfig.panelPort
+  // 部署信任只能来自环境配置，盘上/UI 值不得开启。复制数组，避免 consumer 原地修改
+  // ServerConfig 后影响另一个 consumer。
+  merged.trustedTlsProxyIPs = [...(serverConfig.trustedTlsProxyIPs ?? [])]
   return merged
 }
 
@@ -493,13 +577,90 @@ export function readPanelConfig(
  * `applyProxyRuntimeConfig`。
  */
 export function readProxyConfig(store: Pick<AccountStorePort, 'get'>): ProxyConfig {
-  const saved = store.get('proxyConfig') as Partial<ProxyConfig> | undefined
-  return saved ? { ...DEFAULT_PROXY_CONFIG, ...saved } : { ...DEFAULT_PROXY_CONFIG }
+  const saved = store.get('proxyConfig') as Partial<ProxyRuntimeConfig> | undefined
+  const merged = saved ? { ...DEFAULT_PROXY_CONFIG, ...saved } : { ...DEFAULT_PROXY_CONFIG }
+  // trustedTlsProxyIPs 是部署期信任声明，不是用户配置。即使旧数据/UI 写入过同名键，
+  // 这里也剥掉，防止盘上值在无环境 opt-in 时开启 forwarded-header 信任。
+  return withoutTrustedTlsProxyIPs(merged)
+}
+
+/** ProxyServer 请求边界当前消费的运行时扩展；不进入共享 ProxyConfig 持久化合同。 */
+type ProxyRuntimeConfig = ProxyConfig & { trustedTlsProxyIPs?: string[] }
+
+function readProxyRuntimeConfig(
+  store: Pick<AccountStorePort, 'get'>,
+  serverConfig: ServerConfig
+): ProxyConfig & { trustedTlsProxyIPs: string[] } {
+  return {
+    ...readProxyConfig(store),
+    // 最后覆盖，确保盘上/UI 同名字段永远不能扩大信任边界。
+    trustedTlsProxyIPs: [...(serverConfig.trustedTlsProxyIPs ?? [])]
+  }
+}
+
+/** 去掉部署期字段后才允许写回桌面与服务端共享的 proxyConfig。 */
+function withoutTrustedTlsProxyIPs(config: ProxyRuntimeConfig): ProxyConfig {
+  const persisted = { ...config }
+  delete persisted.trustedTlsProxyIPs
+  return persisted
 }
 
 /** 反代是否该在启动时自动拉起 —— 同桌面语义（`enabled && autoStart`） */
 export function shouldAutoStartProxy(config: ProxyConfig): boolean {
   return config.enabled === true && config.autoStart === true
+}
+
+/**
+ * 服务端壳的自动换号副作用。
+ *
+ * 运行中的反代必须走 activateProxyAccount 的三步 SSOT（入池 → 单账号配置 →
+ * 指针/粘性失效）；未运行时没有内存指针可动，但单账号偏好要写盘，保证下次启动
+ * 不会复活旧账号。多账号模式不写 selectedAccountIds，避免把轮询降级成固定单号。
+ */
+function applyServerAutoSwitchDecision(
+  store: AccountStorePort,
+  server: ProxyServer | null,
+  decision: AutoSwitchDecision
+): boolean {
+  const data = getAccountDataSnapshot() as {
+    accounts?: Record<string, unknown>
+    accountProxyBindings?: Record<string, string>
+    proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
+  } | null
+
+  if (!server?.isRunning()) {
+    const config = readProxyConfig(store)
+    if (config.enableMultiAccount === false) {
+      store.set('proxyConfig', { ...config, selectedAccountIds: [decision.toAccountId] })
+    }
+    store.set(AUTO_SWITCH_APPLIED_DECISION_KEY, decision.id)
+    return true
+  }
+
+  const result = activateProxyAccount(
+    decision.toAccountId,
+    {
+      isRunning: () => server.isRunning(),
+      getAccountPool: () => server.getAccountPool(),
+      getConfig: () => server.getConfig(),
+      updateConfig: (patch) => {
+        server.updateConfig(patch)
+        store.set('proxyConfig', withoutTrustedTlsProxyIPs(server.getConfig()))
+      },
+      invalidateSessionAffinity: () => server.invalidateSessionAffinity(),
+      loadAccountRecords: () => data?.accounts ?? {}
+    },
+    {
+      bindings: data?.accountProxyBindings ?? {},
+      proxyPool: data?.proxyPool ?? {}
+    }
+  )
+  if (!result.applied) {
+    console.warn(`[server] 自动换号未能推进反代: ${decision.toAccountId} (${result.reason})`)
+  } else {
+    store.set(AUTO_SWITCH_APPLIED_DECISION_KEY, decision.id)
+  }
+  return result.applied
 }
 
 // ============ deps 装配 ============
@@ -847,9 +1008,7 @@ export function restoreOrphanProxySession(store: AccountStorePort): void {
         : history
     )
     store.set(PROXY_ORPHAN_SESSION_KEY, undefined)
-    console.log(
-      `[server] 已回收上次非正常退出遗留的会话 (${orphan.totalRequests} 请求)`
-    )
+    console.log(`[server] 已回收上次非正常退出遗留的会话 (${orphan.totalRequests} 请求)`)
   } catch (e) {
     console.warn('[server] 回收 orphan 会话失败:', e)
   }
@@ -942,9 +1101,11 @@ function buildServerRouteDeps(ctx: {
         Record<string, unknown>
       >,
     setAccountOverage: (identity: PanelAccountIdentity, enabled: boolean) =>
-      setAccountOverage({ setUserPreference }, identity, enabled ? 'ENABLED' : 'DISABLED') as Promise<
-        Record<string, unknown>
-      >,
+      setAccountOverage(
+        { setUserPreference },
+        identity,
+        enabled ? 'ENABLED' : 'DISABLED'
+      ) as Promise<Record<string, unknown>>,
     // 反代六端点：整体复用桌面同一份编排（`ipc/panelProxyDeps.ts` 实测零 electron）。
     // 顺序（先同步池再启动 / 选号三步）都在那一层，这里不重算。
     ...asServiceMap(
@@ -955,7 +1116,7 @@ function buildServerRouteDeps(ctx: {
         persistProxyConfig: (cfg) => {
           // 与桌面 `proxy-update-config` 一致地落盘 —— 不写盘的话，下次自启动会丢掉
           // 用户在手机上的选号，表现为「昨天选好的号今天自己变了」。
-          store.set('proxyConfig', cfg)
+          store.set('proxyConfig', withoutTrustedTlsProxyIPs(cfg))
         }
         // updateTrayMenu / archiveSessionIfAny 都是**可选**参数，服务端刻意不传：
         //   - 托盘是桌面专属（`BrowserWindow` / `Tray`），服务器上无此物；

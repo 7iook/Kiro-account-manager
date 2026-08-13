@@ -31,6 +31,7 @@ import {
   persistBatchRefreshResults,
   type BatchRefreshItem
 } from './persistRefreshBatchResults'
+import { syncDesktopAutoSwitchScheduler } from './autoSwitch'
 import type { AccountRuntimeDeps, BatchSummary, UserInfoLike } from './types'
 
 /** background-batch-refresh 的入参形状(镜像原 index.ts 的同名类型) */
@@ -94,6 +95,12 @@ export async function backgroundBatchRefresh(
   concurrency: number = 10,
   syncInfo: boolean = true
 ): Promise<BatchSummary> {
+  // renderer 用既有 IPC 的空批次作为一次性启动/唤醒信号。timer 与决策均在 main，
+  // 空批次本身不刷新任何账号；普通非空后台刷新不会反复触碰调度器。
+  if (accounts.length === 0 && concurrency === 1 && syncInfo === false) {
+    syncDesktopAutoSwitchScheduler(deps)
+  }
+
   console.log(
     `[BackgroundRefresh] Starting batch refresh for ${accounts.length} accounts, concurrency: ${concurrency}, syncInfo: ${syncInfo}`
   )

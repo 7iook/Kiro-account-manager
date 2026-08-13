@@ -218,6 +218,9 @@ function buildPersistBlob(s: AccountsStore): SyncBlob {
     autoSwitchThreshold: s.autoSwitchThreshold,
     autoSwitchInterval: s.autoSwitchInterval,
     switchTarget: s.switchTarget,
+    // main 侧决定信封必须参与三方合并；否则它落在 renderer 防抖窗时会被下一次整表写抹掉，
+    // activeAccountId 虽然变了，IDE/CLI/反代桌面副作用却永远收不到命令。
+    autoSwitchDecision: s.autoSwitchDecision,
     theme: s.theme,
     darkMode: s.darkMode,
     language: s.language,
@@ -281,6 +284,9 @@ function normalizeSyncBlob(data: SyncBlob, current: AccountsStore): Partial<Acco
     autoSwitchThreshold: keep('autoSwitchThreshold', DEFAULT_SETTINGS.autoSwitchThreshold),
     autoSwitchInterval: keep('autoSwitchInterval', DEFAULT_SETTINGS.autoSwitchInterval),
     switchTarget: keep('switchTarget', DEFAULT_SETTINGS.switchTarget),
+    autoSwitchDecision: Object.prototype.hasOwnProperty.call(data, 'autoSwitchDecision')
+      ? parseMainAutoSwitchDecision(data.autoSwitchDecision)
+      : current.autoSwitchDecision,
     theme: keep('theme', DEFAULT_SETTINGS.theme),
     darkMode: keep('darkMode', DEFAULT_SETTINGS.darkMode),
     language: keep('language', DEFAULT_SETTINGS.language),
@@ -303,7 +309,7 @@ function normalizeSyncBlob(data: SyncBlob, current: AccountsStore): Partial<Acco
  * 把一个 blob（磁盘读到的 / 合并产物）回灌进 store state。
  *
  * 只写数据,**不做副作用** —— 副作用由 reloadFromStorageQuiet 按 before/after 差异决定,
- * 因为重放循环里会多次回灌,若每次都重启定时器会造成抖动。
+ * 因为重放循环里会多次回灌,若每次都唤醒 main / 重启 token timer 会造成抖动。
  *
  * I-b 结构性防线:标量设置字段一律经 `keep()` 读取 —— 盘面**根本没有这个 key** 时保留内存现值,
  * 而不是回落到默认值。理由:`?? 默认值` 把"盘面没说"与"盘面说了默认值"混为一谈,于是任何
@@ -373,6 +379,145 @@ type SetFn = (
     | Partial<AccountsState>
     | ((state: AccountsState) => Partial<AccountsState>)
 ) => void
+
+type MainAutoSwitchDecision = {
+  id: string
+  fromAccountId: string
+  toAccountId: string
+  switchTarget: 'ide' | 'cli' | 'both'
+  decidedAt: number
+}
+
+let lastHandledAutoSwitchDecisionId: string | null = null
+let handlingAutoSwitchDecisionId: string | null = null
+
+function parseMainAutoSwitchDecision(value: unknown): MainAutoSwitchDecision | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const raw = value as Record<string, unknown>
+  if (
+    typeof raw.id !== 'string' ||
+    typeof raw.fromAccountId !== 'string' ||
+    typeof raw.toAccountId !== 'string' ||
+    typeof raw.decidedAt !== 'number' ||
+    (raw.switchTarget !== 'ide' && raw.switchTarget !== 'cli' && raw.switchTarget !== 'both')
+  ) {
+    return null
+  }
+  return raw as MainAutoSwitchDecision
+}
+
+function decisionFromBlob(blob: unknown): MainAutoSwitchDecision | null {
+  if (!blob || typeof blob !== 'object' || Array.isArray(blob)) return null
+  return parseMainAutoSwitchDecision(
+    (blob as Record<string, unknown>).autoSwitchDecision
+  )
+}
+
+/**
+ * 复用既有 background-batch-refresh IPC 发空批次，只用于启动/唤醒 Electron main
+ * 的共享调度器。renderer 不持有 timer，也不计算阈值或候选号。
+ */
+function syncMainAutoSwitchScheduler(): void {
+  if (typeof window.api?.backgroundBatchRefresh !== 'function') return
+  void window.api
+    .backgroundBatchRefresh([], 1, false)
+    .catch((error) => console.warn('[AutoSwitch] Failed to sync main scheduler:', error))
+}
+
+/**
+ * 消费 main 已持久化的决定，执行只在桌面存在的副作用。
+ *
+ * 选号已经完成，renderer 不能改目标；它只沿用旧实现的 setActiveAccount（机器码 /
+ * lastUsedAt）、IDE、CLI 和反代热切换顺序。决定 id 做进程内幂等，重复广播不重复切。
+ */
+async function applyMainAutoSwitchDecision(
+  decision: MainAutoSwitchDecision,
+  get: () => AccountsStore,
+  set: SetFn
+): Promise<void> {
+  if (
+    decision.id === lastHandledAutoSwitchDecisionId ||
+    decision.id === handlingAutoSwitchDecisionId
+  ) {
+    return
+  }
+
+  const availableAccount = get().accounts.get(decision.toAccountId)
+  if (!availableAccount) {
+    console.warn(`[AutoSwitch] Decided account no longer exists: ${decision.toAccountId}`)
+    lastHandledAutoSwitchDecisionId = decision.id
+    return
+  }
+
+  handlingAutoSwitchDecisionId = decision.id
+  try {
+    // 保留旧 setActiveAccount 的机器码与保存副作用；main 已决定目标，renderer 不再选号。
+    get().setActiveAccount(decision.toAccountId)
+
+    const creds = availableAccount.credentials
+    if (decision.switchTarget === 'ide' || decision.switchTarget === 'both') {
+      const switchResult = await window.api.switchAccount({
+        accessToken: creds.accessToken || '',
+        refreshToken: creds.refreshToken || '',
+        clientId: creds.clientId || '',
+        clientSecret: creds.clientSecret || '',
+        region: creds.region || 'us-east-1',
+        startUrl: creds.startUrl,
+        authMethod: creds.authMethod,
+        provider: creds.provider,
+        profileArn: availableAccount.profileArn,
+        accountId: availableAccount.id
+      })
+
+      // 与旧 renderer 决策路径一致：main refresh 轮换出的凭据必须回写账号库。
+      if (switchResult?.success && switchResult.refreshedCredentials) {
+        const rc = switchResult.refreshedCredentials
+        set((state) => {
+          const accounts = new Map(state.accounts)
+          const account = accounts.get(availableAccount.id)
+          if (account) {
+            accounts.set(availableAccount.id, {
+              ...account,
+              credentials: {
+                ...account.credentials,
+                accessToken: rc.accessToken,
+                refreshToken: rc.refreshToken,
+                expiresAt: Date.now() + rc.expiresIn * 1000
+              }
+            })
+          }
+          return { accounts }
+        })
+        get().saveToStorage()
+      }
+    }
+
+    if (decision.switchTarget === 'cli' || decision.switchTarget === 'both') {
+      const scopes = availableAccount.credentials.scopes
+      window.api
+        .switchAccountCli?.({
+          accessToken: creds.accessToken || '',
+          refreshToken: creds.refreshToken || '',
+          clientId: creds.clientId,
+          clientSecret: creds.clientSecret,
+          region: creds.region || 'us-east-1',
+          profileArn: availableAccount.profileArn,
+          provider: creds.provider,
+          scopes: scopes ? scopes.split(/\s+/).filter(Boolean) : undefined,
+          tokenEndpoint: availableAccount.credentials.tokenEndpoint,
+          issuerUrl: availableAccount.credentials.issuerUrl,
+          audience: availableAccount.credentials.audience
+        })
+        .catch((error) => console.warn('[AutoSwitch CLI] Failed:', error))
+    }
+
+    // 反代仍走既有三步热切换编排；API-key 绑定在 main 的请求选择路径继续作为硬边界。
+    await get().syncActiveAccountToProxy(availableAccount.id)
+  } finally {
+    handlingAutoSwitchDecisionId = null
+    lastHandledAutoSwitchDecisionId = decision.id
+  }
+}
 
 async function syncLocalSsoAccountAsync(
   get: () => AccountsStore,
@@ -536,9 +681,6 @@ export function isBannedAccountError(error?: string): boolean {
   return false
 }
 
-// 自动换号定时器
-let autoSwitchTimer: ReturnType<typeof setInterval> | null = null
-
 // 批量测活中止标志：stopLivenessCheck 置 true，worker 循环检测后停止取新账号
 let livenessAbortFlag = false
 
@@ -615,6 +757,8 @@ interface AccountsState {
   autoSwitchEnabled: boolean
   autoSwitchThreshold: number // 余额阈值，低于此值时自动切换
   autoSwitchInterval: number // 检查间隔（分钟）
+  /** main 已持久化的最后一条自动换号命令；renderer 只幂等执行，不参与选号。 */
+  autoSwitchDecision: MainAutoSwitchDecision | null
 
   // 批量导入设置
   batchImportConcurrency: number // 批量导入并发数
@@ -735,7 +879,8 @@ interface AccountsActions {
    *   - 不调 syncLocalSsoAccountAsync（防幽灵账号回归:web 端删账号 → 桌面端 reload →
    *     若走 SSO 同步则从本机 SSO 缓存自动重新导入 = 删除失效）
    *   - 不调 startAutoSave / 不做 machineId 迁移（那是首屏一次性动作）
-   *   - 但**会**按 before/after 差异重启定时器 / 应用主题 / 切代理（B-I1 返修）——
+   *   - 但**会**按 before/after 差异唤醒 main 自动换号调度器、重启 token timer、
+   *     应用主题 / 切代理（B-I1 返修）——
    *     否则"同步了值但不生效",UI 显示与实际行为不一致
    *
    * ⚠️ 调用前必须确认没有未落盘的本地编辑（`hasPendingLocalEdits()`）:本函数是**整表覆盖**,
@@ -787,10 +932,6 @@ interface AccountsActions {
 
   // 切号目标设置
   setSwitchTarget: (target: 'ide' | 'cli' | 'both') => void
-
-  startAutoSwitch: () => void
-  stopAutoSwitch: () => void
-  checkAndAutoSwitch: () => Promise<void>
 
   // 自动 Token 刷新
   startAutoTokenRefresh: () => void
@@ -879,7 +1020,7 @@ interface AccountsActions {
 
   /**
    * 将「当前该用哪个账号」传播到反代(唯一收口点)
-   * 所有切换账号的入口(账号卡 / 列表行 / 额度耗尽自动切换 / 反代面板指定)都走这里。
+   * 所有桌面反代切号入口(账号卡 / 列表行 / main 自动换号决定执行 / 反代面板指定)都走这里。
    * 详见 RCA:.archive/2026-07-28/proxy-hot-switch-single-account/
    */
   syncActiveAccountToProxy: (accountId: string) => Promise<{
@@ -1028,6 +1169,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   currentRevision: 0,
   syncError: null,
   livenessProgress: null,
+  autoSwitchDecision: null,
   // I7:持久化设置字段一律取 DEFAULT_SETTINGS,不再与 keep() 的 fallback 各写一份字面量
   ...DEFAULT_SETTINGS,
   proactiveRenewalEnabled: false,
@@ -2458,6 +2600,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           autoSwitchThreshold: data.autoSwitchThreshold ?? 0,
           autoSwitchInterval: data.autoSwitchInterval ?? 5,
           switchTarget: data.switchTarget ?? 'ide',
+          autoSwitchDecision: decisionFromBlob(data),
           theme: data.theme ?? 'default',
           darkMode: data.darkMode ?? false,
           language: data.language ?? 'auto',
@@ -2484,10 +2627,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           void get().setProxy(true, data.proxyUrl)
         }
 
-        // 如果自动换号已启用，启动定时器
-        if (data.autoSwitchEnabled) {
-          get().startAutoSwitch()
-        }
+        // 首次加载只记住盘上的旧决定，不重放历史命令。共享 main 调度器要等下面
+        // syncBaseSnapshot 就绪后再启动，避免第一次决定广播撞进尚未建好的三方合并基线。
+        lastHandledAutoSwitchDecisionId = decisionFromBlob(data)?.id ?? null
 
         // 启动定时自动保存（防止数据丢失）
         get().startAutoSave()
@@ -2511,6 +2653,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         // ⇒ 采纳 theirs（无 machineId）⇒ 刚生成的 machineId 被静默丢弃。
         // 形状仍由 buildPersistBlob 统一产出（与 ours 同一生产者,否则每条记录误判为本地改过）。
         syncBaseSnapshot = deriveBaseFromDisk(data as unknown as SyncBlob, get())
+
+        // 用既有 IPC 发一次空批次，让 Electron main 启动共享调度器。renderer 不持有
+        // 自动换号 timer，也不计算阈值/候选号。
+        syncMainAutoSwitchScheduler()
       }
     } catch (error) {
       console.error('Failed to load accounts:', error)
@@ -2574,17 +2720,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         get().applyTheme()
       }
 
-      // 自动换号定时器:startAutoSwitch 一次性读 interval 建 timer,改值不影响已建 timer。
-      // 照 setAutoSwitch 的既有契约 —— 改完必须重启。
+      // 自动换号 timer/决定都在 main；配置变化只发一次唤醒信号，不在 renderer 重建 timer。
       if (
         after.autoSwitchEnabled !== prev.autoSwitchEnabled ||
         after.autoSwitchInterval !== prev.autoSwitchInterval
       ) {
-        if (after.autoSwitchEnabled) {
-          get().startAutoSwitch()
-        } else {
-          get().stopAutoSwitch()
-        }
+        syncMainAutoSwitchScheduler()
       }
 
       // 自动 token 刷新定时器:同构问题（startAutoTokenRefresh 也是一次性读 interval）
@@ -2607,6 +2748,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           // 代理切换失败不应回滚数据同步;留 warn 可观测（§4.4 精准 catch）
           console.warn('[Store] setProxy after cross-end sync failed:', e)
         }
+      }
+
+      const decision = decisionFromBlob(data)
+      if (decision) {
+        await applyMainAutoSwitchDecision(decision, get, set)
       }
     } catch (error) {
       // 静默失败:调用方（广播 consumer / STALE 处理）会在下次机会重试
@@ -2693,6 +2839,16 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             // 写盘成功 → 本次落盘内容成为新的 base（下次合并的比较基准）
             syncBaseSnapshot = { ...blob, revision: result.revision }
             set({ currentRevision: result.revision, syncError: null })
+            // 自动换号决定可能在本次保存的 STALE 三方合并里才进入内存；若只等下一条
+            // 广播，本窗口自己的成功写回声会被 originId 过滤，桌面副作用将永久丢失。
+            const decision = get().autoSwitchDecision
+            if (decision) {
+              queueMicrotask(() => {
+                void applyMainAutoSwitchDecision(decision, get, set).catch((error) =>
+                  console.warn('[AutoSwitch] Failed to apply merged decision:', error)
+                )
+              })
+            }
             return { ok: true as const, revision: result.revision }
           }
 
@@ -3055,14 +3211,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       autoSwitchThreshold: threshold ?? get().autoSwitchThreshold,
       autoSwitchInterval: interval ?? get().autoSwitchInterval
     })
-    get().saveToStorage()
-    
-    // 重新启动定时器
-    if (enabled) {
-      get().startAutoSwitch()
-    } else {
-      get().stopAutoSwitch()
-    }
+    // 先等配置经 revision 收口落盘，再唤醒 main；否则它可能仍读到旧阈值。
+    void get().saveToStorage().then(syncMainAutoSwitchScheduler)
   },
 
   setBatchImportConcurrency: (concurrency) => {
@@ -3078,144 +3228,6 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   setSwitchTarget: (target) => {
     set({ switchTarget: target })
     get().saveToStorage()
-  },
-
-  startAutoSwitch: () => {
-    const { autoSwitchEnabled, autoSwitchInterval, checkAndAutoSwitch } = get()
-    
-    if (!autoSwitchEnabled) return
-    
-    // 清除现有定时器
-    if (autoSwitchTimer) {
-      clearInterval(autoSwitchTimer)
-    }
-    
-    // 立即检查一次
-    checkAndAutoSwitch()
-    
-    // 设置定时检查
-    autoSwitchTimer = setInterval(() => {
-      checkAndAutoSwitch()
-    }, autoSwitchInterval * 60 * 1000)
-    
-    console.log(`[AutoSwitch] Started with interval: ${autoSwitchInterval} minutes`)
-  },
-
-  stopAutoSwitch: () => {
-    if (autoSwitchTimer) {
-      clearInterval(autoSwitchTimer)
-      autoSwitchTimer = null
-      console.log('[AutoSwitch] Stopped')
-    }
-  },
-
-  checkAndAutoSwitch: async () => {
-    const { accounts, autoSwitchThreshold, checkAccountStatus, setActiveAccount } = get()
-    const activeAccount = get().getActiveAccount()
-    
-    if (!activeAccount) {
-      console.log('[AutoSwitch] No active account')
-      return
-    }
-
-    console.log(`[AutoSwitch] Checking active account: ${activeAccount.email}`)
-
-    // 刷新当前账号状态获取最新余额
-    await checkAccountStatus(activeAccount.id)
-    
-    // 重新获取更新后的账号信息
-    const updatedAccount = get().accounts.get(activeAccount.id)
-    if (!updatedAccount) return
-
-    const remaining = updatedAccount.usage.limit - updatedAccount.usage.current
-    console.log(`[AutoSwitch] Remaining: ${remaining}, Threshold: ${autoSwitchThreshold}`)
-
-    // 检查是否需要切换
-    if (remaining <= autoSwitchThreshold) {
-      console.log(`[AutoSwitch] Account ${updatedAccount.email} reached threshold, switching...`)
-      
-      // 查找可用的账号
-      const availableAccount = Array.from(accounts.values()).find(acc => {
-        // 排除当前账号
-        if (acc.id === activeAccount.id) return false
-        // 排除被封禁的账号
-        if (isBannedAccountError(acc.lastError)) return false
-        // 排除余额不足的账号
-        const accRemaining = acc.usage.limit - acc.usage.current
-        if (accRemaining <= autoSwitchThreshold) return false
-        return true
-      })
-
-      if (availableAccount) {
-        console.log(`[AutoSwitch] Switching to: ${availableAccount.email}`)
-        setActiveAccount(availableAccount.id)
-        // 根据 switchTarget 设置决定切换目标
-        const { switchTarget: target } = get()
-        const creds = availableAccount.credentials
-        if (target === 'ide' || target === 'both') {
-          const switchResult = await window.api.switchAccount({
-            accessToken: creds.accessToken || '',
-            refreshToken: creds.refreshToken || '',
-            clientId: creds.clientId || '',
-            clientSecret: creds.clientSecret || '',
-            region: creds.region || 'us-east-1',
-            startUrl: creds.startUrl,
-            authMethod: creds.authMethod,
-            provider: creds.provider,
-            profileArn: (availableAccount as { profileArn?: string }).profileArn,
-            accountId: availableAccount.id
-          })
-          // 把 main 进程 refresh 后的最新 credentials 同步回 store，
-          // 否则 store 里的 refreshToken 仍是 v1（已被服务端 rotate 作废），下次任何 refresh 都会失败
-          if (switchResult?.success && switchResult.refreshedCredentials) {
-            const rc = switchResult.refreshedCredentials
-            set((state) => {
-              const accounts = new Map(state.accounts)
-              const acc = accounts.get(availableAccount.id)
-              if (acc) {
-                accounts.set(availableAccount.id, {
-                  ...acc,
-                  credentials: {
-                    ...acc.credentials,
-                    accessToken: rc.accessToken,
-                    refreshToken: rc.refreshToken,
-                    expiresAt: Date.now() + rc.expiresIn * 1000
-                  }
-                })
-              }
-              return { accounts }
-            })
-            get().saveToStorage()
-          }
-        }
-        if (target === 'cli' || target === 'both') {
-          const availCreds = (availableAccount as {
-            profileArn?: string
-            credentials?: { tokenEndpoint?: string; issuerUrl?: string; scopes?: string; audience?: string }
-          })
-          const availScopes = availCreds.credentials?.scopes
-          window.api.switchAccountCli?.({
-            accessToken: creds.accessToken || '',
-            refreshToken: creds.refreshToken || '',
-            clientId: creds.clientId,
-            clientSecret: creds.clientSecret,
-            region: creds.region || 'us-east-1',
-            profileArn: availCreds.profileArn,
-            provider: creds.provider,
-            // external_idp: renderer→IPC 边界不能丢字段，否则刷新无可回退刚水号旧 token 写入
-            scopes: availScopes ? availScopes.split(/\s+/).filter(Boolean) : undefined,
-            tokenEndpoint: availCreds.credentials?.tokenEndpoint,
-            issuerUrl: availCreds.credentials?.issuerUrl,
-            audience: availCreds.credentials?.audience
-          }).catch(err => console.warn('[AutoSwitch CLI] Failed:', err))
-        }
-        // 把「当前该用哪个账号」传播到反代(运行中不用停服务)· RCA §6
-        // .archive/2026-07-28/proxy-hot-switch-single-account/
-        await get().syncActiveAccountToProxy(availableAccount.id)
-      } else {
-        console.log('[AutoSwitch] No available account to switch to')
-      }
-    }
   },
 
   // ==================== 自动 Token 刷新 ====================

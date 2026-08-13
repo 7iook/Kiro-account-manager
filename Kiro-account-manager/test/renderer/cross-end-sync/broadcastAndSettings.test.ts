@@ -16,23 +16,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { useAccountsStore } from '@/store/accounts'
 import { mkAcc, makeFakeMain, CLEAN_STATE } from './fixtures'
 
-/** 记录 checkAndAutoSwitch 的真实触发时刻 —— 它是自动换号定时器的唯一动作 */
-let switchTicks: number[]
-
 beforeEach(() => {
-  switchTicks = []
   useAccountsStore.setState({
-    ...CLEAN_STATE,
-    // 换掉最底层的网络动作（真实实现会打上游 API）,保留定时器逻辑本体
-    checkAndAutoSwitch: async () => {
-      switchTicks.push(Date.now())
-    }
+    ...CLEAN_STATE
   })
   document.documentElement.className = ''
 })
 
 afterEach(() => {
-  useAccountsStore.getState().stopAutoSwitch()
   vi.useRealTimers()
   vi.restoreAllMocks()
 })
@@ -94,47 +85,37 @@ describe('外部广播落在本机写入窗口内 · 不能被永久吞掉（A-I
 })
 
 describe('跨端改设置 · 同步了值就必须真的生效（B-I1）', () => {
-  it('另一端把换号间隔从 5 改成 10 分钟 · 定时器真的按 10 分钟跑,不是显示 10 实跑 5', async () => {
-    vi.useFakeTimers()
+  it('另一端把换号间隔从 5 改成 10 分钟 · 唤醒 main 共享调度器,renderer 不重建 timer', async () => {
     const fake = makeFakeMain({
       accounts: { A: mkAcc('A') },
       autoSwitchEnabled: true,
       autoSwitchInterval: 5
     })
     await useAccountsStore.getState().loadFromStorage()
-    useAccountsStore.getState().startAutoSwitch() // 建立 5 分钟节奏的定时器
+    fake.api.backgroundBatchRefresh.mockClear()
 
     // 另一端改成 10 分钟
     fake.externalWrite((d) => ({ ...d, autoSwitchInterval: 10 }))
     await useAccountsStore.getState().reloadFromStorageQuiet()
     expect(useAccountsStore.getState().autoSwitchInterval).toBe(10)
-
-    switchTicks = []
-    // 推进 5 分钟:若定时器仍是旧的 5 分钟节奏,这里就会触发 —— 那正是 B-I1 的病灶
-    await vi.advanceTimersByTimeAsync(5 * 60 * 1000)
-    expect(switchTicks.length).toBe(0)
-
-    // 再推进到第 10 分钟:按新值应当触发
-    await vi.advanceTimersByTimeAsync(5 * 60 * 1000)
-    expect(switchTicks.length).toBe(1)
+    expect(fake.api.backgroundBatchRefresh).toHaveBeenCalledTimes(1)
+    expect(fake.api.backgroundBatchRefresh).toHaveBeenCalledWith([], 1, false)
   })
 
-  it('另一端关掉了自动换号 · 定时器真的停了,不再偷偷换号', async () => {
-    vi.useFakeTimers()
+  it('另一端关掉自动换号 · 把新配置同步给 main 的唯一调度器', async () => {
     const fake = makeFakeMain({
       accounts: { A: mkAcc('A') },
       autoSwitchEnabled: true,
       autoSwitchInterval: 5
     })
     await useAccountsStore.getState().loadFromStorage()
-    useAccountsStore.getState().startAutoSwitch()
+    fake.api.backgroundBatchRefresh.mockClear()
 
     fake.externalWrite((d) => ({ ...d, autoSwitchEnabled: false }))
     await useAccountsStore.getState().reloadFromStorageQuiet()
 
-    switchTicks = []
-    await vi.advanceTimersByTimeAsync(30 * 60 * 1000)
-    expect(switchTicks.length).toBe(0)
+    expect(fake.api.backgroundBatchRefresh).toHaveBeenCalledTimes(1)
+    expect(fake.api.backgroundBatchRefresh).toHaveBeenCalledWith([], 1, false)
   })
 
   it('另一端改了主题 · 本端界面真的变色(DOM class 变了),不是只存值等重启', async () => {
@@ -160,8 +141,7 @@ describe('跨端改设置 · 同步了值就必须真的生效（B-I1）', () =>
     expect(fake.api.setProxy).toHaveBeenCalledWith(true, 'http://127.0.0.1:7897')
   })
 
-  it('设置值没变时不做多余副作用(避免每次广播都重建定时器/闪主题)', async () => {
-    vi.useFakeTimers()
+  it('设置值没变时不做多余副作用(避免每次广播都唤醒调度器/闪主题)', async () => {
     const fake = makeFakeMain({
       accounts: { A: mkAcc('A') },
       autoSwitchEnabled: true,
@@ -169,9 +149,8 @@ describe('跨端改设置 · 同步了值就必须真的生效（B-I1）', () =>
       theme: 'default'
     })
     await useAccountsStore.getState().loadFromStorage()
-    useAccountsStore.getState().startAutoSwitch()
+    fake.api.backgroundBatchRefresh.mockClear()
 
-    switchTicks = []
     // 只有账号变了,设置一个都没动
     fake.externalWrite((d) => {
       ;(d.accounts as Record<string, unknown>).NEW = mkAcc('NEW')
@@ -180,8 +159,7 @@ describe('跨端改设置 · 同步了值就必须真的生效（B-I1）', () =>
     await useAccountsStore.getState().reloadFromStorageQuiet()
 
     expect(useAccountsStore.getState().accounts.has('NEW')).toBe(true)
-    // startAutoSwitch 会立即跑一次 checkAndAutoSwitch;若被无谓重启,这里就会多出一次触发
-    expect(switchTicks.length).toBe(0)
+    expect(fake.api.backgroundBatchRefresh).not.toHaveBeenCalled()
     expect(fake.api.setProxy).not.toHaveBeenCalled()
   })
 })

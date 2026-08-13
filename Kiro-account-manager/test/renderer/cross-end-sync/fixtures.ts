@@ -47,6 +47,8 @@ export type FakeMain = {
     updateTrayLanguage: Mock
     getAppVersion: Mock
     triggerBackgroundRefresh: Mock
+    backgroundBatchRefresh: Mock
+    getLocalActiveAccount: Mock
   }
   externalWrite: (mutate: (d: Record<string, unknown>) => Record<string, unknown>) => void
 }
@@ -75,7 +77,14 @@ export function makeFakeMain(initial: Record<string, unknown>): FakeMain {
     setProxy: vi.fn(async () => ({ normalizedUrl: undefined })),
     updateTrayLanguage: vi.fn(),
     getAppVersion: vi.fn(async () => '1.7.6'),
-    triggerBackgroundRefresh: vi.fn(async () => ({ success: true }))
+    triggerBackgroundRefresh: vi.fn(async () => ({ success: true })),
+    backgroundBatchRefresh: vi.fn(async () => ({
+      success: true,
+      completed: 0,
+      successCount: 0,
+      failedCount: 0
+    })),
+    getLocalActiveAccount: vi.fn(async () => ({ success: false }))
   }
 
   ;(globalThis as unknown as { window: Record<string, unknown> }).window =
@@ -104,6 +113,7 @@ export const CLEAN_STATE = {
   syncError: null,
   autoSwitchEnabled: false,
   autoSwitchInterval: 5,
+  autoSwitchDecision: null,
   autoRefreshEnabled: true,
   autoRefreshInterval: 5,
   theme: 'default',
