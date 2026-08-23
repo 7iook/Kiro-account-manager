@@ -57,7 +57,7 @@ describe('verify-account-credentials: resolveProfileArnForVerify (profile SSOT h
     })
   })
 
-  it('A7 变体: 未传 profileArn + 非 Enterprise (BuilderId) 应返 undefined,不调 fetcher', async () => {
+  it('A7 变体: 未传 profileArn + BuilderId 应返固定 ARN,不调 fetcher', async () => {
     const fetcher = vi.fn()
 
     const result = await resolveProfileArnForVerify(
@@ -72,7 +72,7 @@ describe('verify-account-credentials: resolveProfileArnForVerify (profile SSOT h
       fetcher
     )
 
-    expect(result).toBeUndefined()
+    expect(result).toBe('arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX')
     expect(fetcher).not.toHaveBeenCalled()
   })
 
@@ -94,6 +94,23 @@ describe('verify-account-credentials: resolveProfileArnForVerify (profile SSOT h
     // 老 handler line 4694-4707 就是 try/catch 返 undefined —— 保持这个行为(不阻塞验证主流程)
     expect(result).toBeUndefined()
     expect(fetcher).toHaveBeenCalledOnce()
+  })
+
+  it('social + BuilderId 固定 ARN 不注入 BuilderId 用量 ARN，改走社交 ARN', async () => {
+    const fetcher = vi.fn()
+    const result = await resolveProfileArnForVerify(
+      {
+        providedProfileArn: 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX',
+        isEnterprise: false,
+        accessToken: 'at',
+        region: 'us-east-1',
+        provider: 'Google',
+        authMethod: 'social'
+      },
+      fetcher
+    )
+    expect(result).toBe('arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK')
+    expect(fetcher).not.toHaveBeenCalled()
   })
 
   it('A6 变体: providedProfileArn=空字符串时视为未传(走 fetcher)', async () => {

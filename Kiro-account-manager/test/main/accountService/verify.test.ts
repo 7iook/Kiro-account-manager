@@ -197,6 +197,28 @@ describe('verifyAccountCredentials · 添加账号时验证凭证', () => {
     expect(refresh).not.toHaveBeenCalled()
   })
 
+  it('file2 脏标签：social + BuilderId + OIDC 三件套只走 IdC 刷新', async () => {
+    const refresh = vi.fn(async (_rt: string, _cid: string, _cs: string, _region?: string, authMethod?: string) => {
+      expect(authMethod).toBe('IdC')
+      return { success: true, accessToken: 'at', refreshToken: 'rt2', expiresIn: 3600 }
+    })
+    const deps = makeApiDeps({
+      refreshTokenByMethod: refresh as unknown as VerifyApiDeps['refreshTokenByMethod'],
+      getUsageAndLimits: async () => USAGE_OK
+    })
+    const r = await verifyAccountCredentials(deps, {
+      refreshToken: 'rt',
+      clientId: 'cid',
+      clientSecret: 'csec',
+      authMethod: 'social',
+      provider: 'BuilderId'
+    })
+    expect(r.success).toBe(true)
+    expect(refresh).toHaveBeenCalledTimes(1)
+    if (!r.success) return
+    expect(r.data.profileArn).toBe('arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX')
+  })
+
   it('社交登录账号只有 refreshToken 也允许继续验证（社交无 clientSecret 概念）', async () => {
     const deps = makeApiDeps({
       refreshTokenByMethod: async () => ({ success: true, accessToken: 'at', refreshToken: 'rt2', expiresIn: 3600 }),

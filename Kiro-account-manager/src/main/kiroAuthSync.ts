@@ -18,6 +18,7 @@ import * as fsSync from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 import * as crypto from 'crypto'
+import type { ImportAuthIdentity } from '../shared/importAuthIdentity'
 
 export const KIRO_SSO_CACHE_DIR = path.join(os.homedir(), '.aws', 'sso', 'cache')
 export const KIRO_AUTH_TOKEN_PATH = path.join(KIRO_SSO_CACHE_DIR, 'kiro-auth-token.json')
@@ -71,6 +72,48 @@ const PLACEHOLDER_PROFILE_ARNS = new Set<string>([
 export function isPlaceholderProfileArn(arn: string | undefined | null): boolean {
   if (!arn) return false
   return PLACEHOLDER_PROFILE_ARNS.has(arn)
+}
+
+export type ProfileArnKind = 'none' | 'builder_id_fixed' | 'enterprise_legacy_v1' | 'social_fixed' | 'real'
+
+export function classifyProfileArnKind(arn?: string | null): ProfileArnKind {
+  const value = typeof arn === 'string' ? arn.trim() : ''
+  if (!value) return 'none'
+  if (value === KIRO_BUILDER_ID_PLACEHOLDER_ARN) return 'builder_id_fixed'
+  if (value === KIRO_SOCIAL_PROFILE_ARN) return 'social_fixed'
+  if (
+    value === `arn:aws:codewhisperer:us-east-1:${_ENTERPRISE_LEGACY_V1_ACCOUNT_ID}:profile/${_ENTERPRISE_LEGACY_V1_PROFILE_ID}` ||
+    value === `arn:aws:codewhisperer:eu-central-1:${_ENTERPRISE_LEGACY_V1_ACCOUNT_ID}:profile/${_ENTERPRISE_LEGACY_V1_PROFILE_ID}`
+  ) {
+    return 'enterprise_legacy_v1'
+  }
+  return 'real'
+}
+
+export function resolveUsageLimitsProfileArn(input: {
+  identity: ImportAuthIdentity
+  providedProfileArn?: string | null
+  ssoRegion?: string
+}): string | undefined {
+  const kind = classifyProfileArnKind(input.providedProfileArn)
+  const provided = typeof input.providedProfileArn === 'string' ? input.providedProfileArn.trim() : ''
+
+  if (kind === 'real') return provided
+
+  if (input.identity === 'api_key') return undefined
+
+  if (input.identity === 'social') return KIRO_SOCIAL_PROFILE_ARN
+
+  if (input.identity === 'enterprise' || input.identity === 'external_idp') {
+    if (kind === 'enterprise_legacy_v1' || input.ssoRegion?.startsWith('eu-')) {
+      return getEnterpriseFallbackArn(input.ssoRegion)
+    }
+    return undefined
+  }
+
+  // builder_id：固定 ARN 是 GetUsageLimits 的合法参数（2026-08-23 受控对照 200 PRO MAX）
+  if (kind === 'builder_id_fixed') return KIRO_BUILDER_ID_PLACEHOLDER_ARN
+  return KIRO_BUILDER_ID_PLACEHOLDER_ARN
 }
 
 /**

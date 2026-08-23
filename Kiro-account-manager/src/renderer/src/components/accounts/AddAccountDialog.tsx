@@ -13,6 +13,7 @@ import {
 } from './profileImportHelpers'
 import { apiKeyImportCodeText } from './apiKeyImportText'
 import { isBannedError } from './_helpers'
+import { normalizeImportAuth } from '@shared/importAuthIdentity'
 
 interface AddAccountDialogProps {
   isOpen: boolean
@@ -1087,11 +1088,15 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           return
         }
 
-        // 根据 provider 自动确定 authMethod（external_idp 优先）
+        // 身份归一化 SSOT：脏 JSON 的 authMethod=social + BuilderId + OIDC 三件套走 IdC
         const credProvider = cred.provider || 'BuilderId'
         const isExtIdp = credProvider === 'AzureAD' || credProvider === 'ExternalIdp' || cred.authMethod === 'external_idp'
-        const credAuthMethod = isExtIdp ? 'external_idp'
-          : cred.authMethod || ((credProvider === 'BuilderId' || credProvider === 'Enterprise') ? 'IdC' : 'social')
+        const { authMethod: credAuthMethod } = normalizeImportAuth({
+          authMethod: isExtIdp ? 'external_idp' : cred.authMethod,
+          provider: credProvider,
+          clientId: cred.clientId,
+          clientSecret: cred.clientSecret
+        })
 
         const result = await window.api.verifyAccountCredentials({
           refreshToken: cred.refreshToken,
@@ -1127,9 +1132,12 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             'ExternalIdp': 'ExternalIdp'
           }
           const idp = idpMap[provider] || 'BuilderId'
-          // external_idp 用 external_idp；GitHub/Google 用 social；BuilderId/Enterprise 用 IdC
-          const authMethod = isExtIdp ? 'external_idp'
-            : cred.authMethod || ((provider === 'BuilderId' || provider === 'Enterprise') ? 'IdC' : 'social')
+          const { authMethod } = normalizeImportAuth({
+            authMethod: isExtIdp ? 'external_idp' : cred.authMethod,
+            provider,
+            clientId: cred.clientId,
+            clientSecret: cred.clientSecret
+          })
           
           const now = Date.now()
           addAccount({

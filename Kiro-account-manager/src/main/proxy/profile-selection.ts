@@ -10,6 +10,8 @@
 
 import type { ProxyAccount } from './types'
 import type { KiroProfile } from './kiroApi'
+import { normalizeImportAuth } from '../../shared/importAuthIdentity'
+import { classifyProfileArnKind, resolveUsageLimitsProfileArn } from '../kiroAuthSync'
 
 // ============ verify-account-credentials: profileArn 决策 ============
 
@@ -23,43 +25,61 @@ export interface ResolveProfileArnOpts {
   region: string
   provider?: string
   authMethod?: string
+  clientId?: string
+  clientSecret?: string
 }
 
 /**
  * verify-account-credentials handler 内决定使用哪个 profileArn 的 SSOT 逻辑。
  *
- * 决策卡 v2 修订 2 + 修订 3:
- * - 传入 providedProfileArn(非空) → 直接使用,不再调 fetchEnterpriseProfileArn 兜底
- *   (renderer 侧多 profile 场景 M 次独立 verify 时用它精准指向某个 profile)
- * - 未传 + isEnterprise → 走 fetcher 兜底(向后兼容原行为)
- * - 未传 + 非 Enterprise → 返 undefined(BuilderId / Social 不需要)
- * - fetcher 抛异常 → 吞异常返 undefined(与老 handler line 4691-4707 兜底行为一致,避免登录整体失败)
+ * 决策卡 v2 修订 2 + 修订 3 + 2026-08-23 builderid-placeholder-arn:
+ * - 传入真实 ARN → 直接使用
+ * - BuilderId 固定 ARN + builder_id 身份 → 直接使用(GetUsageLimits 合法参数)
+ * - 企业 / external_idp 缺或废 ARN → fetcher;抛异常吞掉返 undefined
+ * - builder_id / social / api_key → resolveUsageLimitsProfileArn 决策表
  */
 export async function resolveProfileArnForVerify(
   opts: ResolveProfileArnOpts,
   fetcher: (account: ProxyAccount) => Promise<string | undefined>
 ): Promise<string | undefined> {
-  // 空字符串视为未传(避免 renderer 传 '' 误命中)
-  if (typeof opts.providedProfileArn === 'string' && opts.providedProfileArn.length > 0) {
-    return opts.providedProfileArn
+  const { identity } = normalizeImportAuth({
+    authMethod: opts.authMethod,
+    provider: opts.provider,
+    clientId: opts.clientId,
+    clientSecret: opts.clientSecret
+  })
+  const kind = classifyProfileArnKind(opts.providedProfileArn)
+  const provided =
+    typeof opts.providedProfileArn === 'string' && opts.providedProfileArn.length > 0
+      ? opts.providedProfileArn
+      : undefined
+
+  // 真实 ARN 原样；BuilderId 固定 ARN 对 builder_id 也是合法已提供值。
+  if (provided && (kind === 'real' || (identity === 'builder_id' && kind === 'builder_id_fixed'))) {
+    return provided
   }
 
-  if (!opts.isEnterprise) {
-    return undefined
+  const isEnterpriseIdentity = identity === 'enterprise' || identity === 'external_idp' || opts.isEnterprise
+  if (isEnterpriseIdentity) {
+    try {
+      return await fetcher({
+        id: '',
+        accessToken: opts.accessToken,
+        region: opts.region,
+        provider: opts.provider as ProxyAccount['provider'],
+        authMethod: opts.authMethod as ProxyAccount['authMethod']
+      })
+    } catch (e) {
+      console.warn('[ProfileSelection] resolveProfileArnForVerify fetcher failed:', e)
+      return undefined
+    }
   }
 
-  try {
-    return await fetcher({
-      id: '',
-      accessToken: opts.accessToken,
-      region: opts.region,
-      provider: opts.provider as ProxyAccount['provider'],
-      authMethod: opts.authMethod as ProxyAccount['authMethod']
-    })
-  } catch (e) {
-    console.warn('[ProfileSelection] resolveProfileArnForVerify fetcher failed:', e)
-    return undefined
-  }
+  return resolveUsageLimitsProfileArn({
+    identity,
+    providedProfileArn: provided,
+    ssoRegion: opts.region
+  })
 }
 
 // ============ complete-external-idp-login: 返回体拼装 ============

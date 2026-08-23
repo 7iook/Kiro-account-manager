@@ -2,13 +2,15 @@
  * 用量查询：`getUsageLimitsRest`（REST GetUsageLimits）+ `getUsageAndLimits`（统一入口）
  * + `getUserInfo`（CBOR GetUserInfo）。
  *
- * **这个文件里的注释是业务知识本体，不是说明文字。** 五处（TokenType 分发 / V1 占位 ARN →
- * V2 fallback 且 api_key 必须排除 / 数据面 host 按 profileArn 真实 region / social 兜底 ARN
- * 与 ksk_ 的相反处置 / CBOR 401-403 fallback）每一处都是一次 RCA 换来的受控对照结论，
+ * **这个文件里的注释是业务知识本体，不是说明文字。** 五处（TokenType 分发 /
+ * resolveUsageLimitsProfileArn 决策表：BuilderId 固定 ARN 原样、仅 V1 企业废 → V2、
+ * api_key 必须排除 / 数据面 host 按真实 profileArn region / social 与 ksk_ 相反处置 /
+ * CBOR 401-403 fallback）每一处都是一次 RCA 换来的受控对照结论，
  * 逐字保留 —— 重写或「顺手整理」等于把证据扔掉。
  */
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
-import { isPlaceholderProfileArn, getEnterpriseFallbackArn, KIRO_SOCIAL_PROFILE_ARN } from '../kiroAuthSync'
+import { classifyProfileArnKind, resolveUsageLimitsProfileArn } from '../kiroAuthSync'
+import { normalizeImportAuth } from '../../shared/importAuthIdentity'
 import { parseRegionFromProfileArn, isKiroApiDebug } from '../proxy/kiroApi'
 import {
   getRestApiBase,
@@ -108,26 +110,17 @@ export function createUsage(
     const logTag = email || `token:${accessToken?.slice(-6) || '?'}`
     console.log(`[Kiro REST API] GetUsageLimits [${logTag}] region=${ssoRegion || 'default'}`)
 
-    // 2026-07 迁移:V1 legacy Enterprise fallback ARN(610548660232:VNECVYCYYAWN)已废,
-    // 后端拒 400 "Invalid profileArn";isPlaceholderProfileArn 识别后自动 fallback 到 V2 真实值。
-    // 实测证据:eu 账户 + V2 fallback (316704942615:H3A4HCGR4WEC) + management.eu-central-1 返 200。
-    if (profileArn && isPlaceholderProfileArn(profileArn)) {
-      const fallbackArn = getEnterpriseFallbackArn(ssoRegion)
-      console.log(`[Kiro REST API] Legacy V1 profileArn detected, using V2 fallback: ${fallbackArn}`)
-      profileArn = fallbackArn
-    } else if (!profileArn && ssoRegion?.startsWith('eu-') && authMethod !== 'api_key') {
-      // EU management API 后端强制要求 profileArn(2026-07),不传直接 400 Invalid profileArn
-      // 无存量时自动 fallback 到本 region V2 真实值(实测 316704942615:H3A4HCGR4WEC 在任一 EU Enterprise account 下都接受)
-      //
-      // ⚠️ 必须排除网页 API Key(ksk_)账户(RCA 2026-08-02 ksk-eu-fallback-arn):
-      //   ksk 天生无 profileArn(STANDALONE 订阅 GetProfile 返 400 = 既定 feature gate),
-      //   注入这个属于别人 AWS 账号(316704942615)的 ARN → ksk 无权使用 → 403 "Invalid token"。
-      //   受控对照(同一 ksk + management.eu-central-1 + TokenType:API_KEY,只改 profileArn 一个变量):
-      //     无 profileArn → 200 完整额度 / 带该 fallback ARN → 403。
-      //   即「EU 强制要求 profileArn」这个前提对 api_key 不成立 —— ksk 不带 ARN 就是合法请求。
-      //   与 kiroApi.resolveProfileArn 的 api_key 分支同一语义(SSOT:ksk 绝不回退占位/固定 ARN)。
-      profileArn = getEnterpriseFallbackArn(ssoRegion)
-      console.log(`[Kiro REST API] EU account missing profileArn, using V2 EU fallback: ${profileArn}`)
+    // 上层 getUsageAndLimits 已按 idp+authMethod 收口过 ARN。这里只处理：
+    // 1) 仍是 V1 企业废 ARN → V2；2) 仍缺 ARN → 用 authMethod 再走决策表。
+    // 不得拿「只有 authMethod、没有 idp」的不完整身份去覆盖已经算好的社交/真实 ARN。
+    const incomingKind = classifyProfileArnKind(profileArn)
+    if (incomingKind === 'enterprise_legacy_v1' || incomingKind === 'none') {
+      const { identity } = normalizeImportAuth({ authMethod })
+      profileArn = resolveUsageLimitsProfileArn({
+        identity,
+        providedProfileArn: profileArn,
+        ssoRegion
+      })
     }
     
     const params = new URLSearchParams({
@@ -145,10 +138,11 @@ export function createUsage(
     // Bug 现场:account.region=us-east-2 但 profile 在 eu-central-1 → 用 ssoRegion 选 us 主机 403 →
     //          回退 q.us-east-1 → 400 "Improperly formed request"(间歇性,每次用量刷新都触发)。
     // 此处覆盖所有走 getUsageAndLimits → getUsageLimitsRest 的调用方(check-status/批量/verify/订阅)。
-    // ⚠️ 仅对"真实" profileArn 生效:社交固定 ARN(KIRO_SOCIAL_PROFILE_ARN)与 BuilderId 占位 ARN
+    // ⚠️ 仅对"真实" profileArn 生效:社交固定 ARN 与 BuilderId 固定 ARN
     //    恒为 us-east-1,不代表账户真实 region,必须排除,否则 EU 社交/BuilderId 账户被误路由到 us 而 403。
+    const arnKind = classifyProfileArnKind(profileArn)
     const isFixedOrPlaceholderArn =
-      !!profileArn && (isPlaceholderProfileArn(profileArn) || profileArn === KIRO_SOCIAL_PROFILE_ARN)
+      arnKind === 'builder_id_fixed' || arnKind === 'social_fixed' || arnKind === 'enterprise_legacy_v1'
     const arnRegion = isFixedOrPlaceholderArn ? undefined : parseRegionFromProfileArn(profileArn)
     const effectiveRegion = arnRegion || ssoRegion
     if (effectiveRegion !== ssoRegion && isKiroApiDebug()) {
@@ -187,23 +181,18 @@ export function createUsage(
     email?: string,             // 用于日志标识
     authMethod?: string         // external_idp (Azure AD) 需传入以加 TokenType header
   ): Promise<UnifiedUsageResponse> {
-    // 社交账户（Google/Github）在 REST GetUsageLimits 也强制要求 profileArn，
-    // 但账户存储层没有对应字段（社交本身没 profileArn 概念）。用官方社交 profile
-    // 固定 ARN 兜底，行为与 Kiro IDE 自动注入一致（参见 kiroAuthSync KIRO_SOCIAL_PROFILE_ARN）。
-    // 判定：authMethod='social'（新导入路径），或 idp=Google/Github（历史账户 authMethod 可能为 undefined）。
-    // RCA: .agent-workspace/.archive/2026-07-14/usage-refresh-zero/
-    const isSocial = authMethod === 'social' || idp === 'Google' || idp === 'Github'
-    if (isSocial && !profileArn) {
-      profileArn = KIRO_SOCIAL_PROFILE_ARN
-    }
-    // 网页 API Key(ksk_)账户:与 isSocial 相反 —— 绝不能注入任何固定/兜底 ARN。
-    // ksk 天生无 profileArn(STANDALONE 订阅 GetProfile 返 400 = 既定 feature gate),
-    // 下游 getUsageLimitsRest 的「EU 账户无 ARN → 注入 Enterprise fallback」分支若命中,
-    // 会塞一个属于别人 AWS 账号的 ARN → 403 Invalid token(RCA 2026-08-02 ksk-eu-fallback-arn)。
-    // 历史账户 authMethod 可能为 undefined(仅 provider='ApiKey' → idp='ApiKey'),
-    // 故与 isSocial 同款双判据归一化,确保 authMethod 一定以 'api_key' 传到下游。
+    // 社交 / BuilderId / ksk / 企业 的 ARN 注入收口到 resolveUsageLimitsProfileArn。
+    // 社交缺 ARN → KIRO_SOCIAL_PROFILE_ARN(RCA 2026-07-14 usage-refresh-zero)。
+    // BuilderId 缺 ARN → BuilderId 固定 ARN(RCA 2026-08-23 builderid-placeholder-arn;对照 200)。
+    // ksk 绝不注入(RCA 2026-08-02 ksk-eu-fallback-arn)。
     const isApiKey = authMethod === 'api_key' || idp === 'ApiKey'
     const effectiveAuthMethod = isApiKey ? 'api_key' : authMethod
+    const { identity } = normalizeImportAuth({ authMethod: effectiveAuthMethod, provider: idp })
+    profileArn = resolveUsageLimitsProfileArn({
+      identity,
+      providedProfileArn: profileArn,
+      ssoRegion
+    })
     if (getUsageApiType() === 'rest') {
       // 使用 REST API (GetUsageLimits)
       const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email, effectiveAuthMethod)

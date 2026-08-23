@@ -24,6 +24,7 @@ import {
   fetchEnterpriseProfileArn
 } from '../proxy/kiroApi'
 import { resolveProfileArnForVerify } from '../proxy/profile-selection'
+import { normalizeImportAuth } from '../../shared/importAuthIdentity'
 import { sha256Fingerprint } from '../utils/tokenFingerprint'
 // 订阅类型判定 SSOT:W2 与 W3 曾各自独立抽出一份等价实现(normalizeSubscriptionType /
 // classifySubscriptionType),合并时统一到 parseUsage.ts 那份 —— 它多一个 fallbackType 参数,
@@ -352,11 +353,17 @@ export async function verifyAccountCredentials(
       clientId,
       clientSecret,
       region = 'us-east-1',
-      authMethod,
+      authMethod: rawAuthMethod,
       provider,
       tokenEndpoint,
       scopes
     } = credentials
+    const { authMethod } = normalizeImportAuth({
+      authMethod: rawAuthMethod,
+      provider,
+      clientId,
+      clientSecret
+    })
     // 确定 idp：社交登录使用 provider，IdC 也需要根据 provider 区分 BuilderId 和 Enterprise
     // 注：external_idp (AzureAD/ExternalIdp) 刻意 fallback 到 'BuilderId'，避免把非标准 idp 值拼进
     // kiroApiRequest 的 cookie (`Idp=${idp}`) 触发服务端非 401/403 错误绕过 REST fallback。
@@ -401,7 +408,9 @@ export async function verifyAccountCredentials(
         accessToken: refreshResult.accessToken!,
         region: region || 'us-east-1',
         provider,
-        authMethod
+        authMethod,
+        clientId,
+        clientSecret
       },
       (acc) => fetchEnterpriseProfileArn(acc)
     )
@@ -458,7 +467,9 @@ export async function verifyAccountCredentials(
         accessToken: refreshResult.accessToken!,
         region: region || 'us-east-1',
         provider,
-        authMethod
+        authMethod,
+        clientId,
+        clientSecret
       },
       (acc) => fetchEnterpriseProfileArn(acc)
     )
