@@ -54,6 +54,36 @@ function identityValue(field: 'userId' | 'email', record: UnknownRecord): string
 }
 
 /**
+ * ksk_ 导入时上游尚未给出真实 userId，`importApiKey.ts:buildApiKeyAccount` 用
+ * profileArn 尾段 / tokenFingerprint 作本地占位。占位不是上游身份：首次刷新额度拿到
+ * 真实 userId 属于「首次补齐」，不是「换成另一个账号」。
+ *
+ * 只认记录**自己**的凭据派生出的占位值；非 ksk 记录或被改过的值不豁免。
+ */
+function isApiKeyPlaceholderUserId(record: UnknownRecord, userId: string): boolean {
+  const cred = asRecord(record.credentials) ?? {}
+  const isApiKey =
+    cred.authMethod === 'api_key' || cred.provider === 'ApiKey' || record.idp === 'ApiKey'
+  if (!isApiKey) return false
+  if (userId === nonEmptyString(cred.tokenFingerprint)) return true
+  const arn = nonEmptyString(record.profileArn) ?? nonEmptyString(cred.profileArn)
+  const arnTail = arn ? arn.split('/').pop() || arn.slice(-12) : undefined
+  return userId === arnTail
+}
+
+/** 已建立的身份值；ksk 占位 userId 视为尚未建立。 */
+function establishedIdentityValue(
+  field: 'userId' | 'email',
+  record: UnknownRecord
+): string | undefined {
+  const value = identityValue(field, record)
+  if (field === 'userId' && value !== undefined && isApiKeyPlaceholderUserId(record, value)) {
+    return undefined
+  }
+  return value
+}
+
+/**
  * 检查一条既有记录的单次变更。
  *
  * 只要旧字段已有值，新值缺失也算违反约束；否则先清空、下一次再换值就能绕过守卫。
@@ -73,7 +103,7 @@ export function findAccountIdentityTransitionViolation(
   if (previousId !== undefined && previousId !== nextId) fields.push('id')
 
   for (const field of ['userId', 'email'] as const) {
-    const oldValue = identityValue(field, before)
+    const oldValue = establishedIdentityValue(field, before)
     if (oldValue !== undefined && oldValue !== identityValue(field, after)) fields.push(field)
   }
 
