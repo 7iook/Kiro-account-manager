@@ -163,7 +163,8 @@ start_tunnel() {
   if [[ -n "${old}" ]]; then
     stop_pid "$old"
   fi
-  cloudflared tunnel --no-autoupdate run --token-file "$CLOUDFLARED_TOKEN_FILE" \
+  # This VM drops idle QUIC (UDP 7844). HTTP/2 uses TCP 443 to the same edge.
+  cloudflared tunnel --no-autoupdate --protocol http2 run --token-file "$CLOUDFLARED_TOKEN_FILE" \
     >>"$STATE_DIR/tunnel.log" 2>&1 9>&- &
   local pid=$!
   printf '%s\n' "$pid" >"$TUNNEL_PID_FILE"
